@@ -1,0 +1,31 @@
+wiki:
+  apiUrl: https://zh.wikipedia.org/w/api.php
+  # wikiId: zhwiki  # Needed when forcing eventstream on a non-zhwiki site.
+  username: AmanojakuBot
+  loginUsername: AmanojakuBot@bot  # Only for a BotPassword login.
+  ownerUserId: 4073200
+  draftNamespace: 118
+  talkPage: User talk:AmanojakuBot
+  personaPage: User:AmanojakuBot/config/persona
+  controlPage: User:AmanojakuBot/config/control
+  # timestampFormat: "2026年9月14日 (一) 01:23 (UTC)"  # 可选：zhwiki（默认）或自定义签名时间戳格式
+events:
+  # mode: eventstream  # Auto: zhwiki=eventstream, other API URLs=polling.
+  pollIntervalSeconds: 60
+  overlapSeconds: 60
+storage:
+  dbPath: bot.zhwp.sqlite  # Use a separate DB file per wiki.
+llm:
+  provider: gemini
+  model: gemini-3.7-flash
+tasks:
+  review:
+    enabled: false
+    dailyLimit: 10
+  aiEdit:
+    enabled: false
+    reportPagePrefix: User:AmanojakuBot/sandbox/AICheck
+    usersPage: User:AmanojakuBot/sandbox/AICheckUser
+    maxAnalysesPerWindow: 20
+    minConfidence: 0.85
+writeEnabled: false
