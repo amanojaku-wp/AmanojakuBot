@@ -44,7 +44,7 @@ export const configSchema = z.object({
         .string()
         .url()
         .default("https://stream.wikimedia.org/v2/stream/recentchange"),
-      pollIntervalSeconds: z.number().int().min(30).default(60),
+      pollIntervalSeconds: z.number().int().min(10).default(60),
       /** 轮询回溯重叠窗口，防止因 API 复制延迟或时钟偏差遗漏变更 */
       overlapSeconds: z.number().int().min(0).max(300).default(60),
     })
@@ -77,12 +77,12 @@ export const configSchema = z.object({
           /** 按月分段的线索报告页前缀（如 User:AmanojakuBot/AI线索） */
           reportPagePrefix: z
             .string()
-            .regex(/^User:[^/]+\/[^/]+$/i)
+            .regex(/^User:[^/]+\/.+$/i)
             .optional(),
           /** 跨 3 个不同条目触发线索的用户汇总页（如 User:AmanojakuBot/AI用户） */
           usersPage: z
             .string()
-            .regex(/^User:[^/]+\/[^/]+$/i)
+            .regex(/^User:[^/]+\/.+$/i)
             .optional(),
           /** 每个 6 小时 UTC 聚合窗口内送审 LLM 的最大候选编辑数（防预算超支） */
           maxAnalysesPerWindow: z.number().int().min(1).max(100).default(20),

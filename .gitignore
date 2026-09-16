@@ -115,12 +115,6 @@ web_modules/
 .env.development.local
 .env.test.local
 .env.production.local
-.env.local
-.env.testwiki
-.env.zhwp
-
-config.testwiki.yaml
-config.zhwp.yaml
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -203,3 +197,10 @@ dist
 
 # Custom rules (everything added below won't be overriden by 'Generate .gitignore File' if you use 'Update' option)
 
+.env.testwiki
+.env.zhwp
+
+config.testwiki.yaml
+config.zhwp.yaml
+
+bot*.sqlite*

@@ -7,6 +7,11 @@ import { fetchRecentChanges, pollingStart } from "./utils/polling.js";
 import { publishReports } from "./tasks/aiEdit.js";
 import { handle, type ChangeEvent, type HandlerContext } from "./handle.js";
 
+import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
+
+// 全局注册代理分发器，使 fetch 自动遵循系统代理环境变量 (HTTP_PROXY / HTTPS_PROXY 等)
+setGlobalDispatcher(new EnvHttpProxyAgent());
+
 /**
  * 机器人常驻主服务守护进程入口
  *

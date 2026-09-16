@@ -191,7 +191,7 @@ export async function handle(
         replyWikitext,
         extraction.sectionTitle,
       ),
-      summary: `${review ? "回复评审请求" : "回复留言"}（来源修订 ${revid}）`,
+      summary: `${review ? "回复评审请求" : "回复留言"}`,
     };
   });
 
