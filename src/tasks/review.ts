@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import type { Mwn } from "mwn";
-import { taskText } from "../utils/llm.js";
+import { generateText } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { google } from "@ai-sdk/google";
 
 export type ReviewConfig = {
   dailyLimit: number;
@@ -239,4 +241,23 @@ export async function prepareReview(
     `本次处理 ${actions.length} 个有效页面；非主人首次评审每日上限 ${cfg.dailyLimit} 篇（UTC），30 日内可复查一次，跨日复查不计新请求额度。`,
   ].filter(Boolean);
   return [...summaries, ...notes].join("\n").slice(0, 12000);
+}
+
+/**
+ * 任务二/通用单轮结构化任务 LLM 文本生成
+ *
+ * 业务说明：用于条目评审摘要生成等无状态单轮任务，由调用方注入针对维基规则的专项 system prompt。
+ */
+export async function taskText(
+  provider: "openai" | "google",
+  model: string,
+  system: string,
+  prompt: string,
+) {
+  const result = await generateText({
+    model: provider === "openai" ? openai(model) : google(model),
+    system,
+    prompt,
+  });
+  return result.text.trim();
 }
