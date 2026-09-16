@@ -26,7 +26,7 @@ setGlobalDispatcher(new EnvHttpProxyAgent());
  */
 
 const log = pino();
-const cfg = loadConfig();
+const cfg = loadConfig(process.env.CONFIG_PATH ?? "config.yaml");
 const db = openDb(cfg.storage.dbPath);
 const bot = createWiki(
   cfg.wiki.apiUrl,
