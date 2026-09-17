@@ -86,9 +86,8 @@ export async function handle(
         newLength: e.length?.new,
       },
       {
-        draftNamespace: cfg.wiki.draftNamespace,
-        provider: cfg.llm.provider,
-        model: cfg.llm.model,
+        draftNamespace: cfg.tasks.aiEdit.draftNamespace,
+        models: cfg.tasks.aiEdit.models,
         minConfidence: cfg.tasks.aiEdit.minConfidence,
         maxAnalysesPerWindow: cfg.tasks.aiEdit.maxAnalysesPerWindow,
         reportPagePrefix: cfg.tasks.aiEdit.reportPagePrefix!,
@@ -99,8 +98,18 @@ export async function handle(
   }
 
   // 2. 任务一与任务二：讨论页事件前置检查与去重
-  if (!isRelevant(e, cfg.wiki.talkPage, cfg.wiki.username, cfg.wiki.wikiId))
+  if (
+    !isRelevant(
+      e,
+      cfg.tasks.chat.talkPage,
+      cfg.wiki.username,
+      cfg.wiki.wikiId,
+      cfg.events.allowBotEdits,
+    )
+  ) {
     return;
+  }
+
   const revid = e.revision!.new!;
   if ((seen.get(revid) as { state: string } | undefined)?.state === "done")
     return;
@@ -137,11 +146,10 @@ export async function handle(
   if (review) {
     reply = await prepareReview(db, bot, rev.actorId, revid, message, {
       dailyLimit: cfg.tasks.review.dailyLimit,
-      draftNamespace: cfg.wiki.draftNamespace,
+      draftNamespace: cfg.tasks.review.draftNamespace,
       ownerUserId: cfg.wiki.ownerUserId,
       apiUrl: cfg.wiki.apiUrl,
-      provider: cfg.llm.provider,
-      model: cfg.llm.model,
+      models: cfg.tasks.review.models,
       writeEnabled: cfg.writeEnabled,
     });
   } else {
@@ -153,9 +161,8 @@ export async function handle(
       message,
       extraction,
       {
-        personaPage: cfg.wiki.personaPage,
-        provider: cfg.llm.provider,
-        model: cfg.llm.model,
+        personaPage: cfg.tasks.chat.personaPage,
+        models: cfg.tasks.chat.models,
       },
     );
   }
@@ -173,7 +180,7 @@ export async function handle(
   if (!(await canWrite())) return;
 
   // 双重校验：若页面已存在该 source revid 标记，说明先前请求已成功写入但本地位点未提交，直接标记 done
-  const currentTalk = await bot.read(cfg.wiki.talkPage);
+  const currentTalk = await bot.read(cfg.tasks.chat.talkPage);
   const currentTalkContent = currentTalk?.revisions?.[0]?.content ?? "";
   if (currentTalkContent.includes(marker)) {
     save.run(revid, "done", rev.actorId, null);
@@ -182,7 +189,7 @@ export async function handle(
 
   save.run(revid, "pending", rev.actorId, null);
   const replyWikitext = `:${reply.replaceAll("~~~~", "")} —~~~~ ${marker}`;
-  const result = await bot.edit(cfg.wiki.talkPage, ({ content }) => {
+  const result = await bot.edit(cfg.tasks.chat.talkPage, ({ content }) => {
     if (content.includes(marker))
       throw new Error("Reply marker already present");
     return {
@@ -200,11 +207,11 @@ export async function handle(
     save.run(revid, "done", rev.actorId, result.newrevid ?? null);
     if (!review) {
       db.prepare(
-        "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,?, ?,datetime('now'))",
-      ).run(rev.actorId, revid, "user", message);
+        "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'user',?,datetime('now'))",
+      ).run(rev.actorId, revid, message);
       db.prepare(
-        "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,?, ?,datetime('now'))",
-      ).run(rev.actorId, revid, "assistant", reply);
+        "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'assistant',?,datetime('now'))",
+      ).run(rev.actorId, revid, reply);
     }
   })();
   log.info({ revid }, "replied");

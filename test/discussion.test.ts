@@ -102,7 +102,13 @@ describe("discussion filtering & timestamp handling", () => {
     };
     expect(isRelevant(e, "User talk:ExampleBot", "ExampleBot")).toBe(true);
     expect(
-      isRelevant({ ...e, namespace: 0 }, "User talk:ExampleBot", "ExampleBot"),
+      isRelevant(
+        { ...e, namespace: 0 },
+        "User talk:ExampleBot",
+        "ExampleBot",
+        "zhwiki",
+        false,
+      ),
     ).toBe(false);
   });
 });

@@ -1,31 +1,55 @@
 wiki:
   apiUrl: https://zh.wikipedia.org/w/api.php
-  # wikiId: zhwiki  # Needed when forcing eventstream on a non-zhwiki site.
+  wikiId: zhwiki # Needed when forcing eventstream on a non-zhwiki site.
   username: AmanojakuBot
-  loginUsername: AmanojakuBot@bot  # Only for a BotPassword login.
+  loginUsername: AmanojakuBot@bot # Only for a BotPassword login.
   ownerUserId: 4073200
-  draftNamespace: 118
-  talkPage: User talk:AmanojakuBot
-  personaPage: User:AmanojakuBot/config/persona
-  controlPage: User:AmanojakuBot/config/control
-  # timestampFormat: "2026年9月14日 (一) 01:23 (UTC)"  # 可选：zhwiki（默认）或自定义签名时间戳格式
+  writeEnabled: false
+
 events:
-  # mode: eventstream  # Auto: zhwiki=eventstream, other API URLs=polling.
+  mode: eventstream # Auto: zhwiki=eventstream, other API URLs=polling.
   pollIntervalSeconds: 60
   overlapSeconds: 60
+
 storage:
-  dbPath: bot.zhwp.sqlite  # Use a separate DB file per wiki.
+  type: sqlite
+  dbPath: bot.zhwp.sqlite # Use a separate DB file per wiki.
+
+log:
+  level: info
+
 llm:
   provider: gemini
   model: gemini-3.7-flash
+
 tasks:
+  chat:
+    enabled: true
+    llm:
+      provider: openai
+      model: gpt-4o-mini
+    talkPage: User talk:AmanojakuBot
+    personaPage: User:AmanojakuBot/config/persona
+
   review:
     enabled: false
+    draftNamespace: 118
     dailyLimit: 10
+    llm:
+      - provider: openai
+        model: gpt-5.4-mini
+      - provider: openai
+        model: gpt-4o-mini
+
   aiEdit:
     enabled: false
     reportPagePrefix: User:AmanojakuBot/sandbox/AICheck
     usersPage: User:AmanojakuBot/sandbox/AICheckUser
+    draftNamespace: 118
     maxAnalysesPerWindow: 20
     minConfidence: 0.85
-writeEnabled: false
+    llm:
+      - provider: openai
+        model: gpt-5.4-mini
+      - provider: openai
+        model: gpt-4o-mini

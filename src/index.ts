@@ -25,8 +25,8 @@ setGlobalDispatcher(new EnvHttpProxyAgent());
  * 4. 双事件驱动支持：支持 Wikimedia EventStreams (SSE) 高效流式消费与 Action API 定期重叠轮询。
  */
 
-const log = pino();
 const cfg = loadConfig(process.env.CONFIG_PATH ?? "config.yaml");
+const log = pino({ level: process.env.LOG_LEVEL ?? cfg.log.level });
 const db = openDb(cfg.storage.dbPath);
 const bot = createWiki(
   cfg.wiki.apiUrl,
@@ -118,6 +118,7 @@ if (cfg.events.mode === "eventstream") {
 } else {
   const request = (params: Record<string, string | number>) =>
     bot.request(params);
+
   const poll = async (
     key: string,
     title: string | undefined,
@@ -137,6 +138,9 @@ if (cfg.events.mode === "eventstream") {
       end,
       namespaces,
     );
+    if (changes.length > 0) {
+      log.debug({ changes }, "fetched recent changes for polling");
+    }
     for (const rc of changes) {
       await handle(
         {
@@ -164,7 +168,7 @@ if (cfg.events.mode === "eventstream") {
       try {
         await poll(`ai:${cfg.wiki.apiUrl}`, undefined, [
           0,
-          cfg.wiki.draftNamespace,
+          cfg.tasks.aiEdit.draftNamespace,
         ]);
       } catch (error) {
         log.error({ error }, "article polling failed; retaining checkpoint");
@@ -180,9 +184,8 @@ if (cfg.events.mode === "eventstream") {
 // -------------------------------------------------------------
 if (cfg.tasks.aiEdit.enabled) {
   const reportCfg = {
-    draftNamespace: cfg.wiki.draftNamespace,
-    provider: cfg.llm.provider,
-    model: cfg.llm.model,
+    draftNamespace: cfg.tasks.aiEdit.draftNamespace,
+    models: cfg.tasks.aiEdit.models,
     minConfidence: cfg.tasks.aiEdit.minConfidence,
     maxAnalysesPerWindow: cfg.tasks.aiEdit.maxAnalysesPerWindow,
     reportPagePrefix: cfg.tasks.aiEdit.reportPagePrefix!,

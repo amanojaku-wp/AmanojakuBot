@@ -10,6 +10,36 @@ import { z } from "zod";
  * 2. 凭据分离：密码与 API Key 通过进程环境变量注入（WIKI_BOT_PASSWORD / OPENAI_API_KEY 等），不落地在 YAML/Git。
  * 3. 默认安全：默认处于 dry-run 模式（writeEnabled: false），只打日志不向维基发起真实写入或消耗额度。
  */
+const llmSpecSchema = z.object({
+  provider: z.enum(["openai", "google"]),
+  model: z.string().min(1),
+});
+
+const llmConfigSchema = z.union([llmSpecSchema, z.array(llmSpecSchema).min(1)]);
+
+export type LlmModelSpec = z.infer<typeof llmSpecSchema>;
+export type LlmConfig = z.infer<typeof llmConfigSchema>;
+
+/**
+ * 将单个或多个 LLM 配置标准化为数组
+ */
+export function normalizeLlmConfig(
+  specific?: LlmConfig,
+  fallback?: LlmConfig,
+): LlmModelSpec[] {
+  const target = specific ?? fallback;
+  if (!target) return [];
+  return Array.isArray(target) ? target : [target];
+}
+
+/**
+ * 机器人全局配置契约定义
+ *
+ * 核心安全与业务约束：
+ * 1. 权限边界隔离：bot 仅允许读写自身所属的用户子页面与讨论页，防止被注入或误写入公共/条目命名空间。
+ * 2. 凭据分离：密码与 API Key 通过进程环境变量注入（WIKI_BOT_PASSWORD / OPENAI_API_KEY 等），不落地在 YAML/Git。
+ * 3. 默认安全：默认处于 dry-run 模式（writeEnabled: false），只打日志不向维基发起真实写入或消耗额度。
+ */
 export const configSchema = z.object({
   wiki: z.object({
     apiUrl: z.string().url().default("https://zh.wikipedia.org/w/api.php"),
@@ -21,12 +51,6 @@ export const configSchema = z.object({
     loginUsername: z.string().min(1).optional(),
     /** 机器人维护者（主人）的 MediaWiki User ID，享有免除每日评审限额的豁免权 */
     ownerUserId: z.number().int().positive().optional(),
-    /** 草稿命名空间 ID，中文维基百科默认为 118（Draft:） */
-    draftNamespace: z.number().int().nonnegative().default(118),
-    /** 机器人自己的讨论页（如 User talk:AmanojakuBot），任务一聊天与任务二评审的唯一回复目标 */
-    talkPage: z.string().regex(/^User talk:[^/]+$/i),
-    /** 存放机器人人设提示词的页面（User:AmanojakuBot/persona） */
-    personaPage: z.string().regex(/^User:[^/]+\//i),
     /** 存放运行控制开关的页面（User:AmanojakuBot/control），提供链上熔断/紧急停止机制 */
     controlPage: z.string().regex(/^User:[^/]+\//i),
     /**
@@ -35,6 +59,8 @@ export const configSchema = z.object({
      * 或自定义格式字符串（如 "YYYY年M月D日 (dd) HH:mm (UTC)"、"HH:mm, D MMMM YYYY (UTC)"）
      */
     timestampFormat: z.string().min(1).optional(),
+    /** 写入使能总开关（支持在 wiki 层级或顶层配置） */
+    writeEnabled: z.boolean().default(false),
   }),
   events: z
     .object({
@@ -47,33 +73,58 @@ export const configSchema = z.object({
       pollIntervalSeconds: z.number().int().min(10).default(60),
       /** 轮询回溯重叠窗口，防止因 API 复制延迟或时钟偏差遗漏变更 */
       overlapSeconds: z.number().int().min(0).max(300).default(60),
+      allowBotEdits: z.boolean().default(false),
     })
     .default({
       streamUrl: "https://stream.wikimedia.org/v2/stream/recentchange",
       pollIntervalSeconds: 60,
       overlapSeconds: 60,
+      allowBotEdits: false,
     }),
-  llm: z.object({
-    provider: z.enum(["openai", "google"]),
-    model: z.string().min(1),
-  }),
   storage: z
-    .object({ dbPath: z.string().min(1).default("bot.sqlite") })
+    .object({
+      type: z.string().optional(),
+      dbPath: z.string().min(1).default("bot.sqlite"),
+    })
     .default({ dbPath: "bot.sqlite" }),
+  log: z
+    .object({
+      level: z.string().default("info"),
+    })
+    .default({ level: "info" }),
+  llm: llmConfigSchema.optional(),
   tasks: z
     .object({
+      /** 任务一：讨论页自由对话 */
+      chat: z
+        .object({
+          enabled: z.boolean().default(true),
+          talkPage: z
+            .string()
+            .regex(/^User talk:[^/]+$/i)
+            .optional(),
+          personaPage: z
+            .string()
+            .regex(/^User:[^/]+\//i)
+            .optional(),
+          llm: llmConfigSchema.optional(),
+        })
+        .default({ enabled: true }),
       /** 任务二：应请求条目/草稿校对评审 */
       review: z
         .object({
           enabled: z.boolean().default(true),
+          draftNamespace: z.number().int().nonnegative().default(118),
           /** 非主人用户每个 UTC 自然日允许请求评审的有效页面上限 */
           dailyLimit: z.number().int().min(1).max(10).default(10),
+          llm: llmConfigSchema.optional(),
         })
-        .default({ enabled: true, dailyLimit: 10 }),
+        .default({ enabled: true, draftNamespace: 118, dailyLimit: 10 }),
       /** 任务三：近期编辑疑似 AI 辅助内容的人工复核线索报告（默认关闭，需显式启用） */
       aiEdit: z
         .object({
           enabled: z.boolean().default(false),
+          draftNamespace: z.number().int().nonnegative().default(118),
           /** 按月分段的线索报告页前缀（如 User:AmanojakuBot/AI线索） */
           reportPagePrefix: z
             .string()
@@ -88,19 +139,27 @@ export const configSchema = z.object({
           maxAnalysesPerWindow: z.number().int().min(1).max(100).default(20),
           /** 记录为有效线索的最低置信度阈值（要求高置信度与严格原文摘录） */
           minConfidence: z.number().min(0.7).max(1).default(0.85),
+          llm: llmConfigSchema.optional(),
         })
         .default({
           enabled: false,
+          draftNamespace: 118,
           maxAnalysesPerWindow: 20,
           minConfidence: 0.85,
         }),
     })
     .default({
-      review: { enabled: true, dailyLimit: 10 },
-      aiEdit: { enabled: false, maxAnalysesPerWindow: 20, minConfidence: 0.85 },
+      chat: { enabled: true },
+      review: { enabled: true, draftNamespace: 118, dailyLimit: 10 },
+      aiEdit: {
+        enabled: false,
+        draftNamespace: 118,
+        maxAnalysesPerWindow: 20,
+        minConfidence: 0.85,
+      },
     }),
-  /** 写入使能总开关：必须为 true 且提供密码才允许向维基发起实际编辑 */
-  writeEnabled: z.boolean().default(false),
+  /** 写入使能总开关（兼容顶层定义） */
+  writeEnabled: z.boolean().optional(),
 });
 
 export type RawConfig = z.infer<typeof configSchema>;
@@ -108,17 +167,25 @@ export type AppConfig = ReturnType<typeof loadConfig>;
 
 /**
  * 加载并严格校验配置文件
- *
- * 关键安全断言：
- * - 强制检查 talkPage、personaPage、controlPage、reportPagePrefix、usersPage 全部归属于机器人自己
- * - 自动推断 zhwiki 默认 EventStreams 与 wikiId，保障非 zhwiki 站点配置的完备性
  */
 export function loadConfig(path = "config.yaml") {
-  const cfg = configSchema.parse(YAML.parse(readFileSync(path, "utf8")));
-  const user = cfg.wiki.username.replaceAll("_", " ").toLowerCase();
+  const parsed = configSchema.parse(YAML.parse(readFileSync(path, "utf8")));
+  const user = parsed.wiki.username.replaceAll("_", " ").toLowerCase();
+
+  // 整理 writeEnabled
+  const writeEnabled = parsed.wiki.writeEnabled ?? false;
+
+  // 默认 talkPage 和 personaPage
+  const talkPage =
+    parsed.tasks.chat.talkPage ?? `User talk:${parsed.wiki.username}`;
+  const personaPage =
+    parsed.tasks.chat.personaPage ??
+    `User:${parsed.wiki.username}/config/persona`;
+
+  // 校验归属权
   if (
-    cfg.wiki.talkPage.slice(10).replaceAll("_", " ").toLowerCase() !== user ||
-    ![cfg.wiki.personaPage, cfg.wiki.controlPage].every((p) =>
+    talkPage.slice(10).replaceAll("_", " ").toLowerCase() !== user ||
+    ![personaPage, parsed.wiki.controlPage].every((p) =>
       p
         .slice(5)
         .replaceAll("_", " ")
@@ -129,14 +196,16 @@ export function loadConfig(path = "config.yaml") {
     throw new Error(
       "All writable and control pages must belong to the configured bot",
     );
+
   if (
-    cfg.tasks.aiEdit.enabled &&
-    (!cfg.tasks.aiEdit.reportPagePrefix || !cfg.tasks.aiEdit.usersPage)
+    parsed.tasks.aiEdit.enabled &&
+    (!parsed.tasks.aiEdit.reportPagePrefix || !parsed.tasks.aiEdit.usersPage)
   )
     throw new Error("AI-edit reports require reportPagePrefix and usersPage");
+
   for (const p of [
-    cfg.tasks.aiEdit.reportPagePrefix,
-    cfg.tasks.aiEdit.usersPage,
+    parsed.tasks.aiEdit.reportPagePrefix,
+    parsed.tasks.aiEdit.usersPage,
   ].filter((v): v is string => !!v))
     if (
       !p
@@ -146,21 +215,52 @@ export function loadConfig(path = "config.yaml") {
         .startsWith(user + "/")
     )
       throw new Error("AI-edit output pages must belong to the configured bot");
-  const isZhwiki = new URL(cfg.wiki.apiUrl).hostname === "zh.wikipedia.org";
-  const mode = cfg.events.mode ?? (isZhwiki ? "eventstream" : "polling");
-  if (mode === "eventstream" && !cfg.wiki.wikiId && !isZhwiki)
+
+  const isZhwiki = new URL(parsed.wiki.apiUrl).hostname === "zh.wikipedia.org";
+  const mode = parsed.events.mode ?? (isZhwiki ? "eventstream" : "polling");
+  if (mode === "eventstream" && !parsed.wiki.wikiId && !isZhwiki)
     throw new Error(
       "events.mode=eventstream requires wiki.wikiId on non-zhwiki sites",
     );
   const defaultTimestampFormat = isZhwiki ? "zhwiki" : "publictestwiki";
-  const timestampFormat = cfg.wiki.timestampFormat ?? defaultTimestampFormat;
+  const timestampFormat = parsed.wiki.timestampFormat ?? defaultTimestampFormat;
+
+  // 解析各个任务的 LLM 模型链列表
+  const globalLlm = parsed.llm;
+  const chatModels = normalizeLlmConfig(parsed.tasks.chat.llm, globalLlm);
+  const reviewModels = normalizeLlmConfig(parsed.tasks.review.llm, globalLlm);
+  const aiEditModels = normalizeLlmConfig(parsed.tasks.aiEdit.llm, globalLlm);
+
+  if (chatModels.length === 0 && parsed.tasks.chat.enabled) {
+    throw new Error("No LLM configuration found for task: chat");
+  }
+
   return {
-    ...cfg,
-    events: { ...cfg.events, mode },
+    ...parsed,
+    writeEnabled,
+    events: { ...parsed.events, mode },
     wiki: {
-      ...cfg.wiki,
-      wikiId: cfg.wiki.wikiId ?? (isZhwiki ? "zhwiki" : undefined),
+      ...parsed.wiki,
+      writeEnabled,
+      talkPage,
+      personaPage,
       timestampFormat,
+    },
+    tasks: {
+      chat: {
+        ...parsed.tasks.chat,
+        talkPage,
+        personaPage,
+        models: chatModels,
+      },
+      review: {
+        ...parsed.tasks.review,
+        models: reviewModels,
+      },
+      aiEdit: {
+        ...parsed.tasks.aiEdit,
+        models: aiEditModels,
+      },
     },
   };
 }

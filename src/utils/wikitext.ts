@@ -348,13 +348,14 @@ export function isRelevant(
   talkPage: string,
   bot: string,
   wikiId?: string,
+  allowBotEdits?: boolean,
 ) {
   return (
     (!wikiId || e.wiki === wikiId) &&
     e.type === "edit" &&
     e.namespace === 3 &&
     e.title?.replaceAll("_", " ") === talkPage &&
-    !e.bot &&
+    !(e.bot && !allowBotEdits) &&
     e.user !== bot &&
     !!e.revision?.new
   );
