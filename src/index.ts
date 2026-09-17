@@ -105,14 +105,17 @@ if (cfg.events.mode === "eventstream") {
           mark.run(streamKey, lastEventId, new Date().toISOString());
         }
       } catch (error) {
-        log.error({ error }, "event processing failed; checkpoint unchanged");
+        log.error(
+          { err: error },
+          "event processing failed; checkpoint unchanged",
+        );
         source.close();
         process.exit(1);
       }
     });
   });
   source.addEventListener("error", (error) =>
-    log.warn({ error }, "stream disconnected; EventSource will reconnect"),
+    log.warn({ err: error }, "stream disconnected; EventSource will reconnect"),
   );
 } else {
   const request = (params: Record<string, string | number>) =>
@@ -137,9 +140,9 @@ if (cfg.events.mode === "eventstream") {
       end,
       namespaces,
     );
-    if (changes.length > 0) {
-      log.debug({ changes }, "fetched recent changes for polling");
-    }
+    //if (changes.length > 0) {
+    //  log.debug({ changes }, "fetched recent changes for polling");
+    //}
     for (const rc of changes) {
       await handle(
         {
@@ -166,7 +169,7 @@ if (cfg.events.mode === "eventstream") {
         );
       } catch (error) {
         log.error(
-          { error },
+          { err: error },
           "chat discussion polling failed; retaining checkpoint",
         );
       }
@@ -179,7 +182,7 @@ if (cfg.events.mode === "eventstream") {
         );
       } catch (error) {
         log.error(
-          { error },
+          { err: error },
           "review discussion polling failed; retaining checkpoint",
         );
       }
@@ -191,7 +194,10 @@ if (cfg.events.mode === "eventstream") {
           cfg.tasks.aiEdit.draftNamespace,
         ]);
       } catch (error) {
-        log.error({ error }, "article polling failed; retaining checkpoint");
+        log.error(
+          { err: error },
+          "article polling failed; retaining checkpoint",
+        );
       }
     }
     setTimeout(tick, cfg.events.pollIntervalSeconds * 1000);
@@ -218,7 +224,7 @@ if (cfg.tasks.aiEdit.enabled) {
     try {
       await queue;
     } catch (error) {
-      log.error({ error }, "report publication failed");
+      log.error({ err: error }, "report publication failed");
       queue = Promise.resolve();
     }
     setTimeout(publish, 60_000);

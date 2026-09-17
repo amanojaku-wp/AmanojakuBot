@@ -2,11 +2,18 @@ import { describe, it, expect } from "vitest";
 import {
   addedComment,
   extractCommentDetails,
+  formatDiscussionReply,
   formatWikiTimestamp,
+  getCommentIndentLevel,
   insertReplyIntoContent,
   isRelevant,
   parseSections,
 } from "../src/utils/wikitext.js";
+import {
+  addTokenUsage,
+  createTokenUsage,
+  formatTokenUsage,
+} from "../src/utils/llm.js";
 
 describe("discussion filtering & timestamp handling", () => {
   it("formats timestamps according to wiki configuration", () => {
@@ -91,6 +98,52 @@ describe("discussion filtering & timestamp handling", () => {
     );
   });
 
+  it("calculates indentation levels and formats outdent when exceeding 8", () => {
+    expect(getCommentIndentLevel("Hello world")).toBe(0);
+    expect(getCommentIndentLevel(":First reply")).toBe(1);
+    expect(getCommentIndentLevel(":::Third reply")).toBe(3);
+    expect(getCommentIndentLevel("::::::::Level 8 reply")).toBe(8);
+    expect(getCommentIndentLevel(":::::::::Level 9 reply")).toBe(9);
+
+    const marker = "<!-- marker -->";
+    // 0 -> 1 level (:)
+    expect(formatDiscussionReply("回复内容", 0, marker)).toBe(
+      ":回复内容 —~~~~ <!-- marker -->",
+    );
+    // 1 -> 2 level (::)
+    expect(formatDiscussionReply("回复内容", 1, marker)).toBe(
+      "::回复内容 —~~~~ <!-- marker -->",
+    );
+    // 7 -> 8 level (::::::::)
+    expect(formatDiscussionReply("回复内容", 7, marker)).toBe(
+      "::::::::回复内容 —~~~~ <!-- marker -->",
+    );
+    // 8 -> 9 level (> 8) -> outdent to 0
+    expect(formatDiscussionReply("回复内容", 8, marker)).toBe(
+      "{{Outdent|8}}\n回复内容 —~~~~ <!-- marker -->",
+    );
+    // 9 -> 10 level (> 8) -> outdent to 0
+    expect(formatDiscussionReply("回复内容", 9, marker)).toBe(
+      "{{Outdent|8}}\n回复内容 —~~~~ <!-- marker -->",
+    );
+  });
+
+  it("inserts reply directly on the next line following target comment", () => {
+    const content = `== 话题一 ==\nAlice: 留言 1\n:Charlie: 插话！\n:Eve: 后续留言\n\n== 话题二 ==\nBob: 留言 2`;
+    const targetComment = ":Charlie: 插话！";
+    const reply = "::机器人回复 --~~~~ <!-- marker -->";
+
+    const updated = insertReplyIntoContent(
+      content,
+      reply,
+      "话题一",
+      targetComment,
+    );
+    expect(updated).toBe(
+      `== 话题一 ==\nAlice: 留言 1\n:Charlie: 插话！\n::机器人回复 --~~~~ <!-- marker -->\n:Eve: 后续留言\n\n== 话题二 ==\nBob: 留言 2`,
+    );
+  });
+
   it("ignores other wikis and namespaces", () => {
     const e = {
       wiki: "zhwiki",
@@ -110,5 +163,20 @@ describe("discussion filtering & timestamp handling", () => {
         false,
       ),
     ).toBe(false);
+  });
+
+  it("accumulates and formats token usage correctly", () => {
+    const usage = createTokenUsage();
+    expect(formatTokenUsage(usage)).toBe("I0/O0/T0");
+
+    addTokenUsage(usage, { inputTokens: 1234, outputTokens: 567 });
+    expect(formatTokenUsage(usage)).toBe("I1234/O567/T1801");
+
+    addTokenUsage(usage, {
+      inputTokens: 100,
+      outputTokens: 200,
+      totalTokens: 300,
+    });
+    expect(formatTokenUsage(usage)).toBe("I1334/O767/T2101");
   });
 });

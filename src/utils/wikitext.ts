@@ -296,14 +296,74 @@ export function addedComment(
 }
 
 /**
- * 将机器人回复安全插入到讨论页指定二级标题章节的末尾
- * 若未找到指定章节或章节为空，则回退为追加至页面末尾
+ * 识别留言文本开头的维基缩进等级（以冒号 `:` 数量计量）
+ */
+export function getCommentIndentLevel(comment: string): number {
+  const trimmed = comment.trimStart();
+  const firstLine = trimmed.split("\n")[0] ?? "";
+  const match = firstLine.match(/^:+/);
+  return match ? match[0].length : 0;
+}
+
+/**
+ * 格式化机器人讨论页回复：
+ * 在上一条留言缩进等级上 +1；若新等级超过 8，则使用 {{Outdent|上一条缩进}} 将缩进重置为 0。
+ */
+export function formatDiscussionReply(
+  reply: string,
+  currentIndentLevel: number,
+  marker: string,
+): string {
+  const cleanReply = reply.replaceAll("~~~~", "");
+  const nextLevel = currentIndentLevel + 1;
+
+  if (nextLevel > 8) {
+    return `:{{Outdent|${currentIndentLevel - 1}}}${cleanReply.replace(/\n/g, "\n:")} —~~~~ ${marker}`;
+  }
+  const indents = ":".repeat(nextLevel);
+  return `${indents}${cleanReply.replace(/\n/g, `\n${indents}`)} —~~~~ ${marker}`;
+}
+
+/**
+ * 将机器人回复安全插入到讨论页中：
+ * 1. 优先定位目标留言（targetComment），紧跟在其下一行插入回复。
+ * 2. 若未提供 targetComment 或定位失败，则插入到指定二级标题章节的末尾。
+ * 3. 若未找到指定章节或章节为空，则回退为追加至页面末尾。
  */
 export function insertReplyIntoContent(
   content: string,
   replyWikitext: string,
   sectionTitle?: string,
+  targetComment?: string,
 ): string {
+  if (targetComment) {
+    const trimmedTarget = targetComment.trim();
+    let pos = content.indexOf(targetComment);
+    let matchLen = targetComment.length;
+    if (pos === -1 && trimmedTarget) {
+      pos = content.indexOf(trimmedTarget);
+      matchLen = trimmedTarget.length;
+    }
+    if (pos === -1 && trimmedTarget) {
+      const firstLine = trimmedTarget.split("\n")[0].trim();
+      if (firstLine.length > 5) {
+        pos = content.indexOf(firstLine);
+        matchLen = firstLine.length;
+      }
+    }
+    if (pos !== -1) {
+      const before = content.slice(0, pos + matchLen);
+      const after = content.slice(pos + matchLen);
+      if (after.startsWith("\r\n")) {
+        return `${before}\r\n${replyWikitext}${after}`;
+      }
+      if (after.startsWith("\n")) {
+        return `${before}\n${replyWikitext}${after}`;
+      }
+      return `${before}\n${replyWikitext}\n${after.trimStart()}`;
+    }
+  }
+
   if (!sectionTitle) {
     return `${content.trimEnd()}\n\n${replyWikitext}\n`;
   }

@@ -90,8 +90,9 @@ export const configSchema = z.object({
   log: z
     .object({
       level: z.string().default("info"),
+      responseTokenOnWiki: z.boolean().default(false),
     })
-    .default({ level: "info" }),
+    .default({ level: "info", responseTokenOnWiki: false }),
   llm: llmConfigSchema.optional(),
   tasks: z
     .object({

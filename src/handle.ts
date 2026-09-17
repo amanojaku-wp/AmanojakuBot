@@ -72,7 +72,7 @@ export async function handle(
         break;
       }
     } catch (error) {
-      ctx.log.error({ error, event: e }, "handler execution failed");
+      ctx.log.error({ err: error, event: e }, "handler execution failed");
       throw error;
     }
   }

@@ -17,6 +17,7 @@ storage:
 
 log:
   level: info
+  responseTokenOnWiki: false
 
 llm:
   provider: gemini

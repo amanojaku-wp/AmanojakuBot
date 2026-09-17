@@ -16,9 +16,9 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,json,md}\""
   },
   "dependencies": {
-    "@ai-sdk/google": "^2.0.0",
-    "@ai-sdk/openai": "^2.0.0",
-    "ai": "^5.0.0",
+    "@ai-sdk/google": "^4.0.74",
+    "@ai-sdk/openai": "^4.0.69",
+    "ai": "^7.0.105",
     "better-sqlite3": "^12.0.0",
     "diff": "^9.0.0",
     "eventsource": "^4.0.0",
