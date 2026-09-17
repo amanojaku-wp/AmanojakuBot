@@ -10,6 +10,12 @@ import {
   windowStart,
 } from "../utils/wikitext.js";
 import { executeWithFallback, type LlmModelSpec } from "../utils/llm.js";
+import type {
+  ChangeEvent,
+  HandlerContext,
+  HandlerResult,
+  TaskHandler,
+} from "../handle.js";
 
 /**
  * 任务三配置项：疑似 AI 生成内容初筛与报告
@@ -22,6 +28,57 @@ export type AiConfig = {
   reportPagePrefix: string;
   usersPage: string;
   writeEnabled: boolean;
+};
+
+/**
+ * 任务三：近期编辑疑似 AI 辅助内容初筛处理器
+ */
+export const aiEditHandler: TaskHandler = async (
+  e: ChangeEvent,
+  ctx: HandlerContext,
+): Promise<HandlerResult | void> => {
+  const { db, bot, cfg } = ctx;
+  if (!cfg.tasks.aiEdit.enabled) {
+    return { intercepted: false };
+  }
+
+  if (
+    (!cfg.wiki.wikiId || e.wiki === cfg.wiki.wikiId) &&
+    e.revision?.new &&
+    e.title &&
+    e.namespace !== undefined &&
+    e.user &&
+    e.user !== cfg.wiki.username &&
+    ["edit", "new"].includes(e.type ?? "") &&
+    [0, cfg.tasks.aiEdit.draftNamespace].includes(e.namespace)
+  ) {
+    await analyzeCandidate(
+      db,
+      bot,
+      {
+        revid: e.revision.new,
+        title: e.title,
+        namespace: e.namespace,
+        user: e.user,
+        bot: e.bot,
+        type: e.type ?? "",
+        oldLength: e.length?.old,
+        newLength: e.length?.new,
+      },
+      {
+        draftNamespace: cfg.tasks.aiEdit.draftNamespace,
+        models: cfg.tasks.aiEdit.models,
+        minConfidence: cfg.tasks.aiEdit.minConfidence,
+        maxAnalysesPerWindow: cfg.tasks.aiEdit.maxAnalysesPerWindow,
+        reportPagePrefix: cfg.tasks.aiEdit.reportPagePrefix!,
+        usersPage: cfg.tasks.aiEdit.usersPage!,
+        writeEnabled: cfg.writeEnabled,
+      },
+    );
+    return { intercepted: true };
+  }
+
+  return { intercepted: false };
 };
 
 /**

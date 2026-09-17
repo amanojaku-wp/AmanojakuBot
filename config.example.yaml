@@ -35,6 +35,7 @@ tasks:
     enabled: false
     draftNamespace: 118
     dailyLimit: 10
+    talkPage: User talk:AmanojakuBot/review
     llm:
       - provider: openai
         model: gpt-5.4-mini

@@ -101,7 +101,7 @@ export const configSchema = z.object({
           enabled: z.boolean().default(true),
           talkPage: z
             .string()
-            .regex(/^User talk:[^/]+$/i)
+            .regex(/^User talk:[^/]+(?:\/.+)?$/i)
             .optional(),
           personaPage: z
             .string()
@@ -114,6 +114,10 @@ export const configSchema = z.object({
       review: z
         .object({
           enabled: z.boolean().default(true),
+          talkPage: z
+            .string()
+            .regex(/^User talk:[^/]+(?:\/.+)?$/i)
+            .optional(),
           draftNamespace: z.number().int().nonnegative().default(118),
           /** 非主人用户每个 UTC 自然日允许请求评审的有效页面上限 */
           dailyLimit: z.number().int().min(1).max(10).default(10),
@@ -176,15 +180,23 @@ export function loadConfig(path = "config.yaml") {
   const writeEnabled = parsed.wiki.writeEnabled ?? false;
 
   // 默认 talkPage 和 personaPage
-  const talkPage =
+  const chatTalkPage =
     parsed.tasks.chat.talkPage ?? `User talk:${parsed.wiki.username}`;
+  const reviewTalkPage =
+    parsed.tasks.review.talkPage ?? `User talk:${parsed.wiki.username}/review`;
   const personaPage =
     parsed.tasks.chat.personaPage ??
     `User:${parsed.wiki.username}/config/persona`;
 
   // 校验归属权
+  const isBotTalkPage = (p: string) => {
+    const target = p.slice(10).replaceAll("_", " ").toLowerCase();
+    return target === user || target.startsWith(`${user}/`);
+  };
+
   if (
-    talkPage.slice(10).replaceAll("_", " ").toLowerCase() !== user ||
+    !isBotTalkPage(chatTalkPage) ||
+    !isBotTalkPage(reviewTalkPage) ||
     ![personaPage, parsed.wiki.controlPage].every((p) =>
       p
         .slice(5)
@@ -242,19 +254,20 @@ export function loadConfig(path = "config.yaml") {
     wiki: {
       ...parsed.wiki,
       writeEnabled,
-      talkPage,
+      talkPage: chatTalkPage,
       personaPage,
       timestampFormat,
     },
     tasks: {
       chat: {
         ...parsed.tasks.chat,
-        talkPage,
+        talkPage: chatTalkPage,
         personaPage,
         models: chatModels,
       },
       review: {
         ...parsed.tasks.review,
+        talkPage: reviewTalkPage,
         models: reviewModels,
       },
       aiEdit: {

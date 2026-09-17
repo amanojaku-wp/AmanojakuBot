@@ -53,8 +53,7 @@ const checkpoint = db.prepare(
   "SELECT event_id,timestamp FROM checkpoint WHERE name=?",
 );
 
-const streamKey = `stream:${cfg.events.streamUrl}:${cfg.wiki.wikiId}:${cfg.wiki.talkPage}`;
-const pollKey = `poll:${cfg.wiki.apiUrl}:${cfg.wiki.talkPage}`;
+const streamKey = `stream:${cfg.events.streamUrl}:${cfg.wiki.wikiId ?? "default"}`;
 let lastEventId = (
   checkpoint.get(streamKey) as { event_id?: string } | undefined
 )?.event_id;
@@ -159,10 +158,31 @@ if (cfg.events.mode === "eventstream") {
   };
 
   const tick = async () => {
-    try {
-      await poll(pollKey, cfg.wiki.talkPage);
-    } catch (error) {
-      log.error({ error }, "discussion polling failed; retaining checkpoint");
+    if (cfg.tasks.chat.enabled) {
+      try {
+        await poll(
+          `poll:chat:${cfg.wiki.apiUrl}:${cfg.tasks.chat.talkPage}`,
+          cfg.tasks.chat.talkPage,
+        );
+      } catch (error) {
+        log.error(
+          { error },
+          "chat discussion polling failed; retaining checkpoint",
+        );
+      }
+    }
+    if (cfg.tasks.review.enabled) {
+      try {
+        await poll(
+          `poll:review:${cfg.wiki.apiUrl}:${cfg.tasks.review.talkPage}`,
+          cfg.tasks.review.talkPage,
+        );
+      } catch (error) {
+        log.error(
+          { error },
+          "review discussion polling failed; retaining checkpoint",
+        );
+      }
     }
     if (cfg.tasks.aiEdit.enabled) {
       try {

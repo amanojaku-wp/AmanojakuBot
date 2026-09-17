@@ -1,13 +1,147 @@
 import type Database from "better-sqlite3";
 import type { Mwn } from "mwn";
-import { pageText } from "../utils/wiki.js";
-import type { CommentExtractionResult } from "../utils/wikitext.js";
 import { generateText } from "ai";
+import { pageText, revision } from "../utils/wiki.js";
+import {
+  extractCommentDetails,
+  insertReplyIntoContent,
+  isRelevant,
+  type CommentExtractionResult,
+} from "../utils/wikitext.js";
 import { executeWithFallback, type LlmModelSpec } from "../utils/llm.js";
+import type {
+  ChangeEvent,
+  HandlerContext,
+  HandlerResult,
+  TaskHandler,
+} from "../handle.js";
 
 export type ChatConfig = {
   personaPage: string;
   models: LlmModelSpec[];
+};
+
+/**
+ * 任务一：讨论页自由对话处理器
+ */
+export const chatHandler: TaskHandler = async (
+  e: ChangeEvent,
+  ctx: HandlerContext,
+): Promise<HandlerResult | void> => {
+  const { db, bot, cfg, log, canWrite } = ctx;
+  if (!cfg.tasks.chat.enabled) {
+    return { intercepted: false };
+  }
+
+  if (
+    !isRelevant(
+      e,
+      cfg.tasks.chat.talkPage,
+      cfg.wiki.username,
+      cfg.wiki.wikiId,
+      cfg.events.allowBotEdits,
+    )
+  ) {
+    return { intercepted: false };
+  }
+
+  const revid = e.revision!.new!;
+  const seen =
+    ctx.seenStatement ?? db.prepare("SELECT state FROM events WHERE revid=?");
+  const save =
+    ctx.saveStatement ??
+    db.prepare(
+      "INSERT INTO events(revid,state,actor_id,reply_revid,updated_at) VALUES(?,?,?,?,datetime('now')) ON CONFLICT(revid) DO UPDATE SET state=excluded.state,reply_revid=excluded.reply_revid,updated_at=excluded.updated_at",
+    );
+
+  if ((seen.get(revid) as { state: string } | undefined)?.state === "done") {
+    return { intercepted: true };
+  }
+
+  const rev = await revision(bot, revid);
+  if (
+    !rev ||
+    rev.actor !== e.user ||
+    rev.before === undefined ||
+    rev.after === undefined
+  ) {
+    return { intercepted: true };
+  }
+
+  const extraction = extractCommentDetails(
+    rev.before,
+    rev.after,
+    rev.timestamp,
+    cfg.wiki.timestampFormat,
+  );
+  if (!extraction) return { intercepted: true };
+  const message = extraction.comment;
+
+  if (!(await canWrite())) {
+    log.info({ revid }, "chat disabled by control page");
+    return { intercepted: true };
+  }
+
+  const reply = await prepareChatReply(
+    db,
+    bot,
+    rev.actorId,
+    rev.actor,
+    message,
+    extraction,
+    {
+      personaPage: cfg.tasks.chat.personaPage,
+      models: cfg.tasks.chat.models,
+    },
+  );
+
+  if (!reply || reply.length > 12000) {
+    throw new Error("Empty or overlong reply");
+  }
+
+  const marker = `<!-- amanojaku-bot:source=${revid} -->`;
+  if (!cfg.writeEnabled) {
+    log.info({ revid, actorId: rev.actorId, reply }, "dry run (chat)");
+    return { intercepted: true };
+  }
+
+  if (!(await canWrite())) return { intercepted: true };
+
+  const currentTalk = await bot.read(cfg.tasks.chat.talkPage);
+  const currentTalkContent = currentTalk?.revisions?.[0]?.content ?? "";
+  if (currentTalkContent.includes(marker)) {
+    save.run(revid, "done", rev.actorId, null);
+    return { intercepted: true };
+  }
+
+  save.run(revid, "pending", rev.actorId, null);
+  const replyWikitext = `:${reply.replaceAll("~~~~", "")} —~~~~ ${marker}`;
+  const result = await bot.edit(cfg.tasks.chat.talkPage, ({ content }) => {
+    if (content.includes(marker))
+      throw new Error("Reply marker already present");
+    return {
+      text: insertReplyIntoContent(
+        content,
+        replyWikitext,
+        extraction.sectionTitle,
+      ),
+      summary: "回复留言",
+      bot: true,
+    };
+  });
+
+  db.transaction(() => {
+    save.run(revid, "done", rev.actorId, result.newrevid ?? null);
+    db.prepare(
+      "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'user',?,datetime('now'))",
+    ).run(rev.actorId, revid, message);
+    db.prepare(
+      "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'assistant',?,datetime('now'))",
+    ).run(rev.actorId, revid, reply);
+  })();
+  log.info({ revid }, "chat replied");
+
+  return { intercepted: true };
 };
 
 /**

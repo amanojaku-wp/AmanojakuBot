@@ -33,12 +33,12 @@
 ### 代码目录架构
 
 - `src/index.ts`：系统常驻守护进程入口，负责配置加载、数据库与维基客户端初始化、事件驱动监听（EventStreams SSE / RecentChanges 轮询）与定时任务调度。
-- `src/handle.ts`：机器人变更事件路由器，集中处理任务分发、讨论页鉴权过滤、链上控制阻断、任务执行与幂等回复写入。
-- `src/config/`：配置契约与加载器（`src/config/index.ts`），基于 YAML + Zod 严格校验。
+- `src/handle.ts`：变更事件主路由分发器，采用可插拔责任链流水线模式调度各任务 Handler（`[chatHandler, reviewHandler, aiEditHandler]`），支持按 `intercepted` 拦截与错误捕获。
+- `src/config/`：配置契约与加载器（`src/config/index.ts`），基于 YAML + Zod 严格校验；Chat 和 Review 任务支持配置在独立的机器人讨论页中运行。
 - `src/utils/`：通用基础设施与工具模块（`db.ts` SQLite存储、`wiki.ts` MediaWiki客户端交互、`llm.ts` 大模型调用、`polling.ts` 近期变更轮询、`wikitext.ts` 维基文本与讨论页解析）。
-- `src/tasks/`：三大机器人任务模块，各独立一文件：
-  - `src/tasks/chat.ts`：任务一（讨论页自由对话与章节多用户上下文应答）
-  - `src/tasks/review.ts`：任务二（应请求条目/草稿校对评审与30天生命周期额度管控）
+- `src/tasks/`：三大机器人任务模块，各独立一文件并暴露各自的 `TaskHandler`：
+  - `src/tasks/chat.ts`：任务一（讨论页自由对话与章节多用户上下文应答，默认运行在 `User talk:Bot`）
+  - `src/tasks/review.ts`：任务二（应请求条目/草稿校对评审与30天生命周期额度管控，默认运行在 `User talk:Bot/review`）
   - `src/tasks/aiEdit.ts`：任务三（疑似 AI 辅助编辑初筛、6小时UTC聚合线索报告与三篇跨条目用户汇总）
 
 ## 继续开发建议
