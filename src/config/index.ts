@@ -119,12 +119,28 @@ export const configSchema = z.object({
             .string()
             .regex(/^User talk:[^/]+(?:\/.+)?$/i)
             .optional(),
-          draftNamespace: z.number().int().nonnegative().default(118),
-          /** 非主人用户每个 UTC 自然日允许请求评审的有效页面上限 */
-          dailyLimit: z.number().int().min(1).max(10).default(10),
+          rulePage: z
+            .string()
+            .regex(/^User:[^/]+\//i)
+            .optional(),
+          template: z.string().min(1).optional(),
+          draftNamespace: z
+            .union([
+              z.number().int().nonnegative(),
+              z.array(z.number().int().nonnegative()),
+            ])
+            .default([2, 118]),
+          /** 每个用户每个 UTC 自然日最多成功提交的校对请求数量 */
+          userDailyLimit: z.number().int().min(1).default(5),
+          /** 兼容旧配置项 dailyLimit */
+          dailyLimit: z.number().int().min(1).optional(),
           llm: llmConfigSchema.optional(),
         })
-        .default({ enabled: true, draftNamespace: 118, dailyLimit: 10 }),
+        .default({
+          enabled: true,
+          draftNamespace: [2, 118],
+          userDailyLimit: 5,
+        }),
       /** 任务三：近期编辑疑似 AI 辅助内容的人工复核线索报告（默认关闭，需显式启用） */
       aiEdit: z
         .object({
@@ -155,7 +171,7 @@ export const configSchema = z.object({
     })
     .default({
       chat: { enabled: true },
-      review: { enabled: true, draftNamespace: 118, dailyLimit: 10 },
+      review: { enabled: true, draftNamespace: [2, 118], userDailyLimit: 5 },
       aiEdit: {
         enabled: false,
         draftNamespace: 118,
@@ -188,6 +204,17 @@ export function loadConfig(path = "config.yaml") {
   const personaPage =
     parsed.tasks.chat.personaPage ??
     `User:${parsed.wiki.username}/config/persona`;
+  const reviewRulePage =
+    parsed.tasks.review.rulePage ?? `User:${parsed.wiki.username}/task/2/rule`;
+  const reviewTemplate =
+    parsed.tasks.review.template ??
+    `User:${parsed.wiki.username}/template/ReviewRequest`;
+  const draftNamespaceRaw = parsed.tasks.review.draftNamespace;
+  const reviewDraftNamespaces: number[] = Array.isArray(draftNamespaceRaw)
+    ? draftNamespaceRaw
+    : [draftNamespaceRaw];
+  const reviewUserDailyLimit =
+    parsed.tasks.review.userDailyLimit ?? parsed.tasks.review.dailyLimit ?? 5;
 
   // 校验归属权
   const isBotTalkPage = (p: string) => {
@@ -198,7 +225,7 @@ export function loadConfig(path = "config.yaml") {
   if (
     !isBotTalkPage(chatTalkPage) ||
     !isBotTalkPage(reviewTalkPage) ||
-    ![personaPage, parsed.wiki.controlPage].every((p) =>
+    ![personaPage, parsed.wiki.controlPage, reviewRulePage].every((p) =>
       p
         .slice(5)
         .replaceAll("_", " ")
@@ -269,6 +296,10 @@ export function loadConfig(path = "config.yaml") {
       review: {
         ...parsed.tasks.review,
         talkPage: reviewTalkPage,
+        rulePage: reviewRulePage,
+        template: reviewTemplate,
+        draftNamespaces: reviewDraftNamespaces,
+        userDailyLimit: reviewUserDailyLimit,
         models: reviewModels,
       },
       aiEdit: {

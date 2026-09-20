@@ -45,7 +45,9 @@ const log = pino({
           if (typeof inputArgs[0] === "object" && inputArgs[0] !== null) {
             const obj = inputArgs[0] as Record<string, unknown>;
             err = obj.err ?? obj.error;
-            const { err: _e, error: _e2, ...rest } = obj;
+            const rest = { ...obj };
+            delete rest.err;
+            delete rest.error;
             context = Object.keys(rest).length > 0 ? rest : undefined;
             msg = typeof inputArgs[1] === "string" ? inputArgs[1] : "";
           } else if (typeof inputArgs[0] === "string") {

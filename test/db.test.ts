@@ -6,6 +6,9 @@ import {
   getSchemaVersion,
   getAppliedMigrations,
   recordError,
+  countDailyCompletedReviews,
+  saveReviewRequest,
+  getReviewRequest,
   EVENT_SAVE_SQL,
   EVENT_SEEN_SQL,
   MIGRATIONS,
@@ -23,6 +26,7 @@ describe("Database migrations and schema management", () => {
       "20260123000000",
       "20260920000001",
       "20260920000002",
+      "20260920000003",
     ]);
   });
 
@@ -30,7 +34,7 @@ describe("Database migrations and schema management", () => {
     const db = openDb(":memory:");
     const secondRun = runMigrations(db);
     expect(secondRun.applied).toEqual([]);
-    expect(secondRun.currentVersion).toBe("20260920000002");
+    expect(secondRun.currentVersion).toBe("20260920000003");
   });
 
   it("applies migrations incrementally to an older database", () => {
@@ -54,7 +58,11 @@ describe("Database migrations and schema management", () => {
 
     // Run migrations
     const result = runMigrations(db);
-    expect(result.applied).toEqual(["20260920000001", "20260920000002"]);
+    expect(result.applied).toEqual([
+      "20260920000001",
+      "20260920000002",
+      "20260920000003",
+    ]);
 
     // Now events table has input_tokens, output_tokens, model columns
     tableInfo = db.prepare("PRAGMA table_info(events)").all() as {
@@ -179,5 +187,47 @@ describe("Error logging into database", () => {
     expect(row.error_name).toBeNull();
     expect(row.error_message).toBe("String error message");
     expect(row.context).toBe("raw-string-context");
+  });
+});
+
+describe("Review requests persistence and quota tracking", () => {
+  it("tracks daily quota and saves request states", () => {
+    const db = openDb(":memory:");
+    const today = "2026-09-20";
+
+    expect(countDailyCompletedReviews(db, 100, today)).toBe(0);
+
+    saveReviewRequest(db, {
+      source_revid: 101,
+      actor_id: 100,
+      username: "Alice",
+      article: "条目A",
+      status: "completed",
+      result_name: "条目A",
+      result_section: "2026年9月20日",
+      result_page: "User talk:AmanojakuBot/review/条目A",
+      result_revid: 201,
+      reply_revid: 202,
+      utc_day: today,
+    });
+
+    expect(countDailyCompletedReviews(db, 100, today)).toBe(1);
+    expect(countDailyCompletedReviews(db, 200, today)).toBe(0);
+
+    // Save a rejected request, should not count towards quota
+    saveReviewRequest(db, {
+      source_revid: 102,
+      actor_id: 100,
+      username: "Alice",
+      article: "不存在条目",
+      status: "rejected",
+      utc_day: today,
+    });
+
+    expect(countDailyCompletedReviews(db, 100, today)).toBe(1);
+
+    const saved = getReviewRequest(db, 101);
+    expect(saved?.article).toBe("条目A");
+    expect(saved?.status).toBe("completed");
   });
 });

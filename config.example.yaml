@@ -4,6 +4,7 @@ wiki:
   username: AmanojakuBot
   loginUsername: AmanojakuBot@bot # Only for a BotPassword login.
   ownerUserId: 4073200
+  controlPage: User:AmanojakuBot/config/control
   writeEnabled: false
 
 events:
@@ -33,20 +34,23 @@ tasks:
     personaPage: User:AmanojakuBot/config/persona
 
   review:
-    enabled: false
-    draftNamespace: 118
-    dailyLimit: 10
+    enabled: true
+    draftNamespace: [2, 118]
+    userDailyLimit: 5
     talkPage: User talk:AmanojakuBot/review
+    rulePage: User:AmanojakuBot/task/2/rule
+    template: User:AmanojakuBot/template/ReviewRequest
     llm:
       - provider: openai
-        model: gpt-5.4-mini
+        model: gpt-5.6-luna
       - provider: openai
-        model: gpt-4o-mini
+        model: gpt-5.6-luna
 
   aiEdit:
     enabled: false
     reportPagePrefix: User:AmanojakuBot/sandbox/AICheck
     usersPage: User:AmanojakuBot/sandbox/AICheckUser
+    rulePage: User:AmanojakuBot/task/3/rule
     draftNamespace: 118
     maxAnalysesPerWindow: 20
     minConfidence: 0.85

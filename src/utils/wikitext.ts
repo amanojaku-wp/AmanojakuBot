@@ -193,6 +193,110 @@ export function parseSections(wikitext: string): SectionInfo[] {
 }
 
 /**
+ * 从页面章节列表中精准定位目标章节（避免当页面存在多个同名二级标题时误匹配到首个章节）
+ */
+export function findMatchingSection(
+  sections: SectionInfo[],
+  target: { title?: string; index?: number; content?: string },
+  comment?: string,
+  templateName?: string,
+): SectionInfo | undefined {
+  const normTitle = target.title?.trim().toLowerCase() ?? "";
+
+  // 1. 如果指定了 comment，优先查找内容包含该 comment 的章节
+  if (comment) {
+    const trimmedComment = comment.trim();
+    if (trimmedComment) {
+      // 优先在同名章节中查找包含 comment 的章节
+      if (normTitle) {
+        const inTitleMatch = sections.find(
+          (s) =>
+            s.title.trim().toLowerCase() === normTitle &&
+            s.content.includes(trimmedComment),
+        );
+        if (inTitleMatch) return inTitleMatch;
+      }
+
+      // 在所有章节中查找包含 comment 的章节
+      const anyMatch = sections.find((s) => s.content.includes(trimmedComment));
+      if (anyMatch) return anyMatch;
+
+      // 如果 comment 包含多行，尝试匹配第一行
+      const firstLine = trimmedComment.split("\n")[0]?.trim();
+      if (firstLine && firstLine.length > 5) {
+        if (normTitle) {
+          const lineMatchInTitle = sections.find(
+            (s) =>
+              s.title.trim().toLowerCase() === normTitle &&
+              s.content.includes(firstLine),
+          );
+          if (lineMatchInTitle) return lineMatchInTitle;
+        }
+        const lineMatchAny = sections.find((s) =>
+          s.content.includes(firstLine),
+        );
+        if (lineMatchAny) return lineMatchAny;
+      }
+    }
+  }
+
+  // 2. 如果指定了 templateName，查找同名章节中未处理的模板（status 不为 done/not done）
+  if (templateName && normTitle) {
+    const titleMatches = sections.filter(
+      (s) => s.title.trim().toLowerCase() === normTitle,
+    );
+    if (titleMatches.length > 0) {
+      const unprocessed = titleMatches.find((s) => {
+        const tpls = parseWikiTemplates(s.content, templateName);
+        if (tpls.length === 0) return false;
+        const status = (tpls[0].params.status ?? "").trim().toLowerCase();
+        return status !== "done" && status !== "not done";
+      });
+      if (unprocessed) return unprocessed;
+    }
+  }
+
+  // 3. 检查特定 index 处的章节标题是否匹配
+  if (
+    typeof target.index === "number" &&
+    target.index >= 0 &&
+    target.index < sections.length
+  ) {
+    const secAtIndex = sections[target.index];
+    if (!normTitle || secAtIndex.title.trim().toLowerCase() === normTitle) {
+      return secAtIndex;
+    }
+  }
+
+  // 4. 在同名章节中进行选择
+  if (normTitle) {
+    const titleMatches = sections.filter(
+      (s) => s.title.trim().toLowerCase() === normTitle,
+    );
+    if (titleMatches.length === 1) {
+      return titleMatches[0];
+    }
+    if (titleMatches.length > 1) {
+      if (typeof target.index === "number") {
+        let closest = titleMatches[0];
+        let minDiff = Math.abs(closest.index - target.index);
+        for (const s of titleMatches) {
+          const diff = Math.abs(s.index - target.index);
+          if (diff < minDiff) {
+            minDiff = diff;
+            closest = s;
+          }
+        }
+        return closest;
+      }
+      return titleMatches[titleMatches.length - 1];
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * 留言提取结果详情
  */
 export type CommentExtractionResult = {
@@ -318,7 +422,7 @@ export function formatDiscussionReply(
   const nextLevel = currentIndentLevel + 1;
 
   if (nextLevel > 8) {
-    return `:{{Outdent|${currentIndentLevel - 1}}}${cleanReply.replace(/\n/g, "\n:")} —~~~~ ${marker}`;
+    return `{{Outdent|8}}\n${cleanReply} —~~~~ ${marker}`;
   }
   const indents = ":".repeat(nextLevel);
   return `${indents}${cleanReply.replace(/\n/g, `\n${indents}`)} —~~~~ ${marker}`;
@@ -450,4 +554,357 @@ export function safeWikitext(value: string) {
     .replaceAll("[[", "［［")
     .replaceAll("]]", "］］")
     .replaceAll("~~~~", "");
+}
+
+/**
+ * 标准化用户名（首字母大写，下划线转空格，去除前后空白）
+ */
+export function normalizeWikiUsername(name: string): string {
+  const trimmed = name.replaceAll("_", " ").trim();
+  if (!trimmed) return "";
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+}
+
+/**
+ * 标准化模板名称（去除前导冒号与命名空间前缀大小写差异，下划线转空格）
+ */
+export function normalizeTemplateName(name: string): string {
+  let normalized = name.replace(/^:+/, "").replaceAll("_", " ").trim();
+  if (normalized.toLowerCase().startsWith("template:")) {
+    normalized = normalized.slice(9).trim();
+  }
+  return normalized;
+}
+
+/**
+ * 解析后的维基模板结构
+ */
+export type ParsedWikiTemplate = {
+  raw: string;
+  templateName: string;
+  params: Record<string, string>;
+  startIndex: number;
+  endIndex: number;
+};
+
+/**
+ * 解析 Wikitext 中指定名称的维基模板
+ *
+ * 安全特性：
+ * 1. 考虑嵌套模板 {{...}} 与内链 [[...]]，正确提取顶层参数。
+ * 2. 忽略大小写与下划线差异匹配模板名称。
+ * 3. 支持命名参数 (| key = value) 与位置参数 (| 1 = value)。
+ */
+export function parseWikiTemplates(
+  wikitext: string,
+  targetTemplateName?: string,
+): ParsedWikiTemplate[] {
+  const templates: ParsedWikiTemplate[] = [];
+  const normalizedTarget = targetTemplateName
+    ? normalizeTemplateName(targetTemplateName).toLowerCase()
+    : null;
+
+  let i = 0;
+  while (i < wikitext.length - 1) {
+    if (wikitext[i] === "{" && wikitext[i + 1] === "{") {
+      const startIndex = i;
+      let depth = 0;
+      let inLink = 0;
+      let j = i;
+
+      while (j < wikitext.length) {
+        if (wikitext[j] === "[" && wikitext[j + 1] === "[") {
+          inLink++;
+          j += 2;
+          continue;
+        }
+        if (wikitext[j] === "]" && wikitext[j + 1] === "]") {
+          if (inLink > 0) inLink--;
+          j += 2;
+          continue;
+        }
+        if (inLink === 0) {
+          if (wikitext[j] === "{" && wikitext[j + 1] === "{") {
+            depth++;
+            j += 2;
+            continue;
+          }
+          if (wikitext[j] === "}" && wikitext[j + 1] === "}") {
+            depth--;
+            j += 2;
+            if (depth === 0) {
+              const endIndex = j;
+              const raw = wikitext.slice(startIndex, endIndex);
+              const inner = raw.slice(2, -2).trim();
+
+              // 解析模板名称与参数
+              const parts: string[] = [];
+              let currentPart = "";
+              let innerDepth = 0;
+              let innerLink = 0;
+
+              for (let k = 0; k < inner.length; k++) {
+                if (inner[k] === "[" && inner[k + 1] === "[") {
+                  innerLink++;
+                  currentPart += "[[";
+                  k++;
+                  continue;
+                }
+                if (inner[k] === "]" && inner[k + 1] === "]") {
+                  if (innerLink > 0) innerLink--;
+                  currentPart += "]]";
+                  k++;
+                  continue;
+                }
+                if (innerLink === 0) {
+                  if (inner[k] === "{" && inner[k + 1] === "{") {
+                    innerDepth++;
+                    currentPart += "{{";
+                    k++;
+                    continue;
+                  }
+                  if (inner[k] === "}" && inner[k + 1] === "}") {
+                    if (innerDepth > 0) innerDepth--;
+                    currentPart += "}}";
+                    k++;
+                    continue;
+                  }
+                  if (innerDepth === 0 && inner[k] === "|") {
+                    parts.push(currentPart);
+                    currentPart = "";
+                    continue;
+                  }
+                }
+                currentPart += inner[k];
+              }
+              parts.push(currentPart);
+
+              const templateName = parts[0]?.trim() ?? "";
+              const params: Record<string, string> = {};
+              let positionalIndex = 1;
+
+              for (let p = 1; p < parts.length; p++) {
+                const part = parts[p];
+                const eqIdx = part.indexOf("=");
+                if (eqIdx !== -1) {
+                  const key = part.slice(0, eqIdx).trim();
+                  const val = part.slice(eqIdx + 1).trim();
+                  params[key] = val;
+                } else {
+                  params[String(positionalIndex)] = part.trim();
+                  positionalIndex++;
+                }
+              }
+
+              const normalizedName =
+                normalizeTemplateName(templateName).toLowerCase();
+              if (
+                !normalizedTarget ||
+                normalizedName === normalizedTarget ||
+                normalizedName === `template:${normalizedTarget}` ||
+                `template:${normalizedName}` === normalizedTarget
+              ) {
+                templates.push({
+                  raw,
+                  templateName,
+                  params,
+                  startIndex,
+                  endIndex,
+                });
+              }
+
+              i = endIndex;
+              break;
+            }
+            continue;
+          }
+        }
+        j++;
+      }
+      if (depth !== 0) {
+        i += 2;
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return templates;
+}
+
+/**
+ * 在 Wikitext 中更新指定模板的参数并返回更新后的全文
+ */
+export function updateWikiTemplate(
+  wikitext: string,
+  targetTemplateName: string,
+  updates: Record<string, string | undefined>,
+): string {
+  const templates = parseWikiTemplates(wikitext, targetTemplateName);
+  if (templates.length === 0) return wikitext;
+
+  // 针对找到的第一个模板实例进行参数更新
+  const target = templates[0];
+  let templateContent = target.raw;
+
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) continue;
+
+    // 匹配既存的 | key = ... 参数
+    const paramRegex = new RegExp(
+      `(\\|\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=)([^|}\\n]*)`,
+      "i",
+    );
+
+    if (paramRegex.test(templateContent)) {
+      templateContent = templateContent.replace(
+        paramRegex,
+        `$1 ${value.trim()}`,
+      );
+    } else {
+      // 若参数不存在，则在模板结尾 }} 前追加
+      const closeIdx = templateContent.lastIndexOf("}}");
+      if (closeIdx !== -1) {
+        const isMultiline = templateContent.includes("\n");
+        const insertion = isMultiline
+          ? `| ${key} = ${value.trim()}\n`
+          : ` | ${key} = ${value.trim()} `;
+        templateContent = `${templateContent.slice(0, closeIdx)}${insertion}${templateContent.slice(closeIdx)}`;
+      }
+    }
+  }
+
+  return `${wikitext.slice(0, target.startIndex)}${templateContent}${wikitext.slice(target.endIndex)}`;
+}
+
+/**
+ * 从 Wikitext 文本中提取所有签名用户名称
+ */
+export function extractSignatures(text: string): string[] {
+  const users: string[] = [];
+  const regex =
+    /\[\[(?:User|User[ _]talk|用户|用戶|使用者|用户讨论|用戶討論|使用者討論|Special:Contributions|Special:用户贡献|Special:用戶貢獻):([^|\]#/]+)/gi;
+
+  for (const match of text.matchAll(regex)) {
+    const rawUser = match[1]?.trim();
+    if (rawUser) {
+      users.push(normalizeWikiUsername(rawUser));
+    }
+  }
+
+  return [...new Set(users)];
+}
+
+/**
+ * 校验签名用户列表中是否包含指定的修订作者
+ */
+export function isSignatureMatchingActor(
+  signedUsers: string[],
+  actorUsername: string,
+): boolean {
+  if (!signedUsers.length || !actorUsername) return false;
+  const target = normalizeWikiUsername(actorUsername).toLowerCase();
+  return signedUsers.some(
+    (u) => normalizeWikiUsername(u).toLowerCase() === target,
+  );
+}
+
+/**
+ * 生成不重复的结果页章节标题
+ */
+export function generateUniqueSectionTitle(
+  existingSectionTitles: string[],
+  baseTitle: string,
+): string {
+  const existingSet = new Set(
+    existingSectionTitles.map((t) => t.trim().toLowerCase()),
+  );
+  if (!existingSet.has(baseTitle.trim().toLowerCase())) {
+    return baseTitle;
+  }
+
+  let counter = 2;
+  while (existingSet.has(`${baseTitle} (${counter})`.toLowerCase())) {
+    counter++;
+  }
+  return `${baseTitle} (${counter})`;
+}
+
+export type ReviewIssueSeverity = "confirmed" | "suspected" | "suggestion";
+export type ReviewIssueCategory =
+  | "language"
+  | "logic"
+  | "source"
+  | "encyclopedic-style"
+  | "structure"
+  | "wikitext"
+  | "other";
+
+export type ReviewIssue = {
+  severity: ReviewIssueSeverity;
+  category: ReviewIssueCategory;
+  location?: string | null;
+  originalText?: string | null;
+  description: string;
+  suggestion?: string | null;
+};
+
+export type ReviewResult = {
+  summary: string;
+  issues: ReviewIssue[];
+};
+
+const SEVERITY_MAP: Record<ReviewIssueSeverity, string> = {
+  confirmed: "［确认问题］",
+  suspected: "［疑似问题］",
+  suggestion: "［改进建议］",
+};
+
+const CATEGORY_MAP: Record<ReviewIssueCategory, string> = {
+  language: "语言文字",
+  logic: "逻辑与连贯性",
+  source: "来源与可查证性",
+  "encyclopedic-style": "百科风格与中立性",
+  structure: "结构与排版",
+  wikitext: "维基语法",
+  other: "其他",
+};
+
+/**
+ * 将结构化 ReviewResult 转换为规范的 Wikitext 报告
+ */
+export function formatReviewResultWikitext(result: ReviewResult): string {
+  const lines: string[] = [];
+
+  lines.push("'''【校对概述】'''");
+  lines.push(safeWikitext(result.summary.trim()));
+  lines.push("");
+
+  lines.push("'''【发现问题与建议】'''");
+  if (!result.issues || result.issues.length === 0) {
+    lines.push("未发现明显问题。");
+  } else {
+    for (let idx = 0; idx < result.issues.length; idx++) {
+      const issue = result.issues[idx];
+      const sev = SEVERITY_MAP[issue.severity] ?? `［${issue.severity}］`;
+      const cat = CATEGORY_MAP[issue.category] ?? issue.category;
+      let header = `* '''${sev}'''（${cat}）`;
+      if (issue.location) {
+        header += ` 位置：${safeWikitext(issue.location)}`;
+      }
+      lines.push(header);
+
+      if (issue.originalText) {
+        lines.push(
+          `** 原文：<nowiki>${safeWikitext(issue.originalText)}</nowiki>`,
+        );
+      }
+      lines.push(`** 说明：${safeWikitext(issue.description)}`);
+      if (issue.suggestion) {
+        lines.push(`** 建议：${safeWikitext(issue.suggestion)}`);
+      }
+    }
+  }
+
+  return lines.join("\n");
 }

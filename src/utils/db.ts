@@ -130,6 +130,38 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: "20260920000003",
+    name: "create_review_requests_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS review_requests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_revid INTEGER NOT NULL UNIQUE,
+          actor_id INTEGER NOT NULL,
+          username TEXT NOT NULL,
+          article TEXT NOT NULL,
+          article_revid INTEGER,
+          status TEXT NOT NULL,
+          result_name TEXT,
+          result_section TEXT,
+          result_page TEXT,
+          result_revid INTEGER,
+          reply_revid INTEGER,
+          utc_day TEXT NOT NULL,
+          review_result_json TEXT,
+          error TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          model TEXT,
+          created_at TEXT NOT NULL,
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_requests_actor_day ON review_requests(actor_id, utc_day, status);
+        CREATE INDEX IF NOT EXISTS idx_review_requests_source_revid ON review_requests(source_revid);
+      `);
+    },
+  },
 ];
 
 /**
@@ -290,6 +322,116 @@ ON CONFLICT(revid) DO UPDATE SET
   input_tokens = COALESCE(excluded.input_tokens, events.input_tokens),
   output_tokens = COALESCE(excluded.output_tokens, events.output_tokens),
   model = COALESCE(excluded.model, events.model)`;
+
+/**
+ * 任务二：条目校对请求记录结构
+ */
+export type ReviewRequestRecord = {
+  id?: number;
+  source_revid: number;
+  actor_id: number;
+  username: string;
+  article: string;
+  article_revid?: number | null;
+  status: "pending" | "completed" | "rejected" | "failed";
+  result_name?: string | null;
+  result_section?: string | null;
+  result_page?: string | null;
+  result_revid?: number | null;
+  reply_revid?: number | null;
+  utc_day: string;
+  review_result_json?: string | null;
+  error?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  model?: string | null;
+  created_at?: string;
+  completed_at?: string | null;
+};
+
+/**
+ * 查询指定用户在特定 UTC 自然日内已成功完成的校对请求数量
+ */
+export function countDailyCompletedReviews(
+  db: Database.Database,
+  actorId: number,
+  utcDay: string,
+): number {
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS count FROM review_requests WHERE actor_id = ? AND utc_day = ? AND status = 'completed'",
+    )
+    .get(actorId, utcDay) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
+/**
+ * 保存或更新校对请求记录（基于 source_revid 唯一约束）
+ */
+export function saveReviewRequest(
+  db: Database.Database,
+  record: ReviewRequestRecord,
+): void {
+  db.prepare(
+    `INSERT INTO review_requests (
+      source_revid, actor_id, username, article, article_revid, status,
+      result_name, result_section, result_page, result_revid, reply_revid,
+      utc_day, review_result_json, error, input_tokens, output_tokens, model,
+      created_at, completed_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      datetime('now'), ?
+    ) ON CONFLICT(source_revid) DO UPDATE SET
+      article = excluded.article,
+      article_revid = COALESCE(excluded.article_revid, review_requests.article_revid),
+      status = excluded.status,
+      result_name = COALESCE(excluded.result_name, review_requests.result_name),
+      result_section = COALESCE(excluded.result_section, review_requests.result_section),
+      result_page = COALESCE(excluded.result_page, review_requests.result_page),
+      result_revid = COALESCE(excluded.result_revid, review_requests.result_revid),
+      reply_revid = COALESCE(excluded.reply_revid, review_requests.reply_revid),
+      review_result_json = COALESCE(excluded.review_result_json, review_requests.review_result_json),
+      error = excluded.error,
+      input_tokens = COALESCE(excluded.input_tokens, review_requests.input_tokens),
+      output_tokens = COALESCE(excluded.output_tokens, review_requests.output_tokens),
+      model = COALESCE(excluded.model, review_requests.model),
+      completed_at = COALESCE(excluded.completed_at, review_requests.completed_at)`,
+  ).run(
+    record.source_revid,
+    record.actor_id,
+    record.username,
+    record.article,
+    record.article_revid ?? null,
+    record.status,
+    record.result_name ?? null,
+    record.result_section ?? null,
+    record.result_page ?? null,
+    record.result_revid ?? null,
+    record.reply_revid ?? null,
+    record.utc_day,
+    record.review_result_json ?? null,
+    record.error ?? null,
+    record.input_tokens ?? null,
+    record.output_tokens ?? null,
+    record.model ?? null,
+    record.completed_at ??
+      (record.status === "completed" ? new Date().toISOString() : null),
+  );
+}
+
+/**
+ * 根据 source_revid 获取校对请求记录
+ */
+export function getReviewRequest(
+  db: Database.Database,
+  sourceRevid: number,
+): ReviewRequestRecord | undefined {
+  return db
+    .prepare("SELECT * FROM review_requests WHERE source_revid = ?")
+    .get(sourceRevid) as ReviewRequestRecord | undefined;
+}
 
 /**
  * 初始化并维护机器人本地 SQLite 存储，自动应用数据库迁移
