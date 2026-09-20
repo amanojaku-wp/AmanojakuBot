@@ -783,7 +783,7 @@ export function updateWikiTemplate(
 export function extractSignatures(text: string): string[] {
   const users: string[] = [];
   const regex =
-    /\[\[(?:User|User[ _]talk|用户|用戶|使用者|用户讨论|用戶討論|使用者討論|Special:Contributions|Special:用户贡献|Special:用戶貢獻):([^|\]#/]+)/gi;
+    /\[\[(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論|Special:Contributions|特殊:Contributions|Special:用户贡献|Special:用戶貢獻|Special:使用者貢獻|特殊:用户贡献|特殊:用戶貢獻|特殊:使用者貢獻|Special:Contribs|特殊:Contribs):([^|\]#/]+)/gi;
 
   for (const match of text.matchAll(regex)) {
     const rawUser = match[1]?.trim();
