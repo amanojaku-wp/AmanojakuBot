@@ -5,6 +5,7 @@ import type { AppConfig } from "./config/index.js";
 import { chatHandler } from "./tasks/chat.js";
 import { reviewHandler } from "./tasks/review.js";
 import { aiEditHandler } from "./tasks/aiEdit.js";
+import { recordError } from "./utils/db.js";
 
 /**
  * 维基变更事件数据结构
@@ -73,6 +74,11 @@ export async function handle(
       }
     } catch (error) {
       ctx.log.error({ err: error, event: e }, "handler execution failed");
+      recordError(ctx.db, {
+        message: "handler execution failed",
+        error,
+        context: { event: e },
+      });
       throw error;
     }
   }

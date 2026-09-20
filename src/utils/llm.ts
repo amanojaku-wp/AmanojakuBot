@@ -56,7 +56,7 @@ export function formatTokenUsage(usage: TokenUsage): string {
 }
 
 export type FallbackRunnerResult<T> =
-  { result: T; usage?: PartialTokenUsage } | T;
+  { result: T; usage?: PartialTokenUsage; model?: string } | T;
 
 /**
  * 带有 Fallback 降级重试与 Token 统计累加的 LLM 执行器
@@ -68,7 +68,7 @@ export async function executeWithFallback<T>(
     spec: LlmModelSpec,
   ) => Promise<FallbackRunnerResult<T>>,
   usageTracker?: TokenUsage,
-): Promise<{ result: T; usage: TokenUsage }> {
+): Promise<{ result: T; usage: TokenUsage; model: string }> {
   if (!models || models.length === 0) {
     throw new Error("No LLM models configured");
   }
@@ -79,6 +79,7 @@ export async function executeWithFallback<T>(
   for (const spec of models) {
     try {
       const model = getLanguageModel(spec);
+      const modelIdentifier = `${spec.provider}/${spec.model}`;
       const output = await runner(model, spec);
       if (output !== null && typeof output === "object" && "result" in output) {
         addTokenUsage(
@@ -88,9 +89,14 @@ export async function executeWithFallback<T>(
         return {
           result: (output as { result: T }).result,
           usage: currentUsage,
+          model: (output as { model?: string }).model ?? modelIdentifier,
         };
       } else {
-        return { result: output as T, usage: currentUsage };
+        return {
+          result: output as T,
+          usage: currentUsage,
+          model: modelIdentifier,
+        };
       }
     } catch (err) {
       console.error(`[LLM] ${spec.provider}/${spec.model} failed`, err);

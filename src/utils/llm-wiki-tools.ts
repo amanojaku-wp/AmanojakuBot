@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Mwn } from "mwn";
 import { pageText } from "./wiki.js";
 import type { Logger } from "pino";
+import { diffLines } from "diff";
 
 const MAX_RESULTS = 20;
 const MAX_SEARCH_RESULTS = 10;
@@ -20,19 +21,33 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
       inputSchema: z.object({
         title: z
           .string()
-          .min(1)
-          .max(255)
           .describe(
-            "完整MediaWiki页面标题，例如“人工智能”、“Template:Cite web”、“Wikipedia:机器人方针”",
+            "完整MediaWiki页面标题，例如“人工智能”、“Template:Cite web”、“Wikipedia:机器人方针”。",
+          ),
+        redirects: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe(
+            "可选，是否跟随重定向，默认true。若为true，则返回重定向目标页面的内容；" +
+              "若为false，则返回重定向页面本身的内容。一般都取true，除非专门研究重定向的问题。",
+          ),
+        converttitles: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe(
+            "可选，是否将标题转换为规范形式，默认true。" +
+              "一般情况下都是true，除非需要研究页面标题本身的简繁体、大小写等转换问题。",
           ),
       }),
 
-      execute: async ({ title }) => {
+      execute: async ({ title, redirects, converttitles }) => {
         const startedAt = Date.now();
 
         log?.debug({ title }, "tool getWikiPage started");
 
-        const text = await pageText(bot, title);
+        const text = await pageText(bot, title, { redirects, converttitles });
 
         log?.debug(
           {
@@ -54,8 +69,8 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
         return {
           found: true,
           title,
-          content: text.slice(0, 12000),
-          truncated: text.length > 12000,
+          content: text,
+          truncated: text.length > 2097152,
         };
       },
     }),
@@ -65,13 +80,15 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
      *
      * 不返回 revision content，只返回元数据。
      * 如果模型需要查看某个具体版本，再调用 getWikiRevision。
+     * 支持使用 continueToken 进行接续（翻页）查询。
      */
     getPageHistory: tool({
       description:
         "查询中文维基百科指定页面最近的编辑历史。" +
         "返回版本ID、父版本ID、编辑者、时间、编辑摘要等信息。" +
         "当用户询问某页面最近发生了什么、谁修改了页面、某次修改的版本号，" +
-        "或者需要定位应进一步读取的revision时使用。",
+        "或者需要定位应进一步读取的revision时使用。" +
+        "支持传入 continueToken 进行接续（翻页）查询。注意：接续查询代价较高且消耗多次工具轮次，只有在首次查询未能找到所需历史且确有必要追溯更早历史时才进行接续查询。",
 
       inputSchema: z.object({
         title: z.string().min(1).max(255).describe("完整MediaWiki页面标题"),
@@ -83,15 +100,23 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           .max(MAX_RESULTS)
           .default(10)
           .describe("返回最近多少次编辑，默认10，最多20"),
+
+        continueToken: z
+          .string()
+          .optional()
+          .describe(
+            "可选，上一页返回的接续令牌（continueToken）。注意：接续查询代价较高，仅在首批结果未命中且确有必要追溯更早历史时才使用。",
+          ),
       }),
 
-      execute: async ({ title, limit }) => {
+      execute: async ({ title, limit, continueToken }) => {
         const response = await bot.request({
           action: "query",
           prop: "revisions",
           titles: title,
           rvprop: "ids|timestamp|user|comment|flags",
           rvlimit: limit,
+          ...(continueToken ? { rvcontinue: continueToken } : {}),
           formatversion: 2,
         });
 
@@ -102,6 +127,8 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
             found: false,
             title,
             revisions: [],
+            continueToken: null,
+            hasMore: false,
           };
         }
 
@@ -125,24 +152,30 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           }),
         );
 
+        const nextContinueToken = response?.continue?.rvcontinue ?? null;
+
         return {
           found: true,
           title: page.title ?? title,
           pageid: page.pageid,
           revisions,
+          continueToken: nextContinueToken,
+          hasMore: Boolean(nextContinueToken),
         };
       },
     }),
 
     /**
      * 查询用户最近的贡献。
+     * 支持使用 continueToken 进行接续（翻页）查询。
      */
     getUserContribs: tool({
       description:
         "查询中文维基百科指定用户最近的编辑贡献。" +
         "返回页面标题、命名空间、版本ID、父版本ID、时间、编辑摘要等。" +
         "当需要了解某用户最近编辑了哪些页面、定位某次用户编辑，" +
-        "或查看用户近期贡献记录时使用。",
+        "或查看用户近期贡献记录时使用。" +
+        "支持传入 continueToken 进行接续（翻页）查询。注意：接续查询代价较高，仅在首批结果未命中且确有必要查找更早贡献时才进行接续查询。",
 
       inputSchema: z.object({
         user: z
@@ -158,9 +191,16 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           .max(MAX_RESULTS)
           .default(10)
           .describe("返回最近多少次贡献，默认10，最多20"),
+
+        continueToken: z
+          .string()
+          .optional()
+          .describe(
+            "可选，上一页返回的接续令牌（continueToken）。注意：接续查询代价较高，仅在首批结果未命中且确有必要翻页时才使用。",
+          ),
       }),
 
-      execute: async ({ user, limit }) => {
+      execute: async ({ user, limit, continueToken }) => {
         const response = await bot.request({
           action: "query",
           list: "usercontribs",
@@ -168,6 +208,7 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           ucprop: "ids|title|timestamp|comment|flags",
           uclimit: limit,
           ucdir: "older",
+          ...(continueToken ? { uccontinue: continueToken } : {}),
           formatversion: 2,
         });
 
@@ -199,22 +240,28 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           }),
         );
 
+        const nextContinueToken = response?.continue?.uccontinue ?? null;
+
         return {
           user,
           contributions,
+          continueToken: nextContinueToken,
+          hasMore: Boolean(nextContinueToken),
         };
       },
     }),
 
     /**
      * 全站搜索。
+     * 支持使用 offset 进行接续（翻页）查询。
      */
     searchWiki: tool({
       description:
         "搜索中文维基百科页面。" +
         "当不知道准确页面标题、需要寻找与某个关键词相关的页面，" +
         "或用户提到的名称可能不准确时使用。" +
-        "这个工具只用于寻找页面；找到目标页面后，如需了解实际内容，应继续调用getWikiPage。",
+        "这个工具只用于寻找页面；找到目标页面后，如需了解实际内容，应继续调用getWikiPage。" +
+        "支持传入 offset 进行接续（翻页）查询。注意：接续搜索代价较高，通常应优先优化搜索关键词，仅在确有必要查看下一批结果时才翻页。",
 
       inputSchema: z.object({
         query: z
@@ -238,9 +285,18 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           .max(MAX_SEARCH_RESULTS)
           .default(5)
           .describe("最多返回多少个搜索结果，默认5，最多10"),
+
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "可选，搜索结果偏移量（上一页返回的 nextOffset）。注意：接续搜索代价较高，优先优化搜索词，仅在必要时翻页。",
+          ),
       }),
 
-      execute: async ({ query, namespace, limit }) => {
+      execute: async ({ query, namespace, limit, offset }) => {
         const response = await bot.request({
           action: "query",
           list: "search",
@@ -248,6 +304,7 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           ...(namespace?.length ? { srnamespace: namespace.join("|") } : {}),
           srprop: "snippet|titlesnippet|sectiontitle|wordcount|timestamp",
           srlimit: limit,
+          ...(offset !== undefined ? { sroffset: offset } : {}),
           formatversion: 2,
         });
 
@@ -278,26 +335,36 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           }),
         );
 
+        const nextOffset = response?.continue?.sroffset ?? null;
+
         return {
           query,
           totalHits: searchInfo?.totalhits,
           results,
+          nextOffset,
+          hasMore: Boolean(nextOffset),
         };
       },
     }),
 
+    /**
+     * 查询指定修订版本的内容和基本元数据。
+     * 对应用户输入的 [[Special:Permalink/xxx]]、[[Special:Perma/xxx]]、[[Special:固定连接/xxx]]、[[Special:固定連結/xxxx]]。
+     */
     getWikiRevision: tool({
       description:
         "读取中文维基百科指定revision的内容和基本元数据。" +
-        "当用户提供revision ID、oldid，或者通过getPageHistory/getUserContribs定位到某个具体版本后，" +
-        "需要查看该版本实际内容时使用。",
+        "当用户提供revision ID、oldid，或者形如 [[Special:Permalink/12345]]、[[Special:Perma/12345]]、[[Special:固定连接/12345]]、[[Special:固定連結/12345]] 的固定版本链接，" +
+        "或者通过 getPageHistory/getUserContribs 定位到某个具体版本后需要查看该版本实际内容时使用。",
 
       inputSchema: z.object({
         revid: z
           .number()
           .int()
           .positive()
-          .describe("MediaWiki revision ID，例如94394322"),
+          .describe(
+            "MediaWiki revision ID（正整数，例如 94394322）。支持从固定链接 [[Special:Permalink/xxx]]、[[Special:Perma/xxx]]、[[Special:固定连接/xxx]]、[[Special:固定連結/xxx]] 或 oldid 中提取的 ID。",
+          ),
       }),
 
       execute: async ({ revid }) => {
@@ -349,6 +416,163 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           minor: !!rev.minor,
           content: content.slice(0, MAX_CONTENT_CHARS),
           truncated: content.length > MAX_CONTENT_CHARS,
+        };
+      },
+    }),
+
+    /**
+     * 查询指定修订版本的修改差异（Diff）。
+     * 对应用户输入的 [[Special:Diff/xxx]]、[[Special:差异/xxx]]、[[Special:差異/xxx]]。
+     */
+    getWikiDiff: tool({
+      description:
+        "查询中文维基百科指定修订版本（revision）的修改差异（Diff）。" +
+        "当用户提供形如 [[Special:Diff/12345]]、[[Special:差异/12345]]、[[Special:差異/12345]]、" +
+        "[[Special:Diff/12345/67890]]、[[Special:差异/12345/67890]]、[[Special:差異/12345/67890]]，" +
+        "或询问某次修改/版本改动了什么时使用。" +
+        "返回修订版本元数据、编辑摘要及详细差异对比（Wikitext diff 行）。",
+
+      inputSchema: z.object({
+        revid: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "目标修订版本 ID (toRevid)。若不提供 fromRevid，则对比该版本与其上一版本（父版本）。对应 [[Special:Diff/12345]]、[[Special:差异/12345]]、[[Special:差異/12345]]。",
+          ),
+        fromRevid: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "可选，对比的起始修订版本 ID (fromRevid)。若提供，则对比 fromRevid 到 revid 之间的差异（对应 Special:Diff/12345/67890）。若省略，则对比 revid 与其父版本。",
+          ),
+      }),
+
+      execute: async ({ revid, fromRevid }) => {
+        const startedAt = Date.now();
+        log?.debug({ revid, fromRevid }, "tool getWikiDiff started");
+
+        // 1. 获取目标版本详情与内容
+        const targetRes = await bot.request({
+          action: "query",
+          prop: "revisions",
+          revids: revid,
+          rvprop: "ids|timestamp|user|comment|flags|content",
+          rvslots: "main",
+          formatversion: 2,
+        });
+
+        const targetPage = targetRes?.query?.pages?.[0];
+        const targetRev = targetPage?.revisions?.[0];
+
+        if (!targetPage || targetPage.missing || !targetRev) {
+          return {
+            found: false,
+            revid,
+            fromRevid,
+            error: `修订版本 ${revid} 不存在或已被删除`,
+          };
+        }
+
+        const targetContent =
+          targetRev.slots?.main?.content ??
+          targetRev.slots?.main?.["*"] ??
+          targetRev.content ??
+          targetRev["*"] ??
+          "";
+
+        // 2. 确定对比的基准版本 (baseRevId)
+        const baseRevId = fromRevid ?? targetRev.parentid;
+
+        let baseContent = "";
+        let baseRevInfo: {
+          revid?: number;
+          user?: string;
+          timestamp?: string;
+          comment?: string;
+        } | null = null;
+
+        if (baseRevId && baseRevId > 0) {
+          const baseRes = await bot.request({
+            action: "query",
+            prop: "revisions",
+            revids: baseRevId,
+            rvprop: "ids|timestamp|user|comment|flags|content",
+            rvslots: "main",
+            formatversion: 2,
+          });
+          const basePage = baseRes?.query?.pages?.[0];
+          const bRev = basePage?.revisions?.[0];
+          if (bRev) {
+            baseContent =
+              bRev.slots?.main?.content ??
+              bRev.slots?.main?.["*"] ??
+              bRev.content ??
+              bRev["*"] ??
+              "";
+            baseRevInfo = {
+              revid: bRev.revid,
+              user: bRev.user,
+              timestamp: bRev.timestamp,
+              comment: bRev.comment ?? "",
+            };
+          }
+        }
+
+        // 3. 计算文本差异
+        const diffs = diffLines(baseContent, targetContent);
+        const MAX_DIFF_CHARS = 12000;
+
+        const changes: {
+          type: "added" | "removed";
+          value: string;
+        }[] = [];
+
+        let diffText = "";
+        for (const part of diffs) {
+          if (part.added) {
+            changes.push({ type: "added", value: part.value });
+            diffText += `+ ${part.value.trimEnd()}\n`;
+          } else if (part.removed) {
+            changes.push({ type: "removed", value: part.value });
+            diffText += `- ${part.value.trimEnd()}\n`;
+          }
+        }
+
+        const truncated = diffText.length > MAX_DIFF_CHARS;
+        if (truncated) {
+          diffText =
+            diffText.slice(0, MAX_DIFF_CHARS) + "\n...[差异过长已截断]";
+        }
+
+        log?.debug(
+          {
+            revid,
+            fromRevid: baseRevId,
+            elapsedMs: Date.now() - startedAt,
+          },
+          "tool getWikiDiff completed",
+        );
+
+        return {
+          found: true,
+          title: targetPage.title,
+          pageid: targetPage.pageid,
+          targetRevision: {
+            revid: targetRev.revid,
+            parentid: targetRev.parentid,
+            user: targetRev.user,
+            timestamp: targetRev.timestamp,
+            comment: targetRev.comment ?? "",
+            minor: !!targetRev.minor,
+          },
+          baseRevision: baseRevInfo,
+          isNewPage: !baseRevId || baseRevId === 0,
+          diffText: diffText.trim(),
+          changesCount: changes.length,
+          truncated,
         };
       },
     }),

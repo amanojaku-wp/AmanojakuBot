@@ -1,7 +1,12 @@
 import { EventSource } from "eventsource";
 import pino from "pino";
 import { loadConfig } from "./config/index.js";
-import { openDb } from "./utils/db.js";
+import {
+  openDb,
+  recordError,
+  EVENT_SAVE_SQL,
+  EVENT_SEEN_SQL,
+} from "./utils/db.js";
 import { createWiki, pageText } from "./utils/wiki.js";
 import { fetchRecentChanges, pollingStart } from "./utils/polling.js";
 import { publishReports } from "./tasks/aiEdit.js";
@@ -26,8 +31,41 @@ setGlobalDispatcher(new EnvHttpProxyAgent());
  */
 
 const cfg = loadConfig(process.env.CONFIG_PATH ?? "config.yaml");
-const log = pino({ level: process.env.LOG_LEVEL ?? cfg.log.level });
 const db = openDb(cfg.storage.dbPath);
+
+const log = pino({
+  level: process.env.LOG_LEVEL ?? cfg.log.level,
+  hooks: {
+    logMethod(inputArgs, method, level) {
+      if (level >= 50) {
+        try {
+          let err: unknown;
+          let msg = "";
+          let context: unknown;
+          if (typeof inputArgs[0] === "object" && inputArgs[0] !== null) {
+            const obj = inputArgs[0] as Record<string, unknown>;
+            err = obj.err ?? obj.error;
+            const { err: _e, error: _e2, ...rest } = obj;
+            context = Object.keys(rest).length > 0 ? rest : undefined;
+            msg = typeof inputArgs[1] === "string" ? inputArgs[1] : "";
+          } else if (typeof inputArgs[0] === "string") {
+            msg = inputArgs[0];
+          }
+          recordError(db, {
+            level: level >= 60 ? "fatal" : "error",
+            message: msg || (err instanceof Error ? err.message : "Error"),
+            error: err,
+            context,
+          });
+        } catch {
+          // 防止日志记录异常影响主链路
+        }
+      }
+      return method.apply(this, inputArgs);
+    },
+  },
+});
+
 const bot = createWiki(
   cfg.wiki.apiUrl,
   cfg.wiki.loginUsername ?? cfg.wiki.username,
@@ -42,10 +80,8 @@ if (cfg.writeEnabled) {
 }
 
 // 预编译 SQLite 语句
-const seen = db.prepare("SELECT state FROM events WHERE revid=?");
-const save = db.prepare(
-  "INSERT INTO events(revid,state,actor_id,reply_revid,updated_at) VALUES(?,?,?,?,datetime('now')) ON CONFLICT(revid) DO UPDATE SET state=excluded.state,reply_revid=excluded.reply_revid,updated_at=excluded.updated_at",
-);
+const seen = db.prepare(EVENT_SEEN_SQL);
+const save = db.prepare(EVENT_SAVE_SQL);
 const mark = db.prepare(
   "INSERT OR REPLACE INTO checkpoint(name,event_id,timestamp) VALUES(?,?,?)",
 );

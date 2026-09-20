@@ -10,7 +10,7 @@
 
 - MediaWiki：`mwn`；事件模式可配置，中文维基百科默认 Wikimedia EventStreams，其他 API 地址默认通过 `list=recentchanges` 定期轮询机器人讨论页，也可以手工覆盖。轮询按时间窗口增量读取、分页、保留重叠并用修订记录去重；EventStreams 保留 SSE checkpoint。跨站点使用不同 SQLite 文件。
 - LLM：Vercel AI SDK，provider 配置选择 OpenAI 或 Google；不自建 provider 框架。
-- SQLite + `better-sqlite3` + 裸 SQL，不使用 ORM。YAML + Zod 配置，Pino 日志，Vitest 测试。密钥放环境变量，不写进 Git。
+- SQLite + `better-sqlite3` + 裸 SQL，不使用 ORM。基于 `schema_migrations` 表实现增量 migration 模式管理 schema 版本（支持 timestamp 格式版本号）；`events` 表维护输入/输出 token 与模型记录；`error_logs` 表统一持久化异常日志。YAML + Zod 配置，Pino 日志，Vitest 测试。密钥放环境变量，不写进 Git。
 - 优先现成库；仅在维基语义、业务规则、任务路由处写定制逻辑。
 - LLM 输出不得直接授予编辑权限；写入目标、命名空间、紧急停止和业务额度由确定性代码检查。
 

@@ -17,8 +17,15 @@ export function createWiki(apiUrl: string, username: string, password: string) {
 /**
  * 读取指定维基页面的最新 wikitext 原始内容
  */
-export async function pageText(bot: Mwn, title: string) {
-  const page = await bot.read(title);
+export async function pageText(
+  bot: Mwn,
+  title: string,
+  { redirects = true, converttitles = true } = {},
+) {
+  const page = await bot.read(title, {
+    redirects,
+    converttitles,
+  });
   return page?.revisions?.[0]?.content ?? "";
 }
 
