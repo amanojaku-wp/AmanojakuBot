@@ -261,6 +261,7 @@ export const chatHandler: TaskHandler = async (
     reply + tokenSuffix,
     currentIndent,
     marker,
+    cfg.wiki.username,
   );
   const result = await bot.edit(cfg.tasks.chat.talkPage, ({ content }) => {
     if (marker && content.includes(marker))

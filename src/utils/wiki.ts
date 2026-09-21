@@ -1,17 +1,87 @@
-import { Mwn } from "mwn";
+import {
+  Mwn,
+  type ApiParams,
+  type ApiResponse,
+  type RawRequestParams,
+} from "mwn";
+
+/**
+ * 判断错误是否为匿名 IP 软封禁导致的（通常因 Session/登录态丢失引起）
+ */
+export function isSoftBlockError(e: unknown): boolean {
+  if (!e || typeof e !== "object") return false;
+  const err = e as {
+    code?: string;
+    blockinfo?: {
+      systemblocktype?: string;
+      blockanononly?: boolean;
+    };
+  };
+  return (
+    err.code === "blocked" &&
+    err.blockinfo?.systemblocktype === "wgSoftBlockRanges" &&
+    err.blockinfo?.blockanononly === true
+  );
+}
 
 /**
  * 创建 MediaWiki API 客户端实例
  *
  * 遵守 Wikimedia User-Agent 策略（须标明机器人名称、版本号与联系方式）。
+ * 自动拦截因 Session 丢失导致的匿名 IP 软封禁 (wgSoftBlockRanges)，并重新登录后重试。
  */
 export function createWiki(apiUrl: string, username: string, password: string) {
-  return new Mwn({
+  const bot = new Mwn({
     apiUrl,
     username,
     password,
     userAgent: "AmanojakuBot/0.1 (contact via bot talk page)",
   });
+
+  const originalRequest = bot.request.bind(bot);
+
+  // 包装 request 方法，在遇到 Session 掉线导致 IP 软封禁时自动重新登录并重试
+  bot.request = async function (
+    params: ApiParams,
+    customRequestOptions?: RawRequestParams & { _softBlockRetried?: boolean },
+  ): Promise<ApiResponse> {
+    try {
+      return await originalRequest(params, customRequestOptions);
+    } catch (error: unknown) {
+      const isLoginAction =
+        params &&
+        typeof params === "object" &&
+        (params.action === "login" ||
+          (params as Record<string, unknown>).type === "login");
+
+      const isRetry = customRequestOptions?._softBlockRetried;
+
+      if (
+        isSoftBlockError(error) &&
+        !isLoginAction &&
+        !isRetry &&
+        bot.options.username &&
+        bot.options.password
+      ) {
+        await bot.login();
+        if (
+          params &&
+          typeof params === "object" &&
+          "token" in params &&
+          bot.csrfToken
+        ) {
+          (params as Record<string, unknown>).token = bot.csrfToken;
+        }
+        return await originalRequest(params, {
+          ...customRequestOptions,
+          _softBlockRetried: true,
+        } as RawRequestParams);
+      }
+      throw error;
+    }
+  };
+
+  return bot;
 }
 
 /**

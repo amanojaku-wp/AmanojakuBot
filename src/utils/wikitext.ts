@@ -446,7 +446,7 @@ function getLineTagInfo(
 
 /**
  * 格式化机器人讨论页回复：
- * 1. 清理 AI 生成的签名（波浪线及前导破折号、手动签名等）
+ * 1. 清理 AI 生成的签名（波浪线 ~~~/~~~~ 及前导破折号、冒号；若指定了 botUsername，则仅清理带有机器人自身用户名的显式签名，保留提及其他用户的链接）
  * 2. 清理 AI 自己生成的缩进（每行开头的冒号 `:`）
  * 3. 按照现有逻辑加缩进：上一条留言缩进等级 +1；若新等级超过 8，则使用 {{Outdent|8}} 将缩进重置为 0
  * 4. 对于 <math><pre><syntaxhighlight><source><score> 等多行内容标签，其内部各行开头不添加冒号
@@ -455,14 +455,38 @@ export function formatDiscussionReply(
   reply: string,
   currentIndentLevel: number,
   marker: string,
+  botUsername?: string,
 ): string {
-  // 1. 清理 AI 生成的签名
-  let cleanReply = reply.replace(/(?:--|——|—|-)?\s*~{3,5}/g, "");
-  cleanReply = cleanReply.replace(
-    /(?:--|——|—|-)?\s*\[\[(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論):[^\]]+\]\][^\n]*?\d{4}年\d{1,2}月\d{1,2}日[^\n]*?\([A-Z]+\)/gi,
-    "",
-  );
-  cleanReply = cleanReply.replace(/\s*(?:--|——|—|-)\s*$/, "").trim();
+  // 1. 清理 AI 生成的签名及残留破折号、波浪线、时间戳等
+  let cleanReply = reply
+    // 移除 ~~~ 到 ~~~~~ 及其前面可能附带的破折号、冒号、空格
+    .replace(/(?:[:\s\-—–]+)?~{3,5}/g, "");
+
+  // 移除显式维基用户名与时间戳签名及其前导符号（仅在未指定 botUsername 时清理所有，或者在指定 botUsername 时仅清理机器人自身的签名）
+  const userNsPattern =
+    "(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)";
+  const timePattern =
+    "(?:\\d{4}年\\d{1,2}月\\d{1,2}日|\\d{1,2}:\\d{2})[^\\n]*?(?:\\([A-Z]+\\))?";
+
+  if (botUsername) {
+    const escapedBot = botUsername
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replaceAll(" ", "[ _]");
+    const botSigRegex = new RegExp(
+      `(?:[:\\s\\-—–]+)?\\[\\[${userNsPattern}:${escapedBot}(?:\\|[^\\]]*)?\\]\\][^\\n]*?${timePattern}`,
+      "gi",
+    );
+    cleanReply = cleanReply.replace(botSigRegex, "");
+  } else {
+    const anySigRegex = new RegExp(
+      `(?:[:\\s\\-—–]+)?\\[\\[${userNsPattern}:[^\\]]+?\\]\\][^\\n]*?${timePattern}`,
+      "gi",
+    );
+    cleanReply = cleanReply.replace(anySigRegex, "");
+  }
+
+  // 移除末尾残留的冒号、破折号、连字符及空白
+  cleanReply = cleanReply.replace(/[:\s\-—–]+$/, "").trim();
 
   // 2. 清理 AI 自己生成的缩进（每行开头的 :），跳过多行内容标签内部代码
   const rawLines = cleanReply.split("\n");
@@ -486,6 +510,23 @@ export function formatDiscussionReply(
     const { openTagAtEnd } = getLineTagInfo(processedLine, currentTag);
     currentTag = openTagAtEnd;
     cleanedLines.push(processedLine);
+  }
+
+  // 去除末尾空行或仅含冒号/破折号的无效末行
+  while (
+    cleanedLines.length > 0 &&
+    (cleanedLines[cleanedLines.length - 1].trim() === "" ||
+      /^[:\s\-—–]+$/.test(cleanedLines[cleanedLines.length - 1]))
+  ) {
+    cleanedLines.pop();
+  }
+
+  if (cleanedLines.length > 0) {
+    cleanedLines[cleanedLines.length - 1] = cleanedLines[
+      cleanedLines.length - 1
+    ]
+      .replace(/[:\s\-—–]+$/, "")
+      .trimEnd();
   }
 
   const suffix = marker ? ` —~~~~ ${marker}` : " —~~~~";

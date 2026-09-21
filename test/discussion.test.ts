@@ -138,13 +138,40 @@ describe("discussion filtering & timestamp handling", () => {
     expect(formatDiscussionReply("这是回复 — ~~~~", 0, marker)).toBe(
       ":这是回复 —~~~~ <!-- marker -->",
     );
+    expect(formatDiscussionReply("这是回复:: —~~~~", 2, marker)).toBe(
+      ":::这是回复 —~~~~ <!-- marker -->",
+    );
+    expect(
+      formatDiscussionReply(
+        "四就是四。:: —[[U:AmanojakuBot|听话的天邪鬼Bot]] <small>([[UT:AmanojakuBot|人机对话]])</small> 2026年9月21日 (一) 00:40 (UTC)",
+        2,
+        marker,
+        "AmanojakuBot",
+      ),
+    ).toBe(":::四就是四。 —~~~~ <!-- marker -->");
+    expect(formatDiscussionReply("第一行回复\n::: —~~~~", 2, marker)).toBe(
+      ":::第一行回复 —~~~~ <!-- marker -->",
+    );
     expect(
       formatDiscussionReply(
         "这是回复\n--[[User:Bot|Bot]]（留言） 2026年9月21日 (一) 08:00 (UTC)",
         0,
         marker,
+        "Bot",
       ),
     ).toBe(":这是回复 —~~~~ <!-- marker -->");
+
+    // Preserve user mentions when botUsername is provided
+    expect(
+      formatDiscussionReply(
+        "正如 [[User:Alice|Alice]] 在 2026年9月20日 所提到的那样，这个方案可行。",
+        1,
+        marker,
+        "AmanojakuBot",
+      ),
+    ).toBe(
+      "::正如 [[User:Alice|Alice]] 在 2026年9月20日 所提到的那样，这个方案可行。 —~~~~ <!-- marker -->",
+    );
 
     // Clean AI-generated colons on each line
     const aiColoned = ":第一行说明\n:第二行说明\n::第三行列表";
