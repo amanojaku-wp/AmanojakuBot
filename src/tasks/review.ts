@@ -703,7 +703,7 @@ ${formattedIssuesWikitext}
 ~~~~`;
     let text: string;
     if (!content || content.trim().length === 0) {
-      text = `{{archive}}\n\n${sectionWikitext}\n`;
+      text = `{{Talkarchive}}\n\n${sectionWikitext}\n`;
     } else {
       text = `${content.trimEnd()}\n\n${sectionWikitext}\n`;
     }

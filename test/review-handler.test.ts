@@ -627,7 +627,7 @@ describe("Task 2 reviewHandler", () => {
     expect(resultPageEdit[0]).toBe("User talk:AmanojakuBot/review/测试条目");
     const resultPageTransform = resultPageEdit[1];
     const resultPageRes = resultPageTransform({ content: "" });
-    expect(resultPageRes.text).toContain("{{archive}}");
+    expect(resultPageRes.text).toContain("{{Talkarchive}}");
     expect(resultPageRes.text).toContain("[[Special:Permalink/77777|77777]]");
     expect(resultPageRes.text).toContain("'''【校对概述】'''");
     expect(resultPageRes.text).toContain("'''［确认问题］'''（语言文字）");
@@ -807,7 +807,7 @@ describe("Task 2 reviewHandler", () => {
 
     const now = new Date();
     const expectedDate = `${now.getUTCFullYear()}年${now.getUTCMonth() + 1}月${now.getUTCDate()}日`;
-    const existingResultPage = `{{archive}}\n\n== ${expectedDate} ==\n早些时候的校对记录`;
+    const existingResultPage = `{{Talkarchive}}\n\n== ${expectedDate} ==\n早些时候的校对记录`;
     mockBot.read.mockImplementation((title: string) => {
       if (title === "User talk:AmanojakuBot/review/测试条目") {
         return Promise.resolve({
@@ -833,8 +833,10 @@ describe("Task 2 reviewHandler", () => {
     const resultPageTransform = resultPageEdit[1];
     const resultPageRes = resultPageTransform({ content: existingResultPage });
     expect(resultPageRes.text).toContain(`== ${expectedDate} (2) ==`);
-    // Should NOT duplicate {{archive}}
-    expect((resultPageRes.text.match(/\{\{archive\}\}/g) || []).length).toBe(1);
+    // Should NOT duplicate {{Talkarchive}}
+    expect(
+      (resultPageRes.text.match(/\{\{Talkarchive\}\}/g) || []).length,
+    ).toBe(1);
 
     // Verify Talk page section parameter matches
     const talkPageEdit = mockBot.edit.mock.calls[1];
