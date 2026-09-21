@@ -126,6 +126,307 @@ export function containsMatchingTimestamp(
 }
 
 /**
+ * 结构化讨论留言数据模型
+ */
+export type StructuredComment = {
+  /** 发言用户名（如 "Alice"、"192.0.2.1" 或未知用户） */
+  author: string;
+  /** 发言时间戳文本（如 "2026年9月14日 (一) 01:23 (UTC)"） */
+  timestamp?: string;
+  /** 留言正文（已去除签名、时间戳、行首缩进冒号与机器人标记后的纯正文） */
+  text: string;
+  /** 缩进层级（0 为顶格，1 为单个冒号或星号等） */
+  indentLevel: number;
+  /** 原始文本片段 */
+  rawText?: string;
+};
+
+/**
+ * 维基用户链接提取正则（支持 User:, User talk:, 用户:, 用戶:, 使用者:, U:, UT:, Special:Contributions 等）
+ */
+export const USER_LINK_REGEX =
+  /\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)\s*:\s*([^|[\]#]+)|(?:Special|特别|特別)\s*:\s*(?:Contributions|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/([^|[\]#]+))(?:\s*\|\s*[^[\]]*)?\]\]/i;
+
+/**
+ * 维基时间戳正则（支持中文维基、英文/publictestwiki、ISO等常见格式）
+ */
+export const WIKI_TIMESTAMP_REGEX =
+  /(?:\d{4}年\d{1,2}月\d{1,2}日\s*(?:\([^\n)]+\))?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:\([A-Z]+\))?|\d{1,2}:\d{2}(?::\d{2})?,\s*\d{1,2}\s+[A-Za-z]+\s+\d{4}\s*(?:\([A-Z]+\))?|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?\s*(?:\([A-Z]+\))?)/;
+
+/**
+ * 未签名模板正则（如 {{unsigned|User|Time}}、{{未签名|User|Time}}）
+ */
+export const UNSIGNED_TEMPLATE_REGEX =
+  /\{\{\s*(?:unsigned|unsigned-ip|unsignedIP|unsignedip|未签名|未簽名|Unsigned|Unsigned-IP)\s*\|\s*(?:1=)?([^|{}]+?)(?:\s*\|\s*(?:2=)?([^|{}]+?))?\s*\}\}/i;
+
+/**
+ * 解析单条留言文本为结构化对象（提取留言者、时间戳、缩进层级并去除签名噪声）
+ */
+export function parseStructuredComment(
+  rawComment: string,
+  options?: {
+    defaultAuthor?: string;
+    defaultTimestamp?: string;
+    timestampFormat?: string;
+  },
+): StructuredComment {
+  const rawText = rawComment;
+  let text = rawComment;
+
+  // 1. 提取缩进层级
+  const indentLevel = getCommentIndentLevel(text);
+
+  // 2. 移除机器人 source marker
+  text = text.replace(/<!--\s*amanojaku-bot:[^>]*?-->/gi, "");
+
+  let author: string | undefined = undefined;
+  let timestamp: string | undefined = undefined;
+
+  // 3. 检查未签名模板 {{unsigned|User|Time}} 或 {{未签名|User|Time}}
+  const unsignedMatch = text.match(UNSIGNED_TEMPLATE_REGEX);
+  if (unsignedMatch) {
+    author = unsignedMatch[1].trim();
+    if (unsignedMatch[2]) {
+      timestamp = unsignedMatch[2].trim();
+    }
+    text = text.replace(unsignedMatch[0], "");
+  }
+
+  // 4. 检查标准维基签名（末尾的用户链接与时间戳）
+  const timeMatches = [
+    ...text.matchAll(new RegExp(WIKI_TIMESTAMP_REGEX.source, "gi")),
+  ];
+
+  if (timeMatches.length > 0) {
+    const lastTimeMatch = timeMatches[timeMatches.length - 1];
+    const timeIdx = lastTimeMatch.index!;
+    const afterTime = text.slice(timeIdx + lastTimeMatch[0].length).trim();
+
+    // 仅当时间戳位于文本末尾附近（允许尾随括号、空白或标点）时判定为签名时间戳
+    if (afterTime.length < 20 && !afterTime.includes("\n")) {
+      timestamp = lastTimeMatch[0].trim();
+      const beforeTime = text.slice(0, timeIdx);
+
+      // 检查时间戳紧邻前面的签名用户链接
+      const sigPrefixRegex =
+        /(?:[:\s\-—–－]+)?\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)\s*:[^|[\]#]+|(?:Special|特别|特別)\s*:\s*(?:Contributions|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/[^|[\]#]+)(?:\s*\|\s*[^[\]]*)?\]\](?:\([^\n()]{0,30}\)|（[^\n）]{0,30}）|<small>[^<>\n]{0,80}<\/small>|\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)\s*:[^|[\]#]+|(?:Special|特别|特別)\s*:\s*(?:Contributions|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/[^|[\]#]+)(?:\s*\|\s*[^[\]]*)?\]\]|[:\s/·•，,–—-])*$/i;
+
+      const sigPrefixMatch = beforeTime.match(sigPrefixRegex);
+      if (sigPrefixMatch && sigPrefixMatch.index !== undefined) {
+        const sigPrefix = sigPrefixMatch[0];
+        if (!author) {
+          const userMatches = [
+            ...sigPrefix.matchAll(new RegExp(USER_LINK_REGEX.source, "gi")),
+          ];
+          if (userMatches.length > 0) {
+            const lastUser = userMatches[userMatches.length - 1];
+            author = (lastUser[1] || lastUser[2]).replace(/_/g, " ").trim();
+          }
+        }
+        text = beforeTime.slice(0, sigPrefixMatch.index);
+      } else {
+        // 无用户链接前缀，仅移除时间戳及其前面的破折号/空白
+        const trailingDashMatch = beforeTime.match(/[:\s\-—–－]+$/);
+        const cutIdx = trailingDashMatch ? trailingDashMatch.index! : timeIdx;
+        text = beforeTime.slice(0, cutIdx);
+      }
+    }
+  } else {
+    // 检查末尾波浪线签名（~~~ 或 ~~~~ 或 ~~~~~）
+    const tildeMatch = text.match(/(?:[:\s\-—–－]+)?~{3,5}\s*$/);
+    if (tildeMatch && tildeMatch.index !== undefined) {
+      text = text.slice(0, tildeMatch.index);
+    }
+  }
+
+  // 5. 移除每行开头的缩进冒号 (:) 及星号 (*) / 井号 (#)，但保留多行内容标签（如 syntaxhighlight/pre/math）内部代码缩进
+  const rawLines = text.split("\n");
+  const cleanedLines: string[] = [];
+  let currentTag: string | null = null;
+
+  for (const line of rawLines) {
+    const isInsideAtStart = currentTag !== null;
+    let processedLine = line;
+
+    if (!isInsideAtStart) {
+      processedLine = line.replace(/^[:*#]+ */, "");
+    } else if (
+      /^[:*#]+ *(?=<\/\s*(?:math|chem|ce|pre|syntaxhighlight|source|score|nowiki|timeline|graph|maplink|mapframe|hiero)\b)/i.test(
+        line,
+      )
+    ) {
+      processedLine = line.replace(/^[:*#]+ */, "");
+    }
+
+    const { openTagAtEnd } = getLineTagInfo(processedLine, currentTag);
+    currentTag = openTagAtEnd;
+    cleanedLines.push(processedLine);
+  }
+
+  // 去除末尾空行或残存符号
+  while (
+    cleanedLines.length > 0 &&
+    (cleanedLines[cleanedLines.length - 1].trim() === "" ||
+      /^[:\s\-—–－]+$/.test(cleanedLines[cleanedLines.length - 1]))
+  ) {
+    cleanedLines.pop();
+  }
+
+  if (cleanedLines.length > 0) {
+    cleanedLines[cleanedLines.length - 1] = cleanedLines[
+      cleanedLines.length - 1
+    ]
+      .replace(/[:\s\-—–－]+$/, "")
+      .trimEnd();
+  }
+
+  const cleanBody = cleanedLines.join("\n").trim();
+
+  return {
+    author: author || options?.defaultAuthor || "未知用户",
+    timestamp: timestamp || options?.defaultTimestamp,
+    text: cleanBody,
+    indentLevel,
+    rawText,
+  };
+}
+
+/**
+ * 判断单行文本是否包含位于行末的带时间戳维基签名（或未签名模板、~~~~），作为单条留言的结束分割线
+ *
+ * 判定规则：同一行内有用户页/讨论页/贡献页链接及时间戳，且时间戳位于该行末尾；或行末为 ~~~~ / {{unsigned|...}}。
+ */
+export function hasEndSignature(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+
+  // 1. 未展开的波浪线签名（如 ~~~~、~~~~~、--~~~~）位于行末
+  if (/(?:[:\s\-—–－]+)?~{3,5}(?:\s*<!--.*?-->)*\s*$/i.test(trimmed)) {
+    return true;
+  }
+
+  // 2. 未签名模板（如 {{unsigned|...}}、{{未签名|...}}）位于行末
+  if (
+    /\{\{\s*(?:unsigned|unsigned-ip|unsignedIP|unsignedip|未签名|未簽名|Unsigned|Unsigned-IP)\s*\|[^}]+?\}\}(?:\s*<!--.*?-->)*\s*$/i.test(
+      trimmed,
+    )
+  ) {
+    return true;
+  }
+
+  // 3. 检查同一行内是否包含用户页/讨论页/贡献页链接
+  if (!USER_LINK_REGEX.test(trimmed)) {
+    return false;
+  }
+
+  // 4. 检查同一行内是否存在时间戳，且时间戳位于该行末尾
+  const timeMatches = [
+    ...trimmed.matchAll(new RegExp(WIKI_TIMESTAMP_REGEX.source, "gi")),
+  ];
+  if (timeMatches.length === 0) {
+    return false;
+  }
+
+  const lastTimeMatch = timeMatches[timeMatches.length - 1];
+  const timeEndIndex = lastTimeMatch.index! + lastTimeMatch[0].length;
+  const afterTime = trimmed.slice(timeEndIndex);
+
+  // 过滤掉 HTML 注释后检查时间戳后面是否只有空白或尾随括号/标点
+  const afterTimeWithoutComments = afterTime.replace(/<!--.*?-->/g, "").trim();
+  return (
+    afterTimeWithoutComments.length === 0 ||
+    /^[\s()（）\]］.,，。—–-]+$/.test(afterTimeWithoutComments)
+  );
+}
+
+/**
+ * 判断单行文本是否包含签名或时间戳标记（向后兼容接口）
+ */
+export const hasSignatureOrTimestamp = hasEndSignature;
+
+/**
+ * 将维基讨论章节（或整段讨论上下文）按带时间戳签名拆分为结构化留言列表
+ *
+ * 核心逻辑：以带时间戳签名（同一行内有用户页/讨论页/贡献页及时间戳，且时间戳位于该行末尾）为分割线，不能以缩进为分割线。
+ */
+export function parseDiscussionThread(
+  wikitext: string,
+  options?: {
+    defaultAuthor?: string;
+    defaultTimestamp?: string;
+    timestampFormat?: string;
+  },
+): StructuredComment[] {
+  if (!wikitext || !wikitext.trim()) return [];
+
+  const lines = wikitext.split("\n");
+  const commentChunks: string[] = [];
+  let currentLines: string[] = [];
+  let currentTag: string | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 跳过纯二级或更高级别标题行（== 讨论标题 ==）
+    if (
+      /^==+\s*([^=].*?)\s*==+/.test(line.trim()) &&
+      currentLines.length === 0
+    ) {
+      continue;
+    }
+
+    // 处理多行代码/数学公式标签
+    const { isInsideTagAtStart, openTagAtEnd } = getLineTagInfo(
+      line,
+      currentTag,
+    );
+    currentTag = openTagAtEnd;
+
+    if (isInsideTagAtStart || currentTag !== null) {
+      currentLines.push(line);
+      continue;
+    }
+
+    // 检查 Outdent 重置模板
+    if (/^\{\{\s*(?:outdent|od)\b/i.test(line.trim())) {
+      if (
+        currentLines.length > 0 &&
+        currentLines.some((l) => l.trim().length > 0)
+      ) {
+        commentChunks.push(currentLines.join("\n"));
+        currentLines = [];
+      }
+      continue;
+    }
+
+    currentLines.push(line);
+
+    // 仅以带时间戳签名（同一行内有用户/讨论/贡献页及时间戳，且时间戳位于该行末尾；或包含未签名模板/~~~~）为分割线
+    if (hasEndSignature(line)) {
+      commentChunks.push(currentLines.join("\n"));
+      currentLines = [];
+    }
+  }
+
+  if (
+    currentLines.length > 0 &&
+    currentLines.some((l) => l.trim().length > 0)
+  ) {
+    commentChunks.push(currentLines.join("\n"));
+  }
+
+  const structuredList: StructuredComment[] = [];
+  for (const chunk of commentChunks) {
+    const parsed = parseStructuredComment(chunk, options);
+    if (parsed.text.length > 0) {
+      structuredList.push(parsed);
+    }
+  }
+
+  return structuredList;
+}
+
+/**
  * 维基页面二级标题章节结构
  */
 export type SectionInfo = {
@@ -464,16 +765,16 @@ export function formatDiscussionReply(
 
   // 移除显式维基用户名与时间戳签名及其前导符号（仅在未指定 botUsername 时清理所有，或者在指定 botUsername 时仅清理机器人自身的签名）
   const userNsPattern =
-    "(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)";
+    "(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論|Special|特别|特別)";
   const timePattern =
-    "(?:\\d{4}年\\d{1,2}月\\d{1,2}日|\\d{1,2}:\\d{2})[^\\n]*?(?:\\([A-Z]+\\))?";
+    "(?:\\d{4}年\\d{1,2}月\\d{1,2}日\\s*(?:\\([^\\n)]+\\))?\\s*\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:\\([A-Z]+\\))?|\\d{1,2}:\\d{2}(?::\\d{2})?,\\s*\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}\\s*(?:\\([A-Z]+\\))?|\\d{4}-\\d{2}-\d{2}[ T]\\d{2}:\d{2}(?::\\d{2})?\\s*(?:\\([A-Z]+\\))?)";
 
   if (botUsername) {
     const escapedBot = botUsername
       .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
       .replaceAll(" ", "[ _]");
     const botSigRegex = new RegExp(
-      `(?:[:\\s\\-—–]+)?\\[\\[${userNsPattern}:${escapedBot}(?:\\|[^\\]]*)?\\]\\][^\\n]*?${timePattern}`,
+      `(?:[:\\s\\-—–－]+)?\\[\\[${userNsPattern}:${escapedBot}(?:\\|[^\\]]*)?\\]\\][^\n]*?${timePattern}`,
       "gi",
     );
     cleanReply = cleanReply.replace(botSigRegex, "");

@@ -7,8 +7,14 @@ import {
   getCommentIndentLevel,
   insertReplyIntoContent,
   isRelevant,
+  parseDiscussionThread,
   parseSections,
+  parseStructuredComment,
 } from "../src/utils/wikitext.js";
+import {
+  formatStructuredCurrentMessage,
+  formatStructuredDiscussionContext,
+} from "../src/tasks/chat.js";
 import {
   addTokenUsage,
   createTokenUsage,
@@ -124,7 +130,7 @@ describe("discussion filtering & timestamp handling", () => {
     );
     // 9 -> 10 level (> 8) -> outdent to 0
     expect(formatDiscussionReply("回复内容", 9, marker)).toBe(
-      "{{Outdent|8}}\n回复内容 —~~~~ <!-- marker -->",
+      "{{Outdent|9}}\n回复内容 —~~~~ <!-- marker -->",
     );
   });
 
@@ -268,5 +274,152 @@ line 2
       totalTokens: 300,
     });
     expect(formatTokenUsage(usage)).toBe("I1334/O767/T2101");
+  });
+
+  it("parses single comments into structured author, timestamp, indent, and clean body", () => {
+    const raw =
+      ":Charlie: 插话！--[[User:Charlie|Charlie]] 2026年9月14日 (一) 01:23 (UTC)";
+    const parsed = parseStructuredComment(raw);
+    expect(parsed.author).toBe("Charlie");
+    expect(parsed.timestamp).toBe("2026年9月14日 (一) 01:23 (UTC)");
+    expect(parsed.indentLevel).toBe(1);
+    expect(parsed.text).toBe("Charlie: 插话！");
+
+    // IP user signature
+    const ipRaw =
+      "::匿名意见。 --[[Special:Contributions/192.0.2.1|192.0.2.1]] 2026年9月14日 (一) 02:00 (UTC)";
+    const ipParsed = parseStructuredComment(ipRaw);
+    expect(ipParsed.author).toBe("192.0.2.1");
+    expect(ipParsed.timestamp).toBe("2026年9月14日 (一) 02:00 (UTC)");
+    expect(ipParsed.indentLevel).toBe(2);
+    expect(ipParsed.text).toBe("匿名意见。");
+
+    // Unsigned template
+    const unsignedRaw =
+      ":未签名内容。{{unsigned|Eve|2026年9月14日 (一) 03:00 (UTC)}}";
+    const unsignedParsed = parseStructuredComment(unsignedRaw);
+    expect(unsignedParsed.author).toBe("Eve");
+    expect(unsignedParsed.timestamp).toBe("2026年9月14日 (一) 03:00 (UTC)");
+    expect(unsignedParsed.indentLevel).toBe(1);
+    expect(unsignedParsed.text).toBe("未签名内容。");
+
+    // Preserves body mentions of other users without confusing author
+    const mentionRaw =
+      ":正如 [[User:Bob|Bob]] 所述，这个方案可行。 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)";
+    const mentionParsed = parseStructuredComment(mentionRaw);
+    expect(mentionParsed.author).toBe("Alice");
+    expect(mentionParsed.timestamp).toBe("2026年9月14日 (一) 01:00 (UTC)");
+    expect(mentionParsed.text).toBe(
+      "正如 [[User:Bob|Bob]] 所述，这个方案可行。",
+    );
+
+    // Unexpanded signature with fallback
+    const tildeRaw = ":请问在吗？ --~~~~";
+    const tildeParsed = parseStructuredComment(tildeRaw, {
+      defaultAuthor: "David",
+      defaultTimestamp: "2026年9月14日 (一) 04:00 (UTC)",
+    });
+    expect(tildeParsed.author).toBe("David");
+    expect(tildeParsed.timestamp).toBe("2026年9月14日 (一) 04:00 (UTC)");
+    expect(tildeParsed.text).toBe("请问在吗？");
+  });
+
+  it("parses multi-turn discussion threads into structured comments", () => {
+    const threadWikitext = `== 探讨条目校对规则 ==
+你好，请问机器人的校对规则是在哪里配置的？ --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
+:在 User:AmanojakuBot/task/2/rule 页面中配置。 --[[User:Bob|Bob]]（[[User talk:Bob|留言]]） 2026年9月14日 (一) 01:05 (UTC)
+::知道了，多谢！ --[[Special:Contributions/192.0.2.1|192.0.2.1]] 2026年9月14日 (一) 01:10 (UTC)
+:::机器人可以帮我看一下这个吗？ --~~~~`;
+
+    const comments = parseDiscussionThread(threadWikitext, {
+      defaultAuthor: "Charlie",
+      defaultTimestamp: "2026年9月14日 (一) 01:15 (UTC)",
+    });
+
+    expect(comments).toHaveLength(4);
+    expect(comments[0]).toMatchObject({
+      author: "Alice",
+      timestamp: "2026年9月14日 (一) 01:00 (UTC)",
+      indentLevel: 0,
+      text: "你好，请问机器人的校对规则是在哪里配置的？",
+    });
+    expect(comments[1]).toMatchObject({
+      author: "Bob",
+      timestamp: "2026年9月14日 (一) 01:05 (UTC)",
+      indentLevel: 1,
+      text: "在 User:AmanojakuBot/task/2/rule 页面中配置。",
+    });
+    expect(comments[2]).toMatchObject({
+      author: "192.0.2.1",
+      timestamp: "2026年9月14日 (一) 01:10 (UTC)",
+      indentLevel: 2,
+      text: "知道了，多谢！",
+    });
+    expect(comments[3]).toMatchObject({
+      author: "Charlie",
+      timestamp: "2026年9月14日 (一) 01:15 (UTC)",
+      indentLevel: 3,
+      text: "机器人可以帮我看一下这个吗？",
+    });
+  });
+
+  it("formats structured discussion history and current message into XML prompts", () => {
+    const threadWikitext = `== 话题测试 ==
+Alice的第一句话 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
+:Bob的回复 --[[User:Bob|Bob]] 2026年9月14日 (一) 01:05 (UTC)`;
+
+    const xmlHistory = formatStructuredDiscussionContext(
+      threadWikitext,
+      "话题测试",
+      "zhwiki",
+    );
+    expect(xmlHistory).toContain('<discussion-history section="话题测试">');
+    expect(xmlHistory).toContain(
+      '<comment index="1" author="Alice" time="2026年9月14日 (一) 01:00 (UTC)" indent="0">',
+    );
+    expect(xmlHistory).toContain("Alice的第一句话");
+    expect(xmlHistory).toContain(
+      '<comment index="2" author="Bob" time="2026年9月14日 (一) 01:05 (UTC)" indent="1">',
+    );
+    expect(xmlHistory).toContain("Bob的回复");
+
+    const xmlCurrent = formatStructuredCurrentMessage(
+      ":Charlie: 最新提问 --[[User:Charlie|Charlie]] 2026年9月14日 (一) 01:23 (UTC)",
+      "Charlie",
+      "2026-09-14T01:23:00Z",
+      "zhwiki",
+    );
+    expect(xmlCurrent).toContain(
+      '<current-message author="Charlie" time="2026年9月14日 (一) 01:23 (UTC)" indent="1">',
+    );
+    expect(xmlCurrent).toContain("Charlie: 最新提问");
+  });
+
+  it("splits comments strictly by end-of-line signatures rather than indentation changes", () => {
+    const threadWithMultilineAndLists = `== 复杂排版讨论 ==
+:这是 Alice 发言的第一段内容。
+:* 列表项 1：需要重点注意的事情
+:* 列表项 2：另一项补充内容
+:这是 Alice 发言的最后一段总结，其中顺便提到了 [[User:Someone|Someone]] 在 2026年1月1日 (四) 00:00 (UTC) 的旧发言作为参考。 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
+::这是 Bob 对 Alice 的回复。
+::包含第二行。 --[[User:Bob|Bob]] 2026年9月14日 (一) 01:05 (UTC)`;
+
+    const comments = parseDiscussionThread(threadWithMultilineAndLists);
+    expect(comments).toHaveLength(2);
+
+    // Alice 的整段复杂留言应该被保留为单个 comment，不因列表或正文中的旧时间戳断开
+    expect(comments[0].author).toBe("Alice");
+    expect(comments[0].timestamp).toBe("2026年9月14日 (一) 01:00 (UTC)");
+    expect(comments[0].indentLevel).toBe(1);
+    expect(comments[0].text).toContain("这是 Alice 发言的第一段内容。");
+    expect(comments[0].text).toContain("列表项 1：需要重点注意的事情");
+    expect(comments[0].text).toContain("列表项 2：另一项补充内容");
+    expect(comments[0].text).toContain("这是 Alice 发言的最后一段总结");
+
+    // Bob 的回复也是单个 comment
+    expect(comments[1].author).toBe("Bob");
+    expect(comments[1].timestamp).toBe("2026年9月14日 (一) 01:05 (UTC)");
+    expect(comments[1].indentLevel).toBe(2);
+    expect(comments[1].text).toBe("这是 Bob 对 Alice 的回复。\n包含第二行。");
   });
 });
