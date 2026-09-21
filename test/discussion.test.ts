@@ -128,6 +128,69 @@ describe("discussion filtering & timestamp handling", () => {
     );
   });
 
+  it("cleans AI-generated signatures and leading colons properly", () => {
+    const marker = "<!-- marker -->";
+
+    // Clean trailing signatures like --~~~~, —~~~~, ~~~~
+    expect(formatDiscussionReply("这是回复 --~~~~", 0, marker)).toBe(
+      ":这是回复 —~~~~ <!-- marker -->",
+    );
+    expect(formatDiscussionReply("这是回复 — ~~~~", 0, marker)).toBe(
+      ":这是回复 —~~~~ <!-- marker -->",
+    );
+    expect(
+      formatDiscussionReply(
+        "这是回复\n--[[User:Bot|Bot]]（留言） 2026年9月21日 (一) 08:00 (UTC)",
+        0,
+        marker,
+      ),
+    ).toBe(":这是回复 —~~~~ <!-- marker -->");
+
+    // Clean AI-generated colons on each line
+    const aiColoned = ":第一行说明\n:第二行说明\n::第三行列表";
+    expect(formatDiscussionReply(aiColoned, 1, marker)).toBe(
+      "::第一行说明\n::第二行说明\n::第三行列表 —~~~~ <!-- marker -->",
+    );
+  });
+
+  it("preserves internal line formatting inside multiline tags without adding colons", () => {
+    const marker = "<!-- marker -->";
+    const codeReply = `请参考以下示例代码：
+<syntaxhighlight lang="typescript">
+function sum(a: number, b: number): number {
+    return a + b;
+}
+</syntaxhighlight>
+以及数学公式：
+<math>
+E = mc^2
+</math>
+还有预格式化文本：
+<pre>
+line 1
+line 2
+</pre>
+希望对您有帮助！`;
+
+    const formatted = formatDiscussionReply(codeReply, 1, marker);
+    expect(formatted).toBe(`::请参考以下示例代码：
+::<syntaxhighlight lang="typescript">
+function sum(a: number, b: number): number {
+    return a + b;
+}
+</syntaxhighlight>
+::以及数学公式：
+::<math>
+E = mc^2
+</math>
+::还有预格式化文本：
+::<pre>
+line 1
+line 2
+</pre>
+::希望对您有帮助！ —~~~~ <!-- marker -->`);
+  });
+
   it("inserts reply directly on the next line following target comment", () => {
     const content = `== 话题一 ==\nAlice: 留言 1\n:Charlie: 插话！\n:Eve: 后续留言\n\n== 话题二 ==\nBob: 留言 2`;
     const targetComment = ":Charlie: 插话！";

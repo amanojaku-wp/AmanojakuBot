@@ -409,23 +409,115 @@ export function getCommentIndentLevel(comment: string): number {
   return match ? match[0].length : 0;
 }
 
+const MULTILINE_CONTENT_TAG_REGEX =
+  /<\s*(\/)?\s*(math|chem|ce|pre|syntaxhighlight|source|score|nowiki|timeline|graph|maplink|mapframe|hiero)\b([^>]*?)(\/)?\s*>/gi;
+
+/**
+ * 分析单行文本中多行内容标签（如 math, pre, syntaxhighlight 等）的开启与闭合状态
+ */
+function getLineTagInfo(
+  line: string,
+  currentOpenTag: string | null,
+): { isInsideTagAtStart: boolean; openTagAtEnd: string | null } {
+  const isInsideTagAtStart = currentOpenTag !== null;
+  let activeTag = currentOpenTag;
+
+  MULTILINE_CONTENT_TAG_REGEX.lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = MULTILINE_CONTENT_TAG_REGEX.exec(line)) !== null) {
+    const isClosing = Boolean(match[1]);
+    const tagName = match[2].toLowerCase();
+    const isSelfClosing = Boolean(match[4]) || match[3].trimEnd().endsWith("/");
+
+    if (activeTag === null) {
+      if (!isClosing && !isSelfClosing) {
+        activeTag = tagName;
+      }
+    } else {
+      if (isClosing && tagName === activeTag) {
+        activeTag = null;
+      }
+    }
+  }
+
+  return { isInsideTagAtStart, openTagAtEnd: activeTag };
+}
+
 /**
  * 格式化机器人讨论页回复：
- * 在上一条留言缩进等级上 +1；若新等级超过 8，则使用 {{Outdent|上一条缩进}} 将缩进重置为 0。
+ * 1. 清理 AI 生成的签名（波浪线及前导破折号、手动签名等）
+ * 2. 清理 AI 自己生成的缩进（每行开头的冒号 `:`）
+ * 3. 按照现有逻辑加缩进：上一条留言缩进等级 +1；若新等级超过 8，则使用 {{Outdent|8}} 将缩进重置为 0
+ * 4. 对于 <math><pre><syntaxhighlight><source><score> 等多行内容标签，其内部各行开头不添加冒号
  */
 export function formatDiscussionReply(
   reply: string,
   currentIndentLevel: number,
   marker: string,
 ): string {
-  const cleanReply = reply.replaceAll("~~~~", "");
+  // 1. 清理 AI 生成的签名
+  let cleanReply = reply.replace(/(?:--|——|—|-)?\s*~{3,5}/g, "");
+  cleanReply = cleanReply.replace(
+    /(?:--|——|—|-)?\s*\[\[(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論):[^\]]+\]\][^\n]*?\d{4}年\d{1,2}月\d{1,2}日[^\n]*?\([A-Z]+\)/gi,
+    "",
+  );
+  cleanReply = cleanReply.replace(/\s*(?:--|——|—|-)\s*$/, "").trim();
+
+  // 2. 清理 AI 自己生成的缩进（每行开头的 :），跳过多行内容标签内部代码
+  const rawLines = cleanReply.split("\n");
+  const cleanedLines: string[] = [];
+  let currentTag: string | null = null;
+
+  for (const line of rawLines) {
+    const isInsideAtStart = currentTag !== null;
+    let processedLine = line;
+
+    if (!isInsideAtStart) {
+      processedLine = line.replace(/^:+ */, "");
+    } else if (
+      /^:+ *(?=<\/\s*(?:math|chem|ce|pre|syntaxhighlight|source|score|nowiki|timeline|graph|maplink|mapframe|hiero)\b)/i.test(
+        line,
+      )
+    ) {
+      processedLine = line.replace(/^:+ */, "");
+    }
+
+    const { openTagAtEnd } = getLineTagInfo(processedLine, currentTag);
+    currentTag = openTagAtEnd;
+    cleanedLines.push(processedLine);
+  }
+
+  const suffix = marker ? ` —~~~~ ${marker}` : " —~~~~";
   const nextLevel = currentIndentLevel + 1;
 
+  // 3. 缩进等级超过 8 则使用 Outdent 重置为 0
   if (nextLevel > 8) {
-    return `{{Outdent|8}}\n${cleanReply} —~~~~ ${marker}`;
+    const body = cleanedLines.join("\n");
+    return `{{Outdent|${currentIndentLevel}}}\n${body}${suffix}`;
   }
+
+  // 3 & 4. 添加冒号缩进，多行内容标签内部各行保持原样不加冒号
   const indents = ":".repeat(nextLevel);
-  return `${indents}${cleanReply.replace(/\n/g, `\n${indents}`)} —~~~~ ${marker}`;
+  const indentedLines: string[] = [];
+  currentTag = null;
+
+  for (const line of cleanedLines) {
+    const { isInsideTagAtStart, openTagAtEnd } = getLineTagInfo(
+      line,
+      currentTag,
+    );
+    currentTag = openTagAtEnd;
+
+    if (isInsideTagAtStart) {
+      indentedLines.push(line);
+    } else {
+      indentedLines.push(`${indents}${line}`);
+    }
+  }
+
+  const body = indentedLines.join("\n");
+  return `${body}${suffix}`;
 }
 
 /**
@@ -850,6 +942,8 @@ export type ReviewIssue = {
 };
 
 export type ReviewResult = {
+  isEncyclopedic?: boolean;
+  nonEncyclopedicReason?: string | null;
   summary: string;
   issues: ReviewIssue[];
 };
