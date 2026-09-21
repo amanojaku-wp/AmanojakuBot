@@ -9,6 +9,7 @@ import {
 } from "./utils/db.js";
 import { createWiki, pageText } from "./utils/wiki.js";
 import { fetchRecentChanges, pollingStart } from "./utils/polling.js";
+import { cleanupBacklogReviews } from "./tasks/review.js";
 import { publishReports } from "./tasks/aiEdit.js";
 import { handle, type ChangeEvent, type HandlerContext } from "./handle.js";
 
@@ -241,6 +242,24 @@ if (cfg.events.mode === "eventstream") {
     setTimeout(tick, cfg.events.pollIntervalSeconds * 1000);
   };
   void tick();
+}
+
+// -------------------------------------------------------------
+// 任务二：定期/启动清理积压校对请求兜底机制（启动时及每 1 小时执行一次）
+// -------------------------------------------------------------
+if (cfg.tasks.review.enabled) {
+  const runReviewCleanup = async () => {
+    // 串行编排入全局任务队列，确保清理操作与事件处理互斥执行
+    queue = queue.then(() => cleanupBacklogReviews(handlerContext));
+    try {
+      await queue;
+    } catch (error) {
+      log.error({ err: error }, "backlog review cleanup failed");
+      queue = Promise.resolve();
+    }
+    setTimeout(runReviewCleanup, 3600_000);
+  };
+  void runReviewCleanup();
 }
 
 // -------------------------------------------------------------

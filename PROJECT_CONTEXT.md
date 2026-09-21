@@ -20,7 +20,7 @@
 
 ## 任务二：条目辅助校对
 
-通过标准模板 `{{User:AmanojakuBot/template/ReviewRequest | article = 条目名 | status = ...}}` 在配置的讨论页（`tasks.review.talkPage`，如 `User talk:AmanojakuBot/review`）二级标题章节中接收校对请求。每个二级标题章节有且仅有一个请求。请求者身份由触发 revision 的编辑者与签名用户双重校验。支持正式条目（命名空间 0）及配置的草稿命名空间（如 `draftNamespace: [2, 118]`）。页面不存在、名字空间不支持、页面内容为空或明显非百科全书条目（如系统测试、沙盒涂鸦、胡言乱语、破坏、程序代码、用户个人页面、用户个人论述）时将模板标记为 `status = not done` 并说明原因。用户按 UTC 自然日限制每日成功请求上限（`userDailyLimit`），超额标记为 `not done`。校对绑定固定 revision ID，从配置的 `rulePage` 读取校对规则（不使用任务一人格），通过 LLM 结构化输出（Zod schema）中立客观生成校对摘要与问题列表，按 `<talkPage>/<name>` 独立写入结果页并追加唯一日期章节与警告文案，成功写入后更新请求模板为 `status = done` 并 ping 用户。
+通过标准模板 `{{User:AmanojakuBot/template/ReviewRequest | article = 条目名 | status = ...}}` 在配置的讨论页（`tasks.review.talkPage`，如 `User talk:AmanojakuBot/review`）二级标题章节中接收校对请求。每个二级标题章节有且仅有一个请求。请求者身份由触发 revision 的编辑者与签名用户双重校验。支持正式条目（命名空间 0）及配置的草稿命名空间（如 `draftNamespace: [2, 118]`）。页面不存在、名字空间不支持、页面内容为空或明显非百科全书条目（如系统测试、沙盒涂鸦、胡言乱语、破坏、程序代码、用户个人页面、用户个人论述）时将模板标记为 `status = not done` 并说明原因。用户按 UTC 自然日限制每日成功请求上限（`userDailyLimit`），超额标记为 `not done`。校对绑定固定 revision ID，从配置的 `rulePage` 读取校对规则（不使用任务一人格），通过 LLM 结构化输出（Zod schema）中立客观生成校对摘要与问题列表，按 `<talkPage>/<name>` 独立写入结果页并追加唯一日期章节与警告文案，成功写入后更新请求模板为 `status = done` 并 ping 用户。提供兜底机制：机器人启动时及每隔 1 小时自动扫描讨论页中因网络抖动或异常遗漏的积压请求并补处理。
 
 ## 任务三：疑似 AI 编辑线索
 
