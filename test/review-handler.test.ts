@@ -27,6 +27,17 @@ vi.mock("ai", async (importOriginal) => {
           usage: { promptTokens: 80, completionTokens: 40, totalTokens: 120 },
         };
       }
+      if (typeof prompt === "string" && prompt.includes("非百科页面测试")) {
+        return {
+          object: {
+            isEncyclopedic: false,
+            nonEncyclopedicReason: "系统测试与沙盒涂鸦",
+            summary: "页面为测试涂鸦，非百科全书条目。",
+            issues: [],
+          },
+          usage: { promptTokens: 60, completionTokens: 20, totalTokens: 80 },
+        };
+      }
       if (typeof prompt === "string" && prompt.includes("【校对规则】")) {
         return {
           object: {
@@ -623,13 +634,15 @@ describe("Task 2 reviewHandler", () => {
     expect(resultPageRes.text).toContain("第二轮发现遗漏的参考资料问题");
 
     // Check Talk page edit
+    const now = new Date();
+    const expectedDate = `${now.getUTCFullYear()}年${now.getUTCMonth() + 1}月${now.getUTCDate()}日`;
     const talkPageEdit = mockBot.edit.mock.calls[1];
     expect(talkPageEdit[0]).toBe("User talk:AmanojakuBot/review");
     const talkPageTransform = talkPageEdit[1];
     const talkPageRes = talkPageTransform({ content: afterContent });
     expect(talkPageRes.text).toContain("| status = done");
     expect(talkPageRes.text).toContain("| oldid = 77777");
-    expect(talkPageRes.text).toContain("| section = 2026年9月20日");
+    expect(talkPageRes.text).toContain(`| section = ${expectedDate}`);
     expect(talkPageRes.text).toContain("{{ping|Alice}}校对已完成");
 
     // Check database
@@ -792,7 +805,9 @@ describe("Task 2 reviewHandler", () => {
       return Promise.resolve({});
     });
 
-    const existingResultPage = `{{archive}}\n\n== 2026年9月20日 ==\n早些时候的校对记录`;
+    const now = new Date();
+    const expectedDate = `${now.getUTCFullYear()}年${now.getUTCMonth() + 1}月${now.getUTCDate()}日`;
+    const existingResultPage = `{{archive}}\n\n== ${expectedDate} ==\n早些时候的校对记录`;
     mockBot.read.mockImplementation((title: string) => {
       if (title === "User talk:AmanojakuBot/review/测试条目") {
         return Promise.resolve({
@@ -813,11 +828,11 @@ describe("Task 2 reviewHandler", () => {
     const res = await reviewHandler(event, ctx);
     expect(res?.intercepted).toBe(true);
 
-    // Verify Result page has unique section == 2026年9月20日 (2) ==
+    // Verify Result page has unique section == ${expectedDate} (2) ==
     const resultPageEdit = mockBot.edit.mock.calls[0];
     const resultPageTransform = resultPageEdit[1];
     const resultPageRes = resultPageTransform({ content: existingResultPage });
-    expect(resultPageRes.text).toContain("== 2026年9月20日 (2) ==");
+    expect(resultPageRes.text).toContain(`== ${expectedDate} (2) ==`);
     // Should NOT duplicate {{archive}}
     expect((resultPageRes.text.match(/\{\{archive\}\}/g) || []).length).toBe(1);
 
@@ -825,7 +840,7 @@ describe("Task 2 reviewHandler", () => {
     const talkPageEdit = mockBot.edit.mock.calls[1];
     const talkPageTransform = talkPageEdit[1];
     const talkPageRes = talkPageTransform({ content: afterContent });
-    expect(talkPageRes.text).toContain("| section = 2026年9月20日 (2)");
+    expect(talkPageRes.text).toContain(`| section = ${expectedDate} (2)`);
   });
 
   it("correctly replies to the second section when page has multiple sections with the same title", async () => {
@@ -940,5 +955,183 @@ describe("Task 2 reviewHandler", () => {
     // Section 2 should be updated with status = done, oldid = 77779, and ping Alice
     expect(updatedTalk.text).toContain(`| oldid = 77779`);
     expect(updatedTalk.text).toContain(`{{ping|Alice}}校对已完成`);
+  });
+
+  it("rejects review and marks not done when target page content is blank", async () => {
+    const event: ChangeEvent = {
+      type: "edit",
+      title: "User talk:AmanojakuBot/review",
+      namespace: 3,
+      user: "Alice",
+      revision: { new: 111 },
+    };
+
+    const timestamp = "2026-09-20T12:00:00Z";
+    const afterContent = `== 空白页面校对 ==
+{{User:AmanojakuBot/template/ReviewRequest
+| article = 空白页面
+| status =
+}}
+请校对--[[User:Alice|Alice]] 2026年9月20日 (日) 12:00 (UTC)`;
+
+    mockBot.request.mockImplementation((params: Record<string, unknown>) => {
+      if (params.revids === 111) {
+        return Promise.resolve({
+          query: {
+            pages: [
+              {
+                revisions: [
+                  {
+                    revid: 111,
+                    user: "Alice",
+                    userid: 42,
+                    timestamp,
+                    slots: { main: { content: afterContent } },
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      if (params.titles === "空白页面") {
+        return Promise.resolve({
+          query: {
+            pages: [
+              {
+                title: "空白页面",
+                ns: 0,
+                revisions: [
+                  {
+                    revid: 88801,
+                    slots: { main: { content: "  <!-- 仅有注释 -->  \n" } },
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const ctx: HandlerContext = {
+      db,
+      bot: mockBot as unknown as Mwn,
+      cfg,
+      log: logger,
+      canWrite: canWriteMock,
+    };
+
+    const res = await reviewHandler(event, ctx);
+    expect(res?.intercepted).toBe(true);
+    expect(mockBot.edit).toHaveBeenCalledTimes(1);
+
+    const talkPageEdit = mockBot.edit.mock.calls[0];
+    const talkPageTransform = talkPageEdit[1];
+    const transformed = talkPageTransform({ content: afterContent });
+
+    expect(transformed.text).toContain("| status = not done");
+    expect(transformed.text).toContain("内容为空，无法进行校对");
+
+    const reqRow = db
+      .prepare("SELECT * FROM review_requests WHERE source_revid = 111")
+      .get() as Record<string, unknown>;
+    expect(reqRow).toBeDefined();
+    expect(reqRow.status).toBe("rejected");
+    expect(reqRow.error).toBe("empty_content");
+  });
+
+  it("rejects review and marks not done when page is non-encyclopedic content", async () => {
+    const event: ChangeEvent = {
+      type: "edit",
+      title: "User talk:AmanojakuBot/review",
+      namespace: 3,
+      user: "Alice",
+      revision: { new: 112 },
+    };
+
+    const timestamp = "2026-09-20T12:00:00Z";
+    const afterContent = `== 非百科内容校对 ==
+{{User:AmanojakuBot/template/ReviewRequest
+| article = 非百科页面测试
+| status =
+}}
+请校对--[[User:Alice|Alice]] 2026年9月20日 (日) 12:00 (UTC)`;
+
+    mockBot.request.mockImplementation((params: Record<string, unknown>) => {
+      if (params.revids === 112) {
+        return Promise.resolve({
+          query: {
+            pages: [
+              {
+                revisions: [
+                  {
+                    revid: 112,
+                    user: "Alice",
+                    userid: 42,
+                    timestamp,
+                    slots: { main: { content: afterContent } },
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      if (params.titles === "非百科页面测试") {
+        return Promise.resolve({
+          query: {
+            pages: [
+              {
+                title: "非百科页面测试",
+                ns: 0,
+                revisions: [
+                  {
+                    revid: 88802,
+                    slots: {
+                      main: {
+                        content: "非百科页面测试正文：asdf 12345 纯测试",
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    mockBot.read.mockImplementation(() => Promise.resolve({ revisions: [] }));
+
+    const ctx: HandlerContext = {
+      db,
+      bot: mockBot as unknown as Mwn,
+      cfg,
+      log: logger,
+      canWrite: canWriteMock,
+    };
+
+    const res = await reviewHandler(event, ctx);
+    expect(res?.intercepted).toBe(true);
+    expect(mockBot.edit).toHaveBeenCalledTimes(1);
+
+    const talkPageEdit = mockBot.edit.mock.calls[0];
+    const talkPageTransform = talkPageEdit[1];
+    const transformed = talkPageTransform({ content: afterContent });
+
+    expect(transformed.text).toContain("| status = not done");
+    expect(transformed.text).toContain(
+      "内容明显非百科全书条目或草稿（原因：系统测试与沙盒涂鸦），不予校对。",
+    );
+
+    const reqRow = db
+      .prepare("SELECT * FROM review_requests WHERE source_revid = 112")
+      .get() as Record<string, unknown>;
+    expect(reqRow).toBeDefined();
+    expect(reqRow.status).toBe("rejected");
+    expect(reqRow.error).toBe("non_encyclopedic");
   });
 });
