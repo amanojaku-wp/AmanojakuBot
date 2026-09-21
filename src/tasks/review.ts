@@ -7,7 +7,6 @@ import {
   extractCommentDetails,
   extractSignatures,
   findMatchingSection,
-  formatReviewResultWikitext,
   generateUniqueSectionTitle,
   isRelevant,
   isSignatureMatchingActor,
@@ -15,7 +14,6 @@ import {
   parseWikiTemplates,
   safeWikitext,
   updateWikiTemplate,
-  type ReviewResult,
 } from "../utils/wikitext.js";
 import {
   createTokenUsage,
@@ -39,20 +37,51 @@ import type {
 } from "../handle.js";
 
 export const reviewIssueSchema = z.object({
-  severity: z.enum(["confirmed", "suspected", "suggestion"]),
-  category: z.enum([
-    "language",
-    "logic",
-    "source",
-    "encyclopedic-style",
-    "structure",
-    "wikitext",
-    "other",
-  ]),
-  location: z.string().nullable(),
-  originalText: z.string().nullable(),
-  description: z.string(),
-  suggestion: z.string().nullable(),
+  severity: z
+    .enum(["confirmed", "suspected", "suggestion"])
+    .describe(
+      "问题严重程度：confirmed（确认问题，建议优先处理）、suspected（疑似问题，建议进一步核对）、suggestion（改进建议）",
+    ),
+  category: z
+    .enum([
+      "language",
+      "logic",
+      "source",
+      "encyclopedic-style",
+      "structure",
+      "wikitext",
+      "other",
+    ])
+    .describe("问题分类"),
+  title: z
+    .string()
+    .describe(
+      "直接简要概述问题（一句话简述，如：工期“1462天”与日期疑似不符、导言区缺少主要定义、参考资料章节格式不规范等）",
+    ),
+  location: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "问题所在位置（如：导言区第二段、某某章节第1段），无法定位时设为 null",
+    ),
+  originalText: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "【注意：只有涉及具体措辞、数字或需要准确定位时才展示原文，提取简短原文片段】；对于宏观结构、缺少内容或无须准确定位的建议，必须设为 null",
+    ),
+  description: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("对问题的详细说明与分析"),
+  suggestion: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("针对该问题的具体修改建议"),
 });
 
 export const reviewResultSchema = z.object({
@@ -69,7 +98,7 @@ export const reviewResultSchema = z.object({
     .describe(
       "若 isEncyclopedic 为 false，简要说明具体原因（如：系统测试、胡言乱语、页面破坏、纯程序代码、用户个人页面、用户个人论述、无实质条目内容等）。",
     ),
-  summary: z.string(),
+  summary: z.string().describe("条目校对整体概述与总结"),
   issues: z.array(reviewIssueSchema),
 });
 
@@ -115,9 +144,145 @@ const REVIEW_SYSTEM_PROMPT = `
 3. 必须首先判定页面内容是否为合法的百科全书条目或条目草稿：
    - 若页面内容明显不是百科全书条目（例如系统测试、沙盒涂鸦、胡言乱语、破坏、纯程序代码、用户个人页面/个人主页/个人介绍/简历、用户个人论述/日记/杂谈/随笔、空白或极短无实质内容等），必须将 isEncyclopedic 设为 false，并在 nonEncyclopedicReason 中简要注明原因分类（例如“系统测试”、“胡言乱语”、“纯程序代码”、“用户个人页面”、“用户个人论述”等），此时 issues 可返回空数组，summary 简要说明即可。
    - 只有当页面确实是合法的百科条目或草稿时，才将 isEncyclopedic 设为 true，并进行详细校对。
+   - summary 只填写无法从问题数量直接看出的全局性结论或重要限制；没有值得补充的内容时返回空字符串。
 4. 必须基于提供的页面内容和校对规则执行检查。不得将未核实的事实描述为已核实，无法确定的问题应标为 suspected 或 suggestion，严禁捏造虚假问题或事实。
-5. 严格按照指定的 JSON 结构化格式输出校对总结（summary）与问题列表（issues）。
+5. 问题分类与严重程度：
+   - confirmed：已确认存在明显问题（确认问题，如明确错字、语病、前后矛盾、断言与事实数字冲突、破坏或格式语法错误等）。
+   - suspected：疑似存在问题，需要编者进一步核对（如可疑断言缺少可靠来源、语句歧义等）。
+   - suggestion：改进建议（如结构划分、导言区扩充、补充来源、中立语调等建设性改进建议）。
+6. 每条问题必须包含直接简要的一句话概述（title）。当title和原文不足以解释判断依据时，提供详细说明原因（description）。
+7. 原文（originalText）提取原则：【只有涉及具体措辞、数字或需要准确定位时才展示原文，提取简短原文片段】；对于宏观结构、缺少内容或无须准确定位的建议，originalText 必须设为 null。
+8. 严格按照指定的 JSON 结构化格式输出校对总结（summary）与问题列表（issues）。
 `;
+export type ReviewIssueSeverity = "confirmed" | "suspected" | "suggestion";
+export type ReviewIssueCategory =
+  | "language"
+  | "logic"
+  | "source"
+  | "encyclopedic-style"
+  | "structure"
+  | "wikitext"
+  | "other";
+
+export type ReviewIssue = {
+  severity: ReviewIssueSeverity;
+  category: ReviewIssueCategory;
+  title?: string | null;
+  location?: string | null;
+  originalText?: string | null;
+  description?: string | null;
+  suggestion?: string | null;
+};
+
+export type ReviewResult = {
+  isEncyclopedic?: boolean;
+  nonEncyclopedicReason?: string | null;
+  summary: string;
+  issues: ReviewIssue[];
+};
+
+const CATEGORY_MAP: Record<ReviewIssueCategory, string> = {
+  language: "语言文字",
+  logic: "逻辑与连贯性",
+  source: "来源与可查证性",
+  "encyclopedic-style": "百科风格与中立性",
+  structure: "结构与排版",
+  wikitext: "维基语法",
+  other: "其他",
+};
+
+function formatIssueSection(
+  title: string,
+  comment: string,
+  issues: ReviewIssue[],
+  startNumber: number,
+): string[] {
+  const lines: string[] = [];
+  lines.push(`=== ${title} ===`);
+  lines.push(`<!-- ${comment} -->`);
+
+  if (issues.length === 0) {
+    return [];
+  } else {
+    for (let idx = 0; idx < issues.length; idx++) {
+      const issue = issues[idx];
+      const cat = CATEGORY_MAP[issue.category] ?? issue.category;
+      const issueTitle = (
+        issue.title?.trim() ||
+        issue.description?.trim() ||
+        "（未提供标题）"
+      )
+        .split("\n")[0]
+        .trim();
+
+      let title = `; ${idx + startNumber}.<!-- ${cat} -->${safeWikitext(issueTitle)}`;
+      if (issue.location && issue.location.trim()) {
+        title =
+          title + `<small>（${safeWikitext(issue.location.trim())}）</small>`;
+      }
+      lines.push(title);
+
+      if (issue.originalText?.trim()) {
+        lines.push(
+          `: {{tq|<nowiki>${safeWikitext(issue.originalText.trim())}</nowiki>}}`,
+        );
+      }
+
+      if (issue.description?.trim()) {
+        lines.push(
+          `: <small>${safeWikitext(issue.description.trim())}</small>`,
+        );
+      }
+
+      if (issue.suggestion?.trim()) {
+        lines.push(`: ➡️ <u>${safeWikitext(issue.suggestion.trim())}</u>`);
+      }
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * 将结构化 ReviewResult 转换为规范的 Wikitext 报告
+ */
+export function formatReviewResultWikitext(result: ReviewResult): string {
+  const lines: string[] = [];
+
+  const issues = result.issues ?? [];
+  const confirmed = issues.filter((i) => i.severity === "confirmed");
+  const suspected = issues.filter((i) => i.severity === "suspected");
+  const suggestions = issues.filter(
+    (i) =>
+      i.severity === "suggestion" ||
+      !["confirmed", "suspected"].includes(i.severity),
+  );
+
+  lines.push(
+    `'''校对结果：'''共${issues.length}项：` +
+      `${confirmed.length}项确认问题、` +
+      `${suspected.length}项建议进一步核对、` +
+      `${suggestions.length}项改进建议。`,
+  );
+  if (result.summary?.trim()) {
+    lines.push(`:${safeWikitext(result.summary.trim())}`);
+  }
+
+  let n = 1;
+  lines.push(...formatIssueSection("确认问题", "确认问题", confirmed, n));
+  if (confirmed.length > 0) {
+    lines.push("");
+    n += confirmed.length;
+  }
+  lines.push(...formatIssueSection("建议进一步核对", "疑似问题", suspected, n));
+  if (suspected.length > 0) {
+    lines.push("");
+    n += suspected.length;
+  }
+  lines.push(...formatIssueSection("改进建议", "改进建议", suggestions, n));
+
+  return lines.join("\n");
+}
 
 /**
  * 推断 User 命名空间草稿的预期正式条目名称

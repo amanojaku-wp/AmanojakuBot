@@ -18,6 +18,7 @@ vi.mock("ai", async (importOriginal) => {
               {
                 severity: "suggestion",
                 category: "structure",
+                title: "第二轮发现遗漏的参考资料问题",
                 location: "参考资料",
                 description: "第二轮发现遗漏的参考资料问题",
                 suggestion: "增加来源章节",
@@ -46,6 +47,7 @@ vi.mock("ai", async (importOriginal) => {
               {
                 severity: "confirmed",
                 category: "language",
+                title: "发现一处错别字",
                 location: "第1段",
                 originalText: "测试错字",
                 description: "应为正确用字",
@@ -629,8 +631,13 @@ describe("Task 2 reviewHandler", () => {
     const resultPageRes = resultPageTransform({ content: "" });
     expect(resultPageRes.text).toContain("{{Talkarchive}}");
     expect(resultPageRes.text).toContain("[[Special:Permalink/77777|77777]]");
-    expect(resultPageRes.text).toContain("'''【校对概述】'''");
-    expect(resultPageRes.text).toContain("'''［确认问题］'''（语言文字）");
+    expect(resultPageRes.text).toContain(
+      "【校对概述】条目语言流畅，发现一处错别字。",
+    );
+    expect(resultPageRes.text).toContain("=== 确认问题 ===");
+    expect(resultPageRes.text).toContain("<!-- 确认问题 -->");
+    expect(resultPageRes.text).toContain("; 1.<!-- 语言文字 -->发现一处错别字");
+    expect(resultPageRes.text).toContain(": '''原文'''：{{tq|测试错字}}");
     expect(resultPageRes.text).toContain("第二轮发现遗漏的参考资料问题");
 
     // Check Talk page edit
@@ -644,6 +651,9 @@ describe("Task 2 reviewHandler", () => {
     expect(talkPageRes.text).toContain("| oldid = 77777");
     expect(talkPageRes.text).toContain(`| section = ${expectedDate}`);
     expect(talkPageRes.text).toContain("{{ping|Alice}}校对已完成");
+    expect(talkPageRes.text).toContain(
+      "【校对概述】条目语言流畅，发现一处错别字。",
+    );
 
     // Check database
     const reqRow = db

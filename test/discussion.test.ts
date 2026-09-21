@@ -313,6 +313,24 @@ line 2
       "正如 [[User:Bob|Bob]] 所述，这个方案可行。",
     );
 
+    // Multiple user mentions in body and backward user link lookup
+    const multiMentionRaw =
+      ":{{ping|User1}} 感谢 [[User:User2|二号用户]] 与 [[User:User3]] 的建议。 --[[User:AuthorUser|签名]]（[[User talk:AuthorUser|讨论]]） 2026年9月14日 (一) 01:30 (UTC)";
+    const multiMentionParsed = parseStructuredComment(multiMentionRaw);
+    expect(multiMentionParsed.author).toBe("AuthorUser");
+    expect(multiMentionParsed.timestamp).toBe("2026年9月14日 (一) 01:30 (UTC)");
+    expect(multiMentionParsed.text).toBe(
+      "{{ping|User1}} 感谢 [[User:User2|二号用户]] 与 [[User:User3]] 的建议。",
+    );
+
+    // Signature with custom styling/span/font/small tags around links
+    const styledSigRaw =
+      ':我也赞同这个观点。<span style="color:#007acc;">--[[User:StyledUser|风格化用户]]</span> <small>([[User talk:StyledUser|留言]])</small> 2026年9月14日 (一) 01:45 (UTC)';
+    const styledSigParsed = parseStructuredComment(styledSigRaw);
+    expect(styledSigParsed.author).toBe("StyledUser");
+    expect(styledSigParsed.timestamp).toBe("2026年9月14日 (一) 01:45 (UTC)");
+    expect(styledSigParsed.text).toBe("我也赞同这个观点。");
+
     // Unexpanded signature with fallback
     const tildeRaw = ":请问在吗？ --~~~~";
     const tildeParsed = parseStructuredComment(tildeRaw, {

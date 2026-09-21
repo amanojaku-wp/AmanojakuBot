@@ -140,26 +140,72 @@ describe("Review Wikitext utilities", () => {
         {
           severity: "confirmed",
           category: "language",
+          title: "错字“建构”疑似应为“架构”",
           location: "导言区第二段",
           originalText: "该项目于2020年建立",
           description: "缺少句号",
           suggestion: "在句末补全句号。",
         },
         {
+          severity: "suspected",
+          category: "logic",
+          title: "工期“1462天”与日期疑似不符",
+          location: "建设历史章节",
+          description: "日期计算可能存在偏差",
+          suggestion: "核实准确日期",
+        },
+        {
           severity: "suggestion",
           category: "structure",
+          title: "建议增加参考资料章节",
           description: "建议增加参考资料章节",
+          suggestion: "在文末添加参考资料章节",
         },
       ],
     };
 
     const formatted = formatReviewResultWikitext(sampleResult);
-    expect(formatted).toContain("'''【校对概述】'''");
-    expect(formatted).toContain("条目整体结构清晰");
-    expect(formatted).toContain("'''［确认问题］'''（语言文字）");
-    expect(formatted).toContain("导言区第二段");
-    expect(formatted).toContain("<nowiki>该项目于2020年建立</nowiki>");
-    expect(formatted).toContain("'''［改进建议］'''（结构与排版）");
+    expect(formatted).toContain("【校对概述】条目整体结构清晰");
+    expect(formatted).toContain("=== 确认问题 ===");
+    expect(formatted).toContain("<!-- 确认问题 -->");
+    expect(formatted).toContain(
+      "; 1.<!-- 语言文字 -->错字“建构”疑似应为“架构”",
+    );
+    expect(formatted).toContain(": '''位置'''：导言区第二段");
+    expect(formatted).toContain(": '''原文'''：{{tq|该项目于2020年建立}}");
+    expect(formatted).toContain(": '''说明'''：缺少句号");
+    expect(formatted).toContain(": '''建议'''：在句末补全句号。");
+
+    expect(formatted).toContain("=== 建议进一步核对 ===");
+    expect(formatted).toContain("<!-- 疑似问题 -->");
+    expect(formatted).toContain(
+      "; 1.<!-- 逻辑与连贯性 -->工期“1462天”与日期疑似不符",
+    );
+    expect(formatted).toContain(": '''位置'''：建设历史章节");
+    expect(formatted).toContain(": '''说明'''：日期计算可能存在偏差");
+    expect(formatted).toContain(": '''建议'''：核实准确日期");
+
+    expect(formatted).toContain("=== 改进建议 ===");
+    expect(formatted).toContain("<!-- 改进建议 -->");
+    expect(formatted).toContain("; 1.<!-- 结构与排版 -->建议增加参考资料章节");
+    expect(formatted).toContain(": '''说明'''：建议增加参考资料章节");
+    expect(formatted).toContain(": '''建议'''：在文末添加参考资料章节");
+
     expect(formatted).not.toContain("~~~~");
+  });
+
+  it("handles empty issues list gracefully", () => {
+    const emptyResult: ReviewResult = {
+      summary: "未发现任何问题，条目质量良好。",
+      issues: [],
+    };
+
+    const formatted = formatReviewResultWikitext(emptyResult);
+    expect(formatted).toContain("【校对概述】未发现任何问题，条目质量良好。");
+    expect(formatted).toContain("=== 确认问题 ===\n<!-- 确认问题 -->\n无");
+    expect(formatted).toContain(
+      "=== 建议进一步核对 ===\n<!-- 疑似问题 -->\n无",
+    );
+    expect(formatted).toContain("=== 改进建议 ===\n<!-- 改进建议 -->\n无");
   });
 });

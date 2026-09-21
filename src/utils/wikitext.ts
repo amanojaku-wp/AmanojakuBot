@@ -145,7 +145,7 @@ export type StructuredComment = {
  * 维基用户链接提取正则（支持 User:, User talk:, 用户:, 用戶:, 使用者:, U:, UT:, Special:Contributions 等）
  */
 export const USER_LINK_REGEX =
-  /\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)\s*:\s*([^|[\]#]+)|(?:Special|特别|特別)\s*:\s*(?:Contributions|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/([^|[\]#]+))(?:\s*\|\s*[^[\]]*)?\]\]/i;
+  /\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論|用户对话|用戶對話)\s*:\s*([^|[\]#]+)|(?:Special|特别|特別|特殊)\s*:\s*(?:Contributions|Contribs|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/([^|[\]#]+))(?:\s*\|\s*[^[\]]*)?\]\]/i;
 
 /**
  * 维基时间戳正则（支持中文维基、英文/publictestwiki、ISO等常见格式）
@@ -207,23 +207,53 @@ export function parseStructuredComment(
       timestamp = lastTimeMatch[0].trim();
       const beforeTime = text.slice(0, timeIdx);
 
-      // 检查时间戳紧邻前面的签名用户链接
-      const sigPrefixRegex =
-        /(?:[:\s\-—–－]+)?\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)\s*:[^|[\]#]+|(?:Special|特别|特別)\s*:\s*(?:Contributions|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/[^|[\]#]+)(?:\s*\|\s*[^[\]]*)?\]\](?:\([^\n()]{0,30}\)|（[^\n）]{0,30}）|<small>[^<>\n]{0,80}<\/small>|\[\[\s*(?:(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論)\s*:[^|[\]#]+|(?:Special|特别|特別)\s*:\s*(?:Contributions|用户贡献|用戶貢獻|使用者貢獻|使用者贡献)\s*\/[^|[\]#]+)(?:\s*\|\s*[^[\]]*)?\]\]|[:\s/·•，,–—-])*$/i;
+      // 从时间戳倒着往前查找碰到的第一个用户链接作为实际签名（支持正文提及他人，仅以末尾实际签名为准）
+      const userMatches = [
+        ...beforeTime.matchAll(new RegExp(USER_LINK_REGEX.source, "gi")),
+      ];
 
-      const sigPrefixMatch = beforeTime.match(sigPrefixRegex);
-      if (sigPrefixMatch && sigPrefixMatch.index !== undefined) {
-        const sigPrefix = sigPrefixMatch[0];
+      if (userMatches.length > 0) {
+        const lastUserMatch = userMatches[userMatches.length - 1];
+        const rawUser = (lastUserMatch[1] || lastUserMatch[2])
+          .replace(/_/g, " ")
+          .trim();
         if (!author) {
-          const userMatches = [
-            ...sigPrefix.matchAll(new RegExp(USER_LINK_REGEX.source, "gi")),
-          ];
-          if (userMatches.length > 0) {
-            const lastUser = userMatches[userMatches.length - 1];
-            author = (lastUser[1] || lastUser[2]).replace(/_/g, " ").trim();
+          author = rawUser;
+        }
+
+        // 向前查找同属该用户的连续签名链接（如 [[User:X]] ([[User talk:X]])）
+        const normalizedAuthor = normalizeWikiUsername(rawUser).toLowerCase();
+        let firstSigMatch = lastUserMatch;
+
+        for (let i = userMatches.length - 2; i >= 0; i--) {
+          const prevMatch = userMatches[i];
+          const prevUser = normalizeWikiUsername(
+            (prevMatch[1] || prevMatch[2]).replace(/_/g, " ").trim(),
+          ).toLowerCase();
+
+          // 若前一个链接同属该用户且两者之间无换行且距离较短（常见签名组合），则视为同一签名块
+          if (
+            prevUser === normalizedAuthor &&
+            !beforeTime
+              .slice(prevMatch.index!, firstSigMatch.index!)
+              .includes("\n") &&
+            firstSigMatch.index! - (prevMatch.index! + prevMatch[0].length) <
+              100
+          ) {
+            firstSigMatch = prevMatch;
+          } else {
+            break;
           }
         }
-        text = beforeTime.slice(0, sigPrefixMatch.index);
+
+        // 截取签名起始位置前的文本，并去除前导破折号、样式前缀标签或空白
+        const sigStartIndex = firstSigMatch.index!;
+        const beforeSig = beforeTime.slice(0, sigStartIndex);
+        const sigPrefixMatch = beforeSig.match(
+          /(?:<[a-zA-Z][^>]*>|<!--[\s\S]*?-->|[:\s\-—–－~（(])+\s*$/,
+        );
+        const cutIdx = sigPrefixMatch ? sigPrefixMatch.index! : sigStartIndex;
+        text = beforeTime.slice(0, cutIdx);
       } else {
         // 无用户链接前缀，仅移除时间戳及其前面的破折号/空白
         const trailingDashMatch = beforeTime.match(/[:\s\-—–－]+$/);
@@ -1264,83 +1294,3 @@ export function generateUniqueSectionTitle(
   return `${baseTitle} (${counter})`;
 }
 
-export type ReviewIssueSeverity = "confirmed" | "suspected" | "suggestion";
-export type ReviewIssueCategory =
-  | "language"
-  | "logic"
-  | "source"
-  | "encyclopedic-style"
-  | "structure"
-  | "wikitext"
-  | "other";
-
-export type ReviewIssue = {
-  severity: ReviewIssueSeverity;
-  category: ReviewIssueCategory;
-  location?: string | null;
-  originalText?: string | null;
-  description: string;
-  suggestion?: string | null;
-};
-
-export type ReviewResult = {
-  isEncyclopedic?: boolean;
-  nonEncyclopedicReason?: string | null;
-  summary: string;
-  issues: ReviewIssue[];
-};
-
-const SEVERITY_MAP: Record<ReviewIssueSeverity, string> = {
-  confirmed: "［确认问题］",
-  suspected: "［疑似问题］",
-  suggestion: "［改进建议］",
-};
-
-const CATEGORY_MAP: Record<ReviewIssueCategory, string> = {
-  language: "语言文字",
-  logic: "逻辑与连贯性",
-  source: "来源与可查证性",
-  "encyclopedic-style": "百科风格与中立性",
-  structure: "结构与排版",
-  wikitext: "维基语法",
-  other: "其他",
-};
-
-/**
- * 将结构化 ReviewResult 转换为规范的 Wikitext 报告
- */
-export function formatReviewResultWikitext(result: ReviewResult): string {
-  const lines: string[] = [];
-
-  lines.push("'''【校对概述】'''");
-  lines.push(safeWikitext(result.summary.trim()));
-  lines.push("");
-
-  lines.push("'''【发现问题与建议】'''");
-  if (!result.issues || result.issues.length === 0) {
-    lines.push("未发现明显问题。");
-  } else {
-    for (let idx = 0; idx < result.issues.length; idx++) {
-      const issue = result.issues[idx];
-      const sev = SEVERITY_MAP[issue.severity] ?? `［${issue.severity}］`;
-      const cat = CATEGORY_MAP[issue.category] ?? issue.category;
-      let header = `* '''${sev}'''（${cat}）`;
-      if (issue.location) {
-        header += ` 位置：${safeWikitext(issue.location)}`;
-      }
-      lines.push(header);
-
-      if (issue.originalText) {
-        lines.push(
-          `** 原文：<nowiki>${safeWikitext(issue.originalText)}</nowiki>`,
-        );
-      }
-      lines.push(`** 说明：${safeWikitext(issue.description)}`);
-      if (issue.suggestion) {
-        lines.push(`** 建议：${safeWikitext(issue.suggestion)}`);
-      }
-    }
-  }
-
-  return lines.join("\n");
-}
