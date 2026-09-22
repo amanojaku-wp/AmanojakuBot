@@ -491,6 +491,12 @@ export function parseDiscussionThread(
 ): StructuredComment[] {
   if (!wikitext || !wikitext.trim()) return [];
 
+  // 排除非留言模板，例如移動至、移動自、移动至、移动自、Talkback、Deltalk、Nocount、Reaction
+  wikitext = wikitext.replace(
+    /\{\{\s*(?:移動至|移動自|移动至|移动自|Talkback|Deltalk|Nocount|Reaction)[^}]*\}\}/gi,
+    "",
+  );
+
   const lines = wikitext.split("\n");
   const commentChunks: string[] = [];
   let currentLines: string[] = [];

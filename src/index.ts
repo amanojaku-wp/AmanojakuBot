@@ -121,41 +121,74 @@ const handlerContext: HandlerContext = {
   saveStatement: save,
 };
 
+// watchdog
+let lastActivityAt = Date.now();
+const IDLE_TIMEOUT = 5 * 60_000;
+function touch() {
+  lastActivityAt = Date.now();
+}
+
 // -------------------------------------------------------------
 // 事件监听驱动：EventStreams (SSE) vs RecentChanges Polling
 // -------------------------------------------------------------
 if (cfg.events.mode === "eventstream") {
-  const source = new EventSource(cfg.events.streamUrl, {
-    fetch: (input, init) =>
-      fetch(input, {
-        ...init,
-        headers: {
-          ...init?.headers,
-          ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
-        },
-      }),
-  });
-  source.addEventListener("message", (event) => {
-    queue = queue.then(async () => {
-      try {
-        await handle(JSON.parse(event.data) as ChangeEvent, handlerContext);
-        if (event.lastEventId) {
-          lastEventId = event.lastEventId;
-          mark.run(streamKey, lastEventId, new Date().toISOString());
-        }
-      } catch (error) {
-        log.error(
-          { err: error },
-          "event processing failed; checkpoint unchanged",
-        );
-        source.close();
-        process.exit(1);
-      }
+  let prevSource: EventSource | null = null;
+  const createSource = () => {
+    if (prevSource !== null) {
+      prevSource.close();
+    }
+    const source = new EventSource(cfg.events.streamUrl, {
+      fetch: (input, init) =>
+        fetch(input, {
+          ...init,
+          headers: {
+            ...init?.headers,
+            ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
+          },
+        }),
     });
-  });
-  source.addEventListener("error", (error) =>
-    log.warn({ err: error }, "stream disconnected; EventSource will reconnect"),
-  );
+    source.addEventListener("message", (event) => {
+      queue = queue.then(async () => {
+        try {
+          touch();
+          await handle(JSON.parse(event.data) as ChangeEvent, handlerContext);
+          if (event.lastEventId) {
+            lastEventId = event.lastEventId;
+            mark.run(streamKey, lastEventId, new Date().toISOString());
+          }
+        } catch (error) {
+          log.error(
+            { err: error },
+            "event processing failed; checkpoint unchanged",
+          );
+          source.close();
+          process.exit(1);
+        }
+      });
+    });
+    source.addEventListener("error", (error) =>
+      log.warn(
+        { err: error },
+        "stream disconnected; EventSource will reconnect",
+      ),
+    );
+    source.addEventListener("open", () => {
+      touch();
+      log.info({}, "stream connected; EventSource is open");
+    });
+    prevSource = source;
+  };
+
+  createSource();
+  // watchdog: 如果 EventSource 5 分钟内没有收到任何事件，则认为可能卡死，强制重连
+  setInterval(() => {
+    const idleMs = Date.now() - lastActivityAt;
+
+    if (idleMs > IDLE_TIMEOUT) {
+      log.warn({ idleMs }, "EventSource appears stalled");
+      createSource();
+    }
+  }, 30_000);
 } else {
   const request = (params: Record<string, string | number>) =>
     bot.request(params);
