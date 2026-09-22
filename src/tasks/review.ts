@@ -485,6 +485,8 @@ export async function processReviewRequest(
     prop: "revisions",
     rvprop: "ids|content",
     rvslots: "main",
+    redirects: 1,
+    converttitles: 1,
     formatversion: 2,
   });
 
