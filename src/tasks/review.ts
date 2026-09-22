@@ -223,9 +223,7 @@ function formatIssueSection(
       lines.push(title);
 
       if (issue.originalText?.trim()) {
-        lines.push(
-          `: {{tq|<nowiki>${safeWikitext(issue.originalText.trim())}</nowiki>}}`,
-        );
+        lines.push(`: {{tq|${safeWikitext(issue.originalText.trim())}}}`);
       }
 
       if (issue.description?.trim()) {

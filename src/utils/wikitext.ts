@@ -1013,11 +1013,14 @@ export function canonicalTitle(title: string) {
  */
 export function safeWikitext(value: string) {
   return value
+    .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll("[[", "［［")
-    .replaceAll("]]", "］］")
-    .replaceAll("~~~~", "");
+    .replaceAll("[", "&#91;")
+    .replaceAll("]", "&#93;")
+    .replaceAll("{", "&#123;")
+    .replaceAll("}", "&#125;")
+    .replaceAll("~", "&#126;");
 }
 
 /**
@@ -1293,4 +1296,3 @@ export function generateUniqueSectionTitle(
   }
   return `${baseTitle} (${counter})`;
 }
-
