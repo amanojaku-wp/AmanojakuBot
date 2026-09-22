@@ -144,7 +144,7 @@ const WIKITEXT_OUTPUT_POLICY = `
 
 如果只是提及而不是使用模板，使用{{tl|模板名称}}语法。
 
-禁止使用链接方式提及其他用户，例如[[User:用户名]]、{{ping|用户名}}，以避免不必要的通知。
+禁止使用用户页链接、ping等形式提及其他用户，例如[[User:用户名]]、{{ping|用户名}}，以免产生通知。
 `;
 
 const MAX_TOKENS = 2000;
@@ -591,6 +591,26 @@ function cleanReply(reply: string): string {
       .replace(/~~~~/g, "")
       // 移除多余的空行
       .replace(/\n{3,}/g, "\n\n")
+      // 移除开头和结尾的空白字符
+      .trim()
+      // 移除其他用户的用户页，防止ping到他人
+      .replace(
+        /\[\[\s*(User|U|用户|用戶|使用者)\s*:\s*([^\]|]*?)\s*\]\]/gi,
+        "$1:$2",
+      )
+      .replace(
+        /\[\[\s*(User|U|用户|用戶|使用者)\s*:\s*[^\]|]*?\s*\|\s*([^\]]*?)\s*\]\]/gi,
+        "$2",
+      )
+      // 禁止所有能ping到用户的模板
+      .replace(
+        /\{\{\s*(ping|noping|at|hidden ping|unping|reply|reply to|ping2)\s*[^}]*?\}\}/gi,
+        "",
+      )
+      // 花式ping只保留模板本身
+      .replace(
+        /\{\{\s*(pia|hug|mua|eat|panic|ldk|谁的错|誰的錯|hugmua|drink|kick|kira)\s*[^}]*?\}\}/gi,
+        "{{$1}}",
+      )
   );
-  // 移除开头和结尾的空白字符
 }
