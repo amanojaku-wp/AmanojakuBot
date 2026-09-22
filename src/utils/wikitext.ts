@@ -1284,9 +1284,11 @@ export function safeWikitext(value: string) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
+    .replaceAll("=", "&#61;")
     .replaceAll("[", "&#91;")
     .replaceAll("]", "&#93;")
     .replaceAll("{", "&#123;")
+    .replaceAll("|", "&#124;")
     .replaceAll("}", "&#125;")
     .replaceAll("~", "&#126;");
 }
