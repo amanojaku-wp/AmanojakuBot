@@ -143,6 +143,8 @@ const WIKITEXT_OUTPUT_POLICY = `
 不要自行添加缩进、签名、时间戳或机器人source marker，这些内容由程序添加。
 
 如果只是提及而不是使用模板，使用{{tl|模板名称}}语法。
+
+禁止使用链接方式提及其他用户，例如[[User:用户名]]、{{ping|用户名}}，以避免不必要的通知。
 `;
 
 const MAX_TOKENS = 2000;
