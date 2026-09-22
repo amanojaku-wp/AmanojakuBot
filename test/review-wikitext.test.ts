@@ -7,10 +7,14 @@ import {
   generateUniqueSectionTitle,
   parseSections,
   findMatchingSection,
+  splitWikitextIntoChunks,
 } from "../src/utils/wikitext.js";
 import {
   formatReviewResultWikitext,
+  deterministicDeduplicate,
+  mapMergedIssuesToLocated,
   type ReviewResult,
+  type LocatedReviewIssue,
 } from "../src/tasks/review.js";
 
 describe("Review Wikitext utilities", () => {
@@ -209,5 +213,97 @@ describe("Review Wikitext utilities", () => {
       "=== 建议进一步核对 ===\n<!-- 疑似问题 -->\n无",
     );
     expect(formatted).toContain("=== 改进建议 ===\n<!-- 改进建议 -->\n无");
+  });
+
+  describe("splitWikitextIntoChunks", () => {
+    it("splits wikitext into lead and level-2 chunks", () => {
+      const wikitext = `导言区内容介绍。
+
+== 章节一 ==
+章节一的正文内容。
+
+== 章节二 ==
+章节二的正文内容。`;
+
+      const chunks = splitWikitextIntoChunks(wikitext);
+      expect(chunks.length).toBe(3);
+      expect(chunks[0].chunkId).toBe("lead");
+      expect(chunks[0].title).toBe("导言区");
+      expect(chunks[1].chunkId).toBe("s2-1");
+      expect(chunks[1].title).toBe("章节一");
+      expect(chunks[2].chunkId).toBe("s2-2");
+      expect(chunks[2].title).toBe("章节二");
+    });
+
+    it("splits level-2 section into level-3 sub-chunks when section length > 30%", () => {
+      const longSectionText =
+        `== 超长章节 ==\n` +
+        "x".repeat(300) +
+        `\n=== 子章节 A ===\n` +
+        "a".repeat(200) +
+        `\n=== 子章节 B ===\n` +
+        "b".repeat(200);
+      const wikitext = `短导言。\n\n${longSectionText}`;
+
+      const chunks = splitWikitextIntoChunks(wikitext);
+      expect(chunks.length).toBe(3);
+      expect(chunks[0].chunkId).toBe("lead");
+      expect(chunks[1].chunkId).toBe("s2-1-1");
+      expect(chunks[1].title).toBe("超长章节（前言）");
+      expect(chunks[2].chunkId).toBe("s2-1-2");
+      expect(chunks[2].title).toBe("超长章节 - 子章节 A");
+    });
+  });
+
+  describe("deduplication helpers", () => {
+    it("performs deterministic deduplication and merges chunkIds", () => {
+      const issues: LocatedReviewIssue[] = [
+        {
+          chunkId: "s2-1",
+          severity: "confirmed",
+          category: "language",
+          title: "错别字",
+          location: "第一段",
+          originalText: "错字",
+        },
+        {
+          chunkId: "s2-2",
+          severity: "confirmed",
+          category: "language",
+          title: "错别字",
+          location: "第一段",
+          originalText: "错字",
+        },
+      ];
+
+      const deduped = deterministicDeduplicate(issues);
+      expect(deduped.length).toBe(1);
+      expect(deduped[0].chunkIds).toEqual(["s2-1", "s2-2"]);
+    });
+
+    it("maps merged issues to located issues with chunkIds retained", () => {
+      const candidates: LocatedReviewIssue[] = [
+        {
+          chunkIds: ["s2-1"],
+          severity: "confirmed",
+          category: "language",
+          title: "发现错别字",
+          location: "段落一",
+        },
+      ];
+
+      const merged = [
+        {
+          severity: "confirmed" as const,
+          category: "language" as const,
+          title: "发现错别字",
+          location: "段落一",
+        },
+      ];
+
+      const mapped = mapMergedIssuesToLocated(merged, candidates);
+      expect(mapped.length).toBe(1);
+      expect(mapped[0].chunkIds).toEqual(["s2-1"]);
+    });
   });
 });

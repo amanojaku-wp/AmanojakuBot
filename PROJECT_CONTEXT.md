@@ -38,7 +38,7 @@
 - `src/utils/`：通用基础设施与工具模块（`db.ts` SQLite存储、`wiki.ts` MediaWiki客户端交互、`llm.ts` 大模型调用、`polling.ts` 近期变更轮询、`wikitext.ts` 维基文本与讨论页解析）。
 - `src/tasks/`：三大机器人任务模块，各独立一文件并暴露各自的 `TaskHandler`：
   - `src/tasks/chat.ts`：任务一（讨论页自由对话与章节多用户上下文应答，默认运行在 `User talk:Bot`）
-  - `src/tasks/review.ts`：任务二（应请求条目/草稿校对评审与30天生命周期额度管控，默认运行在 `User talk:Bot/review`）
+  - `src/tasks/review.ts`：任务二（应请求条目/草稿校对评审，采用“全文全局检查 + 导言/二级/三级标题 Chunk 分块局部高覆盖率扫描 + 确定性/语义去重合并”流水线，与额度管控相配合，默认运行在 `User talk:Bot/review`）
   - `src/tasks/aiEdit.ts`：任务三（疑似 AI 辅助编辑初筛、6小时UTC聚合线索报告与三篇跨条目用户汇总）
 
 ## 继续开发建议

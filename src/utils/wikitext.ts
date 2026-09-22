@@ -999,6 +999,123 @@ export function addedComment(
 }
 
 /**
+ * 检查 Chunk 结构
+ */
+export type ReviewChunk = {
+  chunkId: string;
+  title: string;
+  content: string;
+};
+
+/**
+ * 将 Wikitext 页面按照导言区、二级标题（== xx ==）及超过 30% 长度的三级标题（=== xx ===）构造检查 Chunk
+ */
+export function splitWikitextIntoChunks(wikitext: string): ReviewChunk[] {
+  if (!wikitext || wikitext.trim().length === 0) {
+    return [];
+  }
+
+  const fullLength = wikitext.length;
+  const chunks: ReviewChunk[] = [];
+
+  // 解析二级标题章节
+  const sections = parseSections(wikitext);
+
+  let level2Index = 0;
+
+  for (const sec of sections) {
+    // 导言区（title 为空）
+    if (!sec.title) {
+      if (sec.content.trim().length > 0) {
+        chunks.push({
+          chunkId: "lead",
+          title: "导言区",
+          content: sec.content,
+        });
+      }
+      continue;
+    }
+
+    level2Index++;
+    const secLength = sec.content.length;
+    const ratio = secLength / fullLength;
+
+    // 若二级章节超过全文 30%，且包含三级标题，进行二级拆分
+    if (ratio > 0.3) {
+      const level3Regex = /^===\s*([^=].*?)\s*===\s*$/gm;
+      const level3Matches = [...sec.content.matchAll(level3Regex)];
+
+      if (level3Matches.length > 0) {
+        let level3Index = 0;
+
+        // 检查第一个三级标题之前的内容
+        const firstMatchIndex = level3Matches[0].index!;
+        const introText = sec.content.slice(0, firstMatchIndex);
+
+        // 如果在第一个三级标题前有除去二级标题本身的实质正文内容
+        const bodyBeforeFirstL3 = introText
+          .replace(/^==\s*[^=].*?\s*==\s*/, "")
+          .trim();
+
+        if (bodyBeforeFirstL3.length > 0) {
+          level3Index++;
+          chunks.push({
+            chunkId: `s2-${level2Index}-${level3Index}`,
+            title: `${sec.title}（前言）`,
+            content: introText,
+          });
+        }
+
+        for (let i = 0; i < level3Matches.length; i++) {
+          level3Index++;
+          const match = level3Matches[i];
+          const matchStart = match.index!;
+          const nextMatch = level3Matches[i + 1];
+          const matchEnd = nextMatch ? nextMatch.index! : sec.content.length;
+
+          let partContent = sec.content.slice(matchStart, matchEnd);
+
+          // 如果没有导言正文（bodyBeforeFirstL3.length === 0），将二级标题头部附在第一个三级 chunk 的头部
+          if (
+            i === 0 &&
+            bodyBeforeFirstL3.length === 0 &&
+            introText.trim().length > 0
+          ) {
+            partContent = `${introText.trimEnd()}\n${partContent}`;
+          }
+
+          chunks.push({
+            chunkId: `s2-${level2Index}-${level3Index}`,
+            title: `${sec.title} - ${match[1].trim()}`,
+            content: partContent,
+          });
+        }
+
+        continue;
+      }
+    }
+
+    // 默认保持为单个二级章节 chunk
+    chunks.push({
+      chunkId: `s2-${level2Index}`,
+      title: sec.title,
+      content: sec.content,
+    });
+  }
+
+  // 兜底：如果解析后没有任何 chunk，但 wikitext 非空，将整个内容当作 lead chunk
+  if (chunks.length === 0 && wikitext.trim().length > 0) {
+    chunks.push({
+      chunkId: "lead",
+      title: "导言区",
+      content: wikitext,
+    });
+  }
+
+  return chunks;
+}
+
+/**
  * 识别留言文本开头的维基缩进等级（以冒号 `:` 数量计量）
  */
 export function getCommentIndentLevel(comment: string): number {

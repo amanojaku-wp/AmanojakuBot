@@ -142,13 +142,13 @@ describe("discussion filtering & timestamp handling", () => {
 
     // Clean trailing signatures like --~~~~, —~~~~, ~~~~
     expect(formatDiscussionReply("这是回复 --~~~~", 0, marker)).toBe(
-      ":这是回复 —~~~~ <!-- marker -->",
+      ":这是回复 ~~~~ <!-- marker -->",
     );
     expect(formatDiscussionReply("这是回复 — ~~~~", 0, marker)).toBe(
-      ":这是回复 —~~~~ <!-- marker -->",
+      ":这是回复 ~~~~ <!-- marker -->",
     );
     expect(formatDiscussionReply("这是回复:: —~~~~", 2, marker)).toBe(
-      ":::这是回复 —~~~~ <!-- marker -->",
+      ":::这是回复 ~~~~ <!-- marker -->",
     );
     expect(
       formatDiscussionReply(
@@ -157,7 +157,7 @@ describe("discussion filtering & timestamp handling", () => {
         marker,
         "AmanojakuBot",
       ),
-    ).toBe(":::四就是四。 —~~~~ <!-- marker -->");
+    ).toBe(":::四就是四。 ~~~~ <!-- marker -->");
     expect(formatDiscussionReply("第一行回复\n::: —~~~~", 2, marker)).toBe(
       ":::第一行回复 —~~~~ <!-- marker -->",
     );
@@ -224,7 +224,7 @@ E = mc^2
 line 1
 line 2
 </pre>
-::希望对您有帮助！ —~~~~ <!-- marker -->`);
+::希望对您有帮助！ ~~~~ <!-- marker -->`);
   });
 
   it("inserts reply directly on the next line following target comment", () => {

@@ -11,17 +11,21 @@ vi.mock("ai", async (importOriginal) => {
   return {
     ...original,
     generateObject: vi.fn().mockImplementation(async ({ prompt }) => {
-      if (typeof prompt === "string" && prompt.includes("不要重复这些问题")) {
+      if (
+        typeof prompt === "string" &&
+        prompt.includes("下面是多个独立检查单元")
+      ) {
         return {
           object: {
             issues: [
               {
-                severity: "suggestion",
-                category: "structure",
-                title: "第二轮发现遗漏的参考资料问题",
-                location: "参考资料",
-                description: "第二轮发现遗漏的参考资料问题",
-                suggestion: "增加来源章节",
+                severity: "confirmed",
+                category: "language",
+                title: "发现一处错别字",
+                location: "第1段",
+                originalText: "测试错字",
+                description: "应为正确用字",
+                suggestion: "修改为正字",
               },
             ],
           },
@@ -39,9 +43,28 @@ vi.mock("ai", async (importOriginal) => {
           usage: { promptTokens: 60, completionTokens: 20, totalTokens: 80 },
         };
       }
+      if (typeof prompt === "string" && prompt.includes("当前检查单元：")) {
+        return {
+          object: {
+            issues: [
+              {
+                severity: "confirmed",
+                category: "language",
+                title: "发现一处错别字",
+                location: "第1段",
+                originalText: "测试错字",
+                description: "应为正确用字",
+                suggestion: "修改为正字",
+              },
+            ],
+          },
+          usage: { promptTokens: 60, completionTokens: 20, totalTokens: 80 },
+        };
+      }
       if (typeof prompt === "string" && prompt.includes("【校对规则】")) {
         return {
           object: {
+            isEncyclopedic: true,
             summary: "条目语言流畅，发现一处错别字。",
             issues: [
               {

@@ -181,14 +181,15 @@ if (cfg.events.mode === "eventstream") {
 
   createSource();
   // watchdog: 如果 EventSource 5 分钟内没有收到任何事件，则认为可能卡死，强制重连
-  setInterval(() => {
-    const idleMs = Date.now() - lastActivityAt;
+  // FIXME 可能有错
+  // setInterval(() => {
+  //   const idleMs = Date.now() - lastActivityAt;
 
-    if (idleMs > IDLE_TIMEOUT) {
-      log.warn({ idleMs }, "EventSource appears stalled");
-      createSource();
-    }
-  }, 30_000);
+  //   if (idleMs > IDLE_TIMEOUT) {
+  //     log.warn({ idleMs }, "EventSource appears stalled");
+  //     createSource();
+  //   }
+  // }, 30_000);
 } else {
   const request = (params: Record<string, string | number>) =>
     bot.request(params);

@@ -68,12 +68,18 @@ export async function executeWithFallback<T>(
     spec: LlmModelSpec,
   ) => Promise<FallbackRunnerResult<T>>,
   usageTracker?: TokenUsage,
-): Promise<{ result: T; usage: TokenUsage; model: string }> {
+): Promise<{
+  result: T;
+  usage: TokenUsage;
+  totalUsage: TokenUsage;
+  model: string;
+}> {
   if (!models || models.length === 0) {
     throw new Error("No LLM models configured");
   }
 
-  const currentUsage = usageTracker ?? createTokenUsage();
+  const totalUsage = usageTracker ?? createTokenUsage();
+  const callUsage = createTokenUsage();
   let lastError: unknown;
 
   for (const spec of models) {
@@ -82,19 +88,20 @@ export async function executeWithFallback<T>(
       const modelIdentifier = `${spec.provider}/${spec.model}`;
       const output = await runner(model, spec);
       if (output !== null && typeof output === "object" && "result" in output) {
-        addTokenUsage(
-          currentUsage,
-          (output as { usage?: PartialTokenUsage }).usage,
-        );
+        const usage = (output as { usage?: PartialTokenUsage }).usage;
+        addTokenUsage(callUsage, usage);
+        addTokenUsage(totalUsage, usage);
         return {
           result: (output as { result: T }).result,
-          usage: currentUsage,
+          usage: { ...callUsage },
+          totalUsage: { ...totalUsage },
           model: (output as { model?: string }).model ?? modelIdentifier,
         };
       } else {
         return {
           result: output as T,
-          usage: currentUsage,
+          usage: { ...callUsage },
+          totalUsage: { ...totalUsage },
           model: modelIdentifier,
         };
       }
@@ -102,10 +109,9 @@ export async function executeWithFallback<T>(
       console.error(`[LLM] ${spec.provider}/${spec.model} failed`, err);
 
       if (err && typeof err === "object" && "usage" in err) {
-        addTokenUsage(
-          currentUsage,
-          (err as { usage?: PartialTokenUsage }).usage,
-        );
+        const usage = (err as { usage?: PartialTokenUsage }).usage;
+        addTokenUsage(callUsage, usage);
+        addTokenUsage(totalUsage, usage);
       }
       lastError = err;
       // 继续尝试下一个模型
