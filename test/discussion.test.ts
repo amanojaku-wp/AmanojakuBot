@@ -5,11 +5,14 @@ import {
   formatDiscussionReply,
   formatWikiTimestamp,
   getCommentIndentLevel,
+  hasDiscussionComments,
   insertReplyIntoContent,
   isRelevant,
   parseDiscussionThread,
   parseSections,
   parseStructuredComment,
+  parseStructuredDiscussionPage,
+  type StructuredDiscussionSection,
 } from "../src/utils/wikitext.js";
 import {
   formatStructuredCurrentMessage,
@@ -114,23 +117,23 @@ describe("discussion filtering & timestamp handling", () => {
     const marker = "<!-- marker -->";
     // 0 -> 1 level (:)
     expect(formatDiscussionReply("回复内容", 0, marker)).toBe(
-      ":回复内容 —~~~~ <!-- marker -->",
+      ":回复内容 ~~~~ <!-- marker -->",
     );
     // 1 -> 2 level (::)
     expect(formatDiscussionReply("回复内容", 1, marker)).toBe(
-      "::回复内容 —~~~~ <!-- marker -->",
+      "::回复内容 ~~~~ <!-- marker -->",
     );
     // 7 -> 8 level (::::::::)
     expect(formatDiscussionReply("回复内容", 7, marker)).toBe(
-      "::::::::回复内容 —~~~~ <!-- marker -->",
+      "::::::::回复内容 ~~~~ <!-- marker -->",
     );
     // 8 -> 9 level (> 8) -> outdent to 0
     expect(formatDiscussionReply("回复内容", 8, marker)).toBe(
-      "{{Outdent|8}}\n回复内容 —~~~~ <!-- marker -->",
+      "{{Outdent|8}}\n回复内容 ~~~~ <!-- marker -->",
     );
     // 9 -> 10 level (> 8) -> outdent to 0
     expect(formatDiscussionReply("回复内容", 9, marker)).toBe(
-      "{{Outdent|9}}\n回复内容 —~~~~ <!-- marker -->",
+      "{{Outdent|9}}\n回复内容 ~~~~ <!-- marker -->",
     );
   });
 
@@ -381,36 +384,42 @@ line 2
     });
   });
 
-  it("formats structured discussion history and current message into XML prompts", () => {
+  it("formats structured discussion history and current message into JSON format", () => {
     const threadWikitext = `== 话题测试 ==
 Alice的第一句话 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
 :Bob的回复 --[[User:Bob|Bob]] 2026年9月14日 (一) 01:05 (UTC)`;
 
-    const xmlHistory = formatStructuredDiscussionContext(
+    const jsonHistory = formatStructuredDiscussionContext(
       threadWikitext,
       "话题测试",
       "zhwiki",
+      123456,
     );
-    expect(xmlHistory).toContain('<discussion-history section="话题测试">');
-    expect(xmlHistory).toContain(
-      '<comment index="1" author="Alice" time="2026年9月14日 (一) 01:00 (UTC)" indent="0">',
-    );
-    expect(xmlHistory).toContain("Alice的第一句话");
-    expect(xmlHistory).toContain(
-      '<comment index="2" author="Bob" time="2026年9月14日 (一) 01:05 (UTC)" indent="1">',
-    );
-    expect(xmlHistory).toContain("Bob的回复");
+    const parsedHistory = JSON.parse(jsonHistory);
+    expect(parsedHistory).toHaveLength(1);
+    expect(parsedHistory[0].title).toBe("话题测试");
+    expect(parsedHistory[0].messages).toHaveLength(2);
+    expect(parsedHistory[0].messages[0].id).toBe("r-123456-202609140100");
+    expect(parsedHistory[0].messages[0].author).toBe("Alice");
+    expect(parsedHistory[0].messages[0].text).toBe("Alice的第一句话");
+    expect(parsedHistory[0].messages[0].rawText).toBeUndefined(); // rawText 必须剔除以防止幻觉
+    expect(parsedHistory[0].messages[1].id).toBe("r-123456-202609140105");
+    expect(parsedHistory[0].messages[1].author).toBe("Bob");
 
-    const xmlCurrent = formatStructuredCurrentMessage(
+    const jsonCurrent = formatStructuredCurrentMessage(
       ":Charlie: 最新提问 --[[User:Charlie|Charlie]] 2026年9月14日 (一) 01:23 (UTC)",
       "Charlie",
       "2026-09-14T01:23:00Z",
       "zhwiki",
+      undefined,
+      123456,
     );
-    expect(xmlCurrent).toContain(
-      '<current-message author="Charlie" time="2026年9月14日 (一) 01:23 (UTC)" indent="1">',
-    );
-    expect(xmlCurrent).toContain("Charlie: 最新提问");
+    const parsedCurrent = JSON.parse(jsonCurrent);
+    expect(parsedCurrent.id).toBe("r-123456-202609140123");
+    expect(parsedCurrent.author).toBe("Charlie");
+    expect(parsedCurrent.indentLevel).toBe(1);
+    expect(parsedCurrent.text).toBe("Charlie: 最新提问");
+    expect(parsedCurrent.rawText).toBeUndefined();
   });
 
   it("splits comments strictly by end-of-line signatures rather than indentation changes", () => {
@@ -439,5 +448,93 @@ Alice的第一句话 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
     expect(comments[1].timestamp).toBe("2026年9月14日 (一) 01:05 (UTC)");
     expect(comments[1].indentLevel).toBe(2);
     expect(comments[1].text).toBe("这是 Bob 对 Alice 的回复。\n包含第二行。");
+  });
+
+  it("identifies discussion comments with hasDiscussionComments", () => {
+    expect(
+      hasDiscussionComments("这是一段普通的条目正文，没有签名和时间戳。"),
+    ).toBe(false);
+    expect(
+      hasDiscussionComments(
+        "我支持这个提议。--[[User:Alice]] 2026年9月14日 (一) 01:00 (UTC)",
+      ),
+    ).toBe(true);
+  });
+
+  it("parses entire discussion page into hierarchical JSON with multi-level headings", () => {
+    const fullPageWikitext = `{{Talk header}}
+导言区的告示或未分类留言 --[[User:Admin|Admin]] 2026年9月14日 (一) 00:30 (UTC)
+
+== 二级讨论话题一 ==
+这是讨论一的正文。 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
+:回复Alice。 --[[User:Bob|Bob]] 2026年9月14日 (一) 01:05 (UTC)
+
+=== 三级子标题 1.1 ===
+这是子话题1.1的内容。 --[[User:Charlie|Charlie]] 2026年9月14日 (一) 01:10 (UTC)
+
+==== 四级小节 1.1.1 ====
+这是更深层次的小节。 --[[User:Dave|Dave]] 2026年9月14日 (一) 01:15 (UTC)
+
+=== 三级子标题 1.2 ===
+另一个子话题的内容。 --[[User:Eve|Eve]] 2026年9月14日 (一) 01:20 (UTC)
+
+== 二级讨论话题二 ==
+第二个大话题。 --[[User:Frank|Frank]] 2026年9月14日 (一) 02:00 (UTC)`;
+
+    const tree = parseStructuredDiscussionPage(fullPageWikitext);
+
+    // 结构验证
+    expect(tree).toHaveLength(3);
+
+    // 导言区 (level 0)
+    expect(tree[0].level).toBe(0);
+    expect(tree[0].messages).toHaveLength(1);
+    expect((tree[0].messages[0] as any).author).toBe("Admin");
+
+    // 二级标题 1
+    const sec1 = tree[1];
+    expect(sec1.level).toBe(2);
+    expect(sec1.title).toBe("二级讨论话题一");
+    expect(sec1.messages).toHaveLength(4);
+
+    // 消息 1 与 2
+    expect((sec1.messages[0] as any).id).toBe("r-0-202609140100");
+    expect((sec1.messages[0] as any).author).toBe("Alice");
+    expect((sec1.messages[0] as any).text).toBe("这是讨论一的正文。");
+    expect((sec1.messages[0] as any).indentLevel).toBe(0);
+    expect((sec1.messages[0] as any).rawText).toBeUndefined(); // rawText 必须剔除以防止幻觉
+    expect((sec1.messages[1] as any).id).toBe("r-0-202609140105");
+    expect((sec1.messages[1] as any).author).toBe("Bob");
+    expect((sec1.messages[1] as any).indentLevel).toBe(1);
+
+    // 三级标题 1.1
+    const subSec1_1 = sec1.messages[2] as StructuredDiscussionSection;
+    expect(subSec1_1.level).toBe(3);
+    expect(subSec1_1.title).toBe("三级子标题 1.1");
+    expect(subSec1_1.messages).toHaveLength(2);
+    expect((subSec1_1.messages[0] as any).id).toBe("r-0-202609140110");
+    expect((subSec1_1.messages[0] as any).author).toBe("Charlie");
+
+    // 四级标题 1.1.1
+    const subSec1_1_1 = subSec1_1.messages[1] as StructuredDiscussionSection;
+    expect(subSec1_1_1.level).toBe(4);
+    expect(subSec1_1_1.title).toBe("四级小节 1.1.1");
+    expect((subSec1_1_1.messages[0] as any).id).toBe("r-0-202609140115");
+    expect((subSec1_1_1.messages[0] as any).author).toBe("Dave");
+
+    // 三级标题 1.2
+    const subSec1_2 = sec1.messages[3] as StructuredDiscussionSection;
+    expect(subSec1_2.level).toBe(3);
+    expect(subSec1_2.title).toBe("三级子标题 1.2");
+    expect((subSec1_2.messages[0] as any).id).toBe("r-0-202609140120");
+    expect((subSec1_2.messages[0] as any).author).toBe("Eve");
+
+    // 二级标题 2
+    const sec2 = tree[2];
+    expect(sec2.level).toBe(2);
+    expect(sec2.title).toBe("二级讨论话题二");
+    expect(sec2.messages).toHaveLength(1);
+    expect((sec2.messages[0] as any).id).toBe("r-0-202609140200");
+    expect((sec2.messages[0] as any).author).toBe("Frank");
   });
 });

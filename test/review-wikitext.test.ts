@@ -5,11 +5,13 @@ import {
   extractSignatures,
   isSignatureMatchingActor,
   generateUniqueSectionTitle,
-  formatReviewResultWikitext,
   parseSections,
   findMatchingSection,
-  type ReviewResult,
 } from "../src/utils/wikitext.js";
+import {
+  formatReviewResultWikitext,
+  type ReviewResult,
+} from "../src/tasks/review.js";
 
 describe("Review Wikitext utilities", () => {
   it("finds the exact matching section when multiple sections share the same title", () => {

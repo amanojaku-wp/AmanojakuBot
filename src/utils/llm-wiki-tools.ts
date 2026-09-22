@@ -1,76 +1,142 @@
 import { tool } from "ai";
 import { z } from "zod";
 import type { Mwn } from "mwn";
-import { pageText } from "./wiki.js";
 import type { Logger } from "pino";
 import { diffLines } from "diff";
+import {
+  hasDiscussionComments,
+  parseStructuredDiscussionPage,
+  type StructuredDiscussionSection,
+} from "./wikitext.js";
 
 const MAX_RESULTS = 20;
 const MAX_SEARCH_RESULTS = 10;
+const MAX_CONTENT_CHARS = 120000;
+const MAX_DIFF_CHARS = 120000;
+
+export type WikiPageResult =
+  | {
+      found: false;
+      title: string;
+    }
+  | {
+      found: true;
+      title: string;
+      revid?: number;
+      kind: "document";
+      content: string;
+      truncated?: boolean;
+    }
+  | {
+      found: true;
+      title: string;
+      revid?: number;
+      kind: "discussion";
+      sections: StructuredDiscussionSection[];
+    };
 
 export function createWikiTools(bot: Mwn, log?: Logger) {
   return {
     /**
-     * 读取指定页面的当前 Wikitext。
+     * 读取指定页面的当前内容，根据命名空间或内容是否包含讨论留言智能决定返回格式：
+     * - 若为讨论页（如各类 Talk 页面、互助客栈等讨论页面），返回 kind: "discussion" 及结构化 JSON 数据；
+     * - 若为常规页面（如条目、模板、方针文档等），返回 kind: "document" 及 Wikitext 文本。
      */
     getWikiPage: tool({
       description:
-        "读取中文维基百科指定页面的当前Wikitext。" +
-        "当需要了解某个条目、模板、Wikipedia页面、用户页等的实际当前内容时使用。",
+        "读取中文维基百科指定页面的当前内容。" +
+        "该工具会自动根据命名空间（如各类 Talk 讨论页面）或内容是否包含签名时间戳留言智能决定返回格式：" +
+        "1. 若为讨论页（各类 Talk 页面、互助客栈、存废讨论、申请评选等），返回 kind: 'discussion' 及按标题分层的结构化 JSON 数据（包含 id, author, timestamp, text, indentLevel 及嵌套子章节）；" +
+        "2. 若为常规文档/条目页面（条目正文、模板代码、方针指引文档等），返回 kind: 'document' 及页面的 Wikitext 正文内容。" +
+        "当需要了解某个条目、模板、Wikipedia页面、用户页、讨论页等内容时使用。",
 
       inputSchema: z.object({
         title: z
           .string()
+          .min(1)
           .describe(
-            "完整MediaWiki页面标题，例如“人工智能”、“Template:Cite web”、“Wikipedia:机器人方针”。",
-          ),
-        redirects: z
-          .boolean()
-          .optional()
-          .default(true)
-          .describe(
-            "可选，是否跟随重定向，默认true。若为true，则返回重定向目标页面的内容；" +
-              "若为false，则返回重定向页面本身的内容。一般都取true，除非专门研究重定向的问题。",
-          ),
-        converttitles: z
-          .boolean()
-          .optional()
-          .default(true)
-          .describe(
-            "可选，是否将标题转换为规范形式，默认true。" +
-              "一般情况下都是true，除非需要研究页面标题本身的简繁体、大小写等转换问题。",
+            "完整MediaWiki页面标题，例如“人工智能”、“User talk:Example”、“Wikipedia:互助客栈/方针”、“Template:Cite web”。",
           ),
       }),
 
-      execute: async ({ title, redirects, converttitles }) => {
+      execute: async ({ title }): Promise<WikiPageResult> => {
         const startedAt = Date.now();
-
         log?.debug({ title }, "tool getWikiPage started");
 
-        const text = await pageText(bot, title, { redirects, converttitles });
+        let resolvedTitle = title ?? "";
 
-        log?.debug(
-          {
-            title,
-            found: text != null,
-            chars: text?.length ?? 0,
-            elapsedMs: Date.now() - startedAt,
-          },
-          "tool getWikiPage fetched",
-        );
+        const response = await bot.request({
+          action: "query",
+          prop: "revisions",
+          titles: title,
+          rvprop: "ids|content",
+          rvslots: "main",
+          redirects: 1,
+          converttitles: 1,
+          formatversion: 2,
+        });
 
-        if (text == null) {
+        const page = response?.query?.pages?.[0];
+        const rev = page?.revisions?.[0];
+
+        if (!page || page.missing || !rev) {
+          log?.debug(
+            { title, found: false, elapsedMs: Date.now() - startedAt },
+            "tool getWikiPage not found",
+          );
           return {
             found: false,
             title,
           };
         }
 
+        resolvedTitle = page.title ?? resolvedTitle;
+        const revid = rev.revid;
+        const content =
+          rev.slots?.main?.content ??
+          rev.slots?.main?.["*"] ??
+          rev.content ??
+          rev["*"] ??
+          "";
+
+        // 判断是否为讨论页：
+        // 1. 命名空间判定：MediaWiki 中所有讨论命名空间 ID 均为奇数 (ns > 0 && ns % 2 !== 0)，如 Talk(1), User talk(3), Wikipedia talk(5) 等
+        // 2. 标题前缀判定：若 ns 未明确给出但标题带有 Talk 讨论页前缀
+        // 3. 内容特征判定：页面内容中包含用户签名链接及时间戳（如 Wikipedia:互助客栈、存废讨论、评选等 Project 命名空间页面）
+        const isTalkNamespace =
+          typeof page.ns === "number" && page.ns > 0 && page.ns % 2 !== 0;
+        const hasComments = hasDiscussionComments(content);
+        const isDiscussion = isTalkNamespace || hasComments;
+
+        log?.debug(
+          {
+            title: resolvedTitle,
+            ns: page.ns,
+            isDiscussion,
+            chars: content.length,
+            elapsedMs: Date.now() - startedAt,
+          },
+          "tool getWikiPage completed",
+        );
+
+        if (isDiscussion) {
+          const sections = parseStructuredDiscussionPage(content, { revid });
+          return {
+            found: true,
+            title: resolvedTitle,
+            revid,
+            kind: "discussion",
+            sections,
+          };
+        }
+
         return {
           found: true,
-          title,
-          content: text,
-          truncated: text.length > 2097152,
+          title: resolvedTitle,
+          revid,
+          kind: "document",
+          content: content.slice(0, MAX_CONTENT_CHARS),
+          truncated: content.length > MAX_CONTENT_CHARS,
         };
       },
     }),
@@ -402,8 +468,6 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           rev["*"] ??
           "";
 
-        const MAX_CONTENT_CHARS = 12000;
-
         return {
           found: true,
           title: page.title,
@@ -523,7 +587,6 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
 
         // 3. 计算文本差异
         const diffs = diffLines(baseContent, targetContent);
-        const MAX_DIFF_CHARS = 12000;
 
         const changes: {
           type: "added" | "removed";

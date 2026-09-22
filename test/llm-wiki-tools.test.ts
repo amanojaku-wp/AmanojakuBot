@@ -294,4 +294,186 @@ describe("LLM Wiki Tools", () => {
     expect(result.revid).toBe(12345);
     expect(result.content).toBe("固定版本内容");
   });
+
+  it("provides getWikiPage returning kind: 'document' for normal articles and kind: 'discussion' for talk pages and discussion pages", async () => {
+    const mockRequest = vi
+      .fn()
+      .mockImplementation((params: { titles: string }) => {
+        // 1. 普通条目（无讨论留言，ns: 0）
+        if (params.titles === "人工智能") {
+          return Promise.resolve({
+            query: {
+              pages: [
+                {
+                  pageid: 101,
+                  ns: 0,
+                  title: "人工智能",
+                  revisions: [
+                    {
+                      revid: 1001,
+                      slots: {
+                        main: { content: "人工智能是一门新兴的技术科学。" },
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        }
+
+        // 2. 讨论命名空间（User talk:, ns: 3）
+        if (params.titles === "User talk:AmanojakuBot") {
+          const talkWikitext = `== 主题一 ==
+关于机器人运行的意见。 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
+:赞成！ --[[User:Bob|Bob]] 2026年9月14日 (一) 01:05 (UTC)
+
+=== 子议题 1 ===
+细节需要补充。 --[[User:Charlie|Charlie]] 2026年9月14日 (一) 01:10 (UTC)`;
+
+          return Promise.resolve({
+            query: {
+              pages: [
+                {
+                  pageid: 102,
+                  ns: 3,
+                  title: "User talk:AmanojakuBot",
+                  revisions: [
+                    {
+                      revid: 2001,
+                      slots: { main: { content: talkWikitext } },
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        }
+
+        // 3. Wikipedia: 命名空间中的讨论页（ns: 4，但包含讨论留言）
+        if (params.titles === "Wikipedia:互助客栈/方针") {
+          const forumWikitext = `== 关于新提案讨论 ==
+我认为该提案非常合理。 --[[User:Alice|Alice]] 2026年9月14日 (一) 01:00 (UTC)
+:我也支持。 --[[User:Bob|Bob]] 2026年9月14日 (一) 01:05 (UTC)`;
+
+          return Promise.resolve({
+            query: {
+              pages: [
+                {
+                  pageid: 103,
+                  ns: 4,
+                  title: "Wikipedia:互助客栈/方针",
+                  revisions: [
+                    {
+                      revid: 3001,
+                      slots: { main: { content: forumWikitext } },
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        }
+
+        // 4. Wikipedia: 命名空间中的方针正文（ns: 4，无讨论留言）
+        if (params.titles === "Wikipedia:机器人方针") {
+          const policyWikitext = `== 机器人方针 ==
+本方针规定机器人的运作原则和权限申请流程。
+=== 申请程序 ===
+所有机器人均需在申请页面提交申请。`;
+
+          return Promise.resolve({
+            query: {
+              pages: [
+                {
+                  pageid: 104,
+                  ns: 4,
+                  title: "Wikipedia:机器人方针",
+                  revisions: [
+                    {
+                      revid: 4001,
+                      slots: { main: { content: policyWikitext } },
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        }
+
+        return Promise.resolve({ query: { pages: [{ missing: true }] } });
+      });
+
+    const mockBot = {
+      request: mockRequest,
+    } as unknown as Mwn;
+
+    const tools = createWikiTools(mockBot);
+
+    // 1. 测试读取普通条目 -> kind: "document"
+    const docResult = (await tools.getWikiPage.execute!(
+      { title: "人工智能" },
+      { messages: [], toolCallId: "call_doc", context: {} as never },
+    )) as any;
+    expect(docResult.found).toBe(true);
+    expect(docResult.kind).toBe("document");
+    expect(docResult.title).toBe("人工智能");
+    expect(docResult.revid).toBe(1001);
+    expect(docResult.content).toBe("人工智能是一门新兴的技术科学。");
+
+    // 2. 测试读取 Talk 命名空间 -> kind: "discussion"
+    const talkResult = (await tools.getWikiPage.execute!(
+      { title: "User talk:AmanojakuBot" },
+      { messages: [], toolCallId: "call_talk", context: {} as never },
+    )) as any;
+    expect(talkResult.found).toBe(true);
+    expect(talkResult.kind).toBe("discussion");
+    expect(talkResult.title).toBe("User talk:AmanojakuBot");
+    expect(talkResult.revid).toBe(2001);
+    expect(talkResult.sections).toHaveLength(1);
+    expect(talkResult.sections[0].level).toBe(2);
+    expect(talkResult.sections[0].title).toBe("主题一");
+    expect(talkResult.sections[0].messages).toHaveLength(3);
+    expect(talkResult.sections[0].messages[0].id).toBe("r-2001-202609140100");
+    expect(talkResult.sections[0].messages[0].author).toBe("Alice");
+    expect(talkResult.sections[0].messages[0].text).toBe(
+      "关于机器人运行的意见。",
+    );
+    expect(talkResult.sections[0].messages[0].rawText).toBeUndefined();
+
+    // 3. 测试读取 Wikipedia: 命名空间中的讨论页 -> kind: "discussion"
+    const forumResult = (await tools.getWikiPage.execute!(
+      { title: "Wikipedia:互助客栈/方针" },
+      { messages: [], toolCallId: "call_forum", context: {} as never },
+    )) as any;
+    expect(forumResult.found).toBe(true);
+    expect(forumResult.kind).toBe("discussion");
+    expect(forumResult.title).toBe("Wikipedia:互助客栈/方针");
+    expect(forumResult.revid).toBe(3001);
+    expect(forumResult.sections).toHaveLength(1);
+    expect(forumResult.sections[0].title).toBe("关于新提案讨论");
+    expect(forumResult.sections[0].messages[0].id).toBe("r-3001-202609140100");
+    expect(forumResult.sections[0].messages[0].author).toBe("Alice");
+
+    // 4. 测试读取 Wikipedia: 命名空间中的方针正文 -> kind: "document"
+    const policyResult = (await tools.getWikiPage.execute!(
+      { title: "Wikipedia:机器人方针" },
+      { messages: [], toolCallId: "call_policy", context: {} as never },
+    )) as any;
+    expect(policyResult.found).toBe(true);
+    expect(policyResult.kind).toBe("document");
+    expect(policyResult.title).toBe("Wikipedia:机器人方针");
+    expect(policyResult.revid).toBe(4001);
+    expect(policyResult.content).toContain(
+      "本方针规定机器人的运作原则和权限申请流程。",
+    );
+
+    // 5. 测试不存在的页面 -> found: false
+    const missingResult = (await tools.getWikiPage.execute!(
+      { title: "不存在的页面_xyz" },
+      { messages: [], toolCallId: "call_missing", context: {} as never },
+    )) as any;
+    expect(missingResult.found).toBe(false);
+    expect(missingResult.title).toBe("不存在的页面_xyz");
+  });
 });

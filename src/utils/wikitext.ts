@@ -126,9 +126,101 @@ export function containsMatchingTimestamp(
 }
 
 /**
+ * 将维基时间戳文本或日期转换为 12 位紧凑数字格式（YYYYMMDDHHmm，如 "202601231123"）
+ */
+export function compactWikiTimestamp(
+  timestampText?: string,
+  defaultDate?: Date | string | number,
+): string {
+  if (timestampText) {
+    const trimmed = timestampText.trim();
+
+    // 1. 中文维基格式：2026年9月14日 (一) 01:23 (UTC)
+    const zhMatch = trimmed.match(
+      /(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日[^\d]*(\d{1,2}):(\d{2})/,
+    );
+    if (zhMatch) {
+      const y = zhMatch[1];
+      const m = zhMatch[2].padStart(2, "0");
+      const d = zhMatch[3].padStart(2, "0");
+      const hh = zhMatch[4].padStart(2, "0");
+      const mm = zhMatch[5].padStart(2, "0");
+      return `${y}${m}${d}${hh}${mm}`;
+    }
+
+    // 2. 英文维基/publictestwiki格式：14:14, 7 June 2026 (UTC)
+    const enMatch = trimmed.match(
+      /(\d{1,2}):(\d{2}),\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/,
+    );
+    if (enMatch) {
+      const hh = enMatch[1].padStart(2, "0");
+      const mm = enMatch[2].padStart(2, "0");
+      const d = enMatch[3].padStart(2, "0");
+      const monthStr = enMatch[4];
+      const y = enMatch[5];
+      const mIdx = EN_MONTHS.findIndex(
+        (mon) => mon.toLowerCase() === monthStr.toLowerCase(),
+      );
+      const m = String(mIdx !== -1 ? mIdx + 1 : 1).padStart(2, "0");
+      return `${y}${m}${d}${hh}${mm}`;
+    }
+
+    // 3. ISO/标准日期格式：2026-09-14 01:23 或 2026-09-14T01:23:00Z
+    const isoMatch = trimmed.match(
+      /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/,
+    );
+    if (isoMatch) {
+      return `${isoMatch[1]}${isoMatch[2]}${isoMatch[3]}${isoMatch[4]}${isoMatch[5]}`;
+    }
+
+    // 4. 尝试通过 Date 解析
+    const parsedDate = new Date(trimmed);
+    if (!Number.isNaN(parsedDate.getTime())) {
+      const y = parsedDate.getUTCFullYear();
+      const m = String(parsedDate.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(parsedDate.getUTCDate()).padStart(2, "0");
+      const hh = String(parsedDate.getUTCHours()).padStart(2, "0");
+      const mm = String(parsedDate.getUTCMinutes()).padStart(2, "0");
+      return `${y}${m}${d}${hh}${mm}`;
+    }
+  }
+
+  // 5. fallback 到 defaultDate
+  if (defaultDate !== undefined) {
+    const d = defaultDate instanceof Date ? defaultDate : new Date(defaultDate);
+    if (!Number.isNaN(d.getTime())) {
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+      const day = String(d.getUTCDate()).padStart(2, "0");
+      const hh = String(d.getUTCHours()).padStart(2, "0");
+      const mm = String(d.getUTCMinutes()).padStart(2, "0");
+      return `${y}${m}${day}${hh}${mm}`;
+    }
+  }
+
+  return "000000000000";
+}
+
+/**
+ * 生成讨论留言的唯一消息 ID（格式："r-版本号-202601231123"）
+ */
+export function generateMessageId(
+  revid?: number | string,
+  timestampText?: string,
+  defaultDate?: Date | string | number,
+): string {
+  const version =
+    revid !== undefined && revid !== null && revid !== "" ? revid : 0;
+  const compactTime = compactWikiTimestamp(timestampText, defaultDate);
+  return `r-${version}-${compactTime}`;
+}
+
+/**
  * 结构化讨论留言数据模型
  */
 export type StructuredComment = {
+  /** 消息唯一 ID（格式：r-版本号-202601231123） */
+  id: string;
   /** 发言用户名（如 "Alice"、"192.0.2.1" 或未知用户） */
   author: string;
   /** 发言时间戳文本（如 "2026年9月14日 (一) 01:23 (UTC)"） */
@@ -168,6 +260,7 @@ export function parseStructuredComment(
     defaultAuthor?: string;
     defaultTimestamp?: string;
     timestampFormat?: string;
+    revid?: number | string;
   },
 ): StructuredComment {
   const rawText = rawComment;
@@ -311,10 +404,18 @@ export function parseStructuredComment(
   }
 
   const cleanBody = cleanedLines.join("\n").trim();
+  const authorFinal = author || options?.defaultAuthor || "未知用户";
+  const timestampFinal = timestamp || options?.defaultTimestamp;
+  const id = generateMessageId(
+    options?.revid,
+    timestampFinal,
+    options?.defaultTimestamp,
+  );
 
   return {
-    author: author || options?.defaultAuthor || "未知用户",
-    timestamp: timestamp || options?.defaultTimestamp,
+    id,
+    author: authorFinal,
+    timestamp: timestampFinal,
     text: cleanBody,
     indentLevel,
     rawText,
@@ -385,6 +486,7 @@ export function parseDiscussionThread(
     defaultAuthor?: string;
     defaultTimestamp?: string;
     timestampFormat?: string;
+    revid?: number | string;
   },
 ): StructuredComment[] {
   if (!wikitext || !wikitext.trim()) return [];
@@ -454,6 +556,166 @@ export function parseDiscussionThread(
   }
 
   return structuredList;
+}
+
+/**
+ * 结构化讨论留言（供 LLM 消费与外部输出，不包含 rawText 以防幻觉）
+ */
+export type CleanStructuredComment = {
+  id: string;
+  author: string;
+  timestamp?: string;
+  text: string;
+  indentLevel: number;
+};
+
+/**
+ * 结构化讨论章节/话题节点（支持多级标题嵌套，如一/二/三/四等标题分层）
+ */
+export type StructuredDiscussionSection = {
+  /** 标题层级（例如 1 为一级标题，2 为二级标题，3 为三级标题，4 为四级标题等；0 为页面开头的导言/无标题区） */
+  level: number;
+  /** 章节标题文本 */
+  title: string;
+  /** 该章节下的留言列表及嵌套子章节 */
+  messages: Array<CleanStructuredComment | StructuredDiscussionSection>;
+};
+
+const SECTION_HEADING_REGEX =
+  /^(={1,6})\s*([^=].*?)\s*\1(?:\s*<!--[\s\S]*?-->)*\s*$/;
+
+/**
+ * 检查文本是否包含讨论留言特征（包含用户/用户讨论/用户贡献链接，且包含时间戳）
+ */
+export function hasDiscussionComments(wikitext: string): boolean {
+  if (!wikitext) return false;
+  return (
+    (USER_LINK_REGEX.test(wikitext) ||
+      UNSIGNED_TEMPLATE_REGEX.test(wikitext)) &&
+    (WIKI_TIMESTAMP_REGEX.test(wikitext) ||
+      UNSIGNED_TEMPLATE_REGEX.test(wikitext))
+  );
+}
+
+/**
+ * 解析页面全部讨论内容，按照一/二/三/四等各级标题进行树状分层，
+ * 并提取每个章节下的结构化留言列表（发言人、时间戳、留言正文、缩进层级等，不含 rawText）。
+ */
+export function parseStructuredDiscussionPage(
+  wikitext: string,
+  options?: {
+    defaultAuthor?: string;
+    defaultTimestamp?: string;
+    timestampFormat?: string;
+    revid?: number | string;
+  },
+): StructuredDiscussionSection[] {
+  if (!wikitext || !wikitext.trim()) return [];
+
+  const lines = wikitext.split("\n");
+  const rawSections: { level: number; title: string; lines: string[] }[] = [];
+  let currentSection = {
+    level: 0,
+    title: "",
+    lines: [] as string[],
+  };
+  let currentTag: string | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const { isInsideTagAtStart, openTagAtEnd } = getLineTagInfo(
+      line,
+      currentTag,
+    );
+    currentTag = openTagAtEnd;
+
+    if (!isInsideTagAtStart && currentTag === null) {
+      const headingMatch = line.match(SECTION_HEADING_REGEX);
+      if (headingMatch) {
+        const headingLevel = headingMatch[1].length;
+        const headingTitle = headingMatch[2]
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .trim();
+        if (headingTitle.length > 0) {
+          if (
+            currentSection.level > 0 ||
+            currentSection.lines.some((l) => l.trim().length > 0)
+          ) {
+            rawSections.push(currentSection);
+          }
+          currentSection = {
+            level: headingLevel,
+            title: headingTitle,
+            lines: [],
+          };
+          continue;
+        }
+      }
+    }
+
+    currentSection.lines.push(line);
+  }
+
+  if (
+    currentSection.level > 0 ||
+    currentSection.lines.some((l) => l.trim().length > 0)
+  ) {
+    rawSections.push(currentSection);
+  }
+
+  const rootSections: StructuredDiscussionSection[] = [];
+  const stack: StructuredDiscussionSection[] = [];
+
+  for (const raw of rawSections) {
+    const sectionText = raw.lines.join("\n");
+    const rawComments = parseDiscussionThread(sectionText, options);
+
+    // 剔除 rawText，仅保留 id, author, timestamp, text, indentLevel
+    const comments: CleanStructuredComment[] = rawComments.map((c) => ({
+      id: c.id,
+      author: c.author,
+      timestamp: c.timestamp,
+      text: c.text,
+      indentLevel: c.indentLevel,
+    }));
+
+    // 页面导言区（无标题区，level 0）
+    if (raw.level === 0) {
+      if (comments.length > 0) {
+        const leadSection: StructuredDiscussionSection = {
+          level: 0,
+          title: "",
+          messages: comments,
+        };
+        rootSections.push(leadSection);
+      }
+      continue;
+    }
+
+    const sectionNode: StructuredDiscussionSection = {
+      level: raw.level,
+      title: raw.title,
+      messages: [...comments],
+    };
+
+    // 弹出栈中层级大于或等于当前 sectionNode 层级的节点
+    while (
+      stack.length > 0 &&
+      stack[stack.length - 1].level >= sectionNode.level
+    ) {
+      stack.pop();
+    }
+
+    if (stack.length === 0) {
+      rootSections.push(sectionNode);
+    } else {
+      stack[stack.length - 1].messages.push(sectionNode);
+    }
+
+    stack.push(sectionNode);
+  }
+
+  return rootSections;
 }
 
 /**
@@ -797,7 +1059,7 @@ export function formatDiscussionReply(
   const userNsPattern =
     "(?:User|User[ _]talk|U|UT|用户|用戶|使用者|用户讨论|用戶討論|使用者討論|Special|特别|特別)";
   const timePattern =
-    "(?:\\d{4}年\\d{1,2}月\\d{1,2}日\\s*(?:\\([^\\n)]+\\))?\\s*\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:\\([A-Z]+\\))?|\\d{1,2}:\\d{2}(?::\\d{2})?,\\s*\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}\\s*(?:\\([A-Z]+\\))?|\\d{4}-\\d{2}-\d{2}[ T]\\d{2}:\d{2}(?::\\d{2})?\\s*(?:\\([A-Z]+\\))?)";
+    "(?:\\d{4}年\\d{1,2}月\\d{1,2}日\\s*(?:\\([^\\n)]+\\))?\\s*\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:\\([A-Z]+\\))?|\\d{1,2}:\\d{2}(?::\\d{2})?,\\s*\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4}\\s*(?:\\([A-Z]+\\))?|\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}(?::\\d{2})?\\s*(?:\\([A-Z]+\\))?)";
 
   if (botUsername) {
     const escapedBot = botUsername
@@ -860,7 +1122,7 @@ export function formatDiscussionReply(
       .trimEnd();
   }
 
-  const suffix = marker ? ` —~~~~ ${marker}` : " —~~~~";
+  const suffix = marker ? ` ~~~~ ${marker}` : " ~~~~";
   const nextLevel = currentIndentLevel + 1;
 
   // 3. 缩进等级超过 8 则使用 Outdent 重置为 0
