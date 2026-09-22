@@ -797,7 +797,7 @@ export async function processReviewRequest(
 
   // 6. 确定结果名称 name
   let resultName = fixedArticleTitle;
-  let resultpageParam = "";
+  let resultpageParam = resultName;
 
   if (namespace === 2) {
     resultName = await inferIntendedArticleName(
