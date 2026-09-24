@@ -27,6 +27,7 @@ describe("Database migrations and schema management", () => {
       "20260920000001",
       "20260920000002",
       "20260920000003",
+      "20260924000000",
     ]);
   });
 
@@ -34,7 +35,7 @@ describe("Database migrations and schema management", () => {
     const db = openDb(":memory:");
     const secondRun = runMigrations(db);
     expect(secondRun.applied).toEqual([]);
-    expect(secondRun.currentVersion).toBe("20260920000003");
+    expect(secondRun.currentVersion).toBe("20260924000000");
   });
 
   it("applies migrations incrementally to an older database", () => {
@@ -62,6 +63,7 @@ describe("Database migrations and schema management", () => {
       "20260920000001",
       "20260920000002",
       "20260920000003",
+      "20260924000000",
     ]);
 
     // Now events table has input_tokens, output_tokens, model columns

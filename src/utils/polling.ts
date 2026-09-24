@@ -7,6 +7,9 @@ export type RecentChange = {
   title: string;
   user: string;
   revid: number;
+  old_revid?: number;
+  oldlen?: number;
+  newlen?: number;
   timestamp: string;
   bot?: boolean;
   rcid: number;
@@ -41,7 +44,7 @@ export async function fetchRecentChanges(
       ...(title ? { rctitle: title } : {}),
       ...(namespaces ? { rcnamespace: namespaces.join("|") } : {}),
       rctype: "edit|new",
-      rcprop: "title|ids|user|timestamp|flags",
+      rcprop: "title|ids|user|timestamp|flags|sizes",
       rcdir: "newer",
       rcstart: start,
       rcend: end,

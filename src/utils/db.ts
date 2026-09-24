@@ -17,6 +17,7 @@ export type Migration = {
  * - 20260123000000: 初始建表（events, checkpoint, messages, review_*, ai_*, publication）
  * - 20260920000001: events 表新增 input_tokens, output_tokens, model 字段
  * - 20260920000002: 新增 error_logs 错误日志表
+ * - 20260924000000: checkpoint 表新增 last_revid 字段
  */
 export const MIGRATIONS: Migration[] = [
   {
@@ -160,6 +161,20 @@ export const MIGRATIONS: Migration[] = [
         CREATE INDEX IF NOT EXISTS idx_review_requests_actor_day ON review_requests(actor_id, utc_day, status);
         CREATE INDEX IF NOT EXISTS idx_review_requests_source_revid ON review_requests(source_revid);
       `);
+    },
+  },
+  {
+    version: "20260924000000",
+    name: "add_last_revid_to_checkpoint",
+    up: (db) => {
+      const tableInfo = db.prepare("PRAGMA table_info(checkpoint)").all() as {
+        name: string;
+      }[];
+      const columnNames = new Set(tableInfo.map((col) => col.name));
+
+      if (!columnNames.has("last_revid")) {
+        db.exec("ALTER TABLE checkpoint ADD COLUMN last_revid INTEGER;");
+      }
     },
   },
 ];

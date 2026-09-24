@@ -86,16 +86,18 @@ if (cfg.writeEnabled) {
 const seen = db.prepare(EVENT_SEEN_SQL);
 const save = db.prepare(EVENT_SAVE_SQL);
 const mark = db.prepare(
-  "INSERT OR REPLACE INTO checkpoint(name,event_id,timestamp) VALUES(?,?,?)",
+  "INSERT OR REPLACE INTO checkpoint(name,event_id,timestamp,last_revid) VALUES(?,?,?,?)",
 );
 const checkpoint = db.prepare(
-  "SELECT event_id,timestamp FROM checkpoint WHERE name=?",
+  "SELECT event_id,timestamp,last_revid FROM checkpoint WHERE name=?",
 );
 
 const streamKey = `stream:${cfg.events.streamUrl}:${cfg.wiki.wikiId ?? "default"}`;
-let lastEventId = (
-  checkpoint.get(streamKey) as { event_id?: string } | undefined
-)?.event_id;
+const initialCheckpoint = checkpoint.get(streamKey) as
+  { event_id?: string; timestamp?: string; last_revid?: number } | undefined;
+let lastEventId = initialCheckpoint?.event_id;
+let lastRevid = initialCheckpoint?.last_revid;
+let checkpointTimestamp = initialCheckpoint?.timestamp;
 
 /** 串行任务调度队列 */
 let queue = Promise.resolve();
@@ -133,9 +135,101 @@ function touch() {
 // -------------------------------------------------------------
 if (cfg.events.mode === "eventstream") {
   let prevSource: EventSource | null = null;
+  const RETRY_DELAYS = [10, 30, 60, 120, 300];
+  let errorTimer: NodeJS.Timeout | null = null;
+  let failCount = 0;
+
+  const request = (params: Record<string, string | number>) =>
+    bot.request(params);
+
+  const compensateMissingEdits = async (
+    startRevid: number,
+    startTimestamp?: string,
+  ) => {
+    let start = startTimestamp
+      ? pollingStart(startTimestamp, cfg.events.overlapSeconds)
+      : undefined;
+
+    if (!start) {
+      try {
+        const res = await bot.request({
+          action: "query",
+          prop: "revisions",
+          revids: startRevid,
+          rvprop: "timestamp",
+          formatversion: 2,
+        });
+        const revTimestamp = res.query?.pages?.[0]?.revisions?.[0]?.timestamp;
+        if (revTimestamp) {
+          start = pollingStart(revTimestamp, cfg.events.overlapSeconds);
+        }
+      } catch {
+        // fallback
+      }
+    }
+    if (!start) {
+      start = new Date(Date.now() - 3600_000).toISOString();
+    }
+    const end = new Date().toISOString();
+
+    log.info(
+      { startRevid, start, end },
+      "compensating missing edits via recentchanges",
+    );
+
+    const changes = await fetchRecentChanges(request, undefined, start, end);
+
+    let count = 0;
+    for (const rc of changes) {
+      // 1. 过滤 bot 编辑
+      if (rc.bot) {
+        continue;
+      }
+      // 2. 仅对 last revid 之后的编辑进行补偿
+      if (rc.revid <= startRevid) {
+        continue;
+      }
+
+      // 3. 补偿时向上游提供的数据结构和实时推送一样
+      const changeEvent: ChangeEvent = {
+        wiki: cfg.wiki.wikiId,
+        type: rc.type,
+        title: rc.title,
+        namespace: rc.ns,
+        bot: rc.bot,
+        user: rc.user,
+        revision: { new: rc.revid },
+        length:
+          rc.oldlen !== undefined && rc.newlen !== undefined
+            ? { old: rc.oldlen, new: rc.newlen }
+            : undefined,
+      };
+
+      await handle(changeEvent, handlerContext);
+
+      count++;
+      if (rc.revid > (lastRevid ?? 0)) {
+        lastRevid = rc.revid;
+      }
+      checkpointTimestamp = new Date().toISOString();
+      mark.run(
+        streamKey,
+        lastEventId ?? null,
+        checkpointTimestamp,
+        lastRevid ?? null,
+      );
+    }
+
+    log.info({ count, lastRevid }, "compensation completed");
+  };
+
   const createSource = () => {
     if (prevSource !== null) {
-      prevSource.close();
+      try {
+        prevSource.close();
+      } catch {
+        // ignore
+      }
     }
     const source = new EventSource(cfg.events.streamUrl, {
       fetch: (input, init) =>
@@ -147,15 +241,26 @@ if (cfg.events.mode === "eventstream") {
           },
         }),
     });
+
     source.addEventListener("message", (event) => {
       queue = queue.then(async () => {
         try {
           touch();
-          await handle(JSON.parse(event.data) as ChangeEvent, handlerContext);
+          const data = JSON.parse(event.data) as ChangeEvent;
+          await handle(data, handlerContext);
+          if (data.revision?.new) {
+            lastRevid = data.revision.new;
+          }
           if (event.lastEventId) {
             lastEventId = event.lastEventId;
-            mark.run(streamKey, lastEventId, new Date().toISOString());
           }
+          checkpointTimestamp = new Date().toISOString();
+          mark.run(
+            streamKey,
+            lastEventId ?? null,
+            checkpointTimestamp,
+            lastRevid ?? null,
+          );
         } catch (error) {
           log.error(
             { err: error },
@@ -166,30 +271,74 @@ if (cfg.events.mode === "eventstream") {
         }
       });
     });
-    source.addEventListener("error", (error) =>
+
+    source.addEventListener("error", (error) => {
       log.warn(
         { err: error },
-        "stream disconnected; EventSource will reconnect",
-      ),
-    );
+        "stream disconnected; EventSource encountered error",
+      );
+
+      if (errorTimer) {
+        clearTimeout(errorTimer);
+        errorTimer = null;
+      }
+      const delaySec =
+        RETRY_DELAYS[Math.min(failCount, RETRY_DELAYS.length - 1)];
+      failCount++;
+
+      log.warn(
+        { delaySec, failCount },
+        `EventSource error; waiting ${delaySec}s before forcing reconnect`,
+      );
+
+      errorTimer = setTimeout(() => {
+        errorTimer = null;
+        log.warn(
+          { delaySec },
+          "EventSource did not open within timeout; forcing reconnect",
+        );
+        if (prevSource) {
+          try {
+            prevSource.close();
+          } catch {
+            // ignore
+          }
+          prevSource = null;
+        }
+        createSource();
+      }, delaySec * 1000);
+    });
+
     source.addEventListener("open", () => {
       touch();
       log.info({}, "stream connected; EventSource is open");
+
+      if (errorTimer) {
+        clearTimeout(errorTimer);
+        errorTimer = null;
+      }
+      failCount = 0;
+
+      if (lastRevid) {
+        const compensateFromRevid = lastRevid;
+        const compensateFromTime = checkpointTimestamp;
+        queue = queue.then(async () => {
+          try {
+            await compensateMissingEdits(
+              compensateFromRevid,
+              compensateFromTime,
+            );
+          } catch (err) {
+            log.error({ err }, "compensation during stream open failed");
+          }
+        });
+      }
     });
+
     prevSource = source;
   };
 
   createSource();
-  // watchdog: 如果 EventSource 5 分钟内没有收到任何事件，则认为可能卡死，强制重连
-  // FIXME 可能有错
-  // setInterval(() => {
-  //   const idleMs = Date.now() - lastActivityAt;
-
-  //   if (idleMs > IDLE_TIMEOUT) {
-  //     log.warn({ idleMs }, "EventSource appears stalled");
-  //     createSource();
-  //   }
-  // }, 30_000);
 } else {
   const request = (params: Record<string, string | number>) =>
     bot.request(params);
@@ -203,7 +352,7 @@ if (cfg.events.mode === "eventstream") {
     const previous = (checkpoint.get(key) as { timestamp?: string } | undefined)
       ?.timestamp;
     if (!previous) {
-      mark.run(key, null, end); // 首次启动建立基准位点，不补回历史留言
+      mark.run(key, null, end, null); // 首次启动建立基准位点，不补回历史留言
       return;
     }
     const changes = await fetchRecentChanges(
@@ -230,7 +379,7 @@ if (cfg.events.mode === "eventstream") {
         handlerContext,
       );
     }
-    mark.run(key, null, end); // 整批变更全部成功后再提交位点
+    mark.run(key, null, end, null); // 整批变更全部成功后再提交位点
   };
 
   const tick = async () => {
