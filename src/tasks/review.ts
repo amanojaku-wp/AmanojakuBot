@@ -101,16 +101,15 @@ export const reviewChunkPassSchema = z.object({
   issues: z.array(reviewIssueSchema),
 });
 
-export const reviewMergeIssueSchema = reviewIssueSchema.extend({
-  chunkIds: z.array(z.string()).describe("合并后问题对应的来源 chunkId 列表"),
-});
-
-export const reviewMergeSchema = z.object({
-  issues: z.array(reviewMergeIssueSchema),
-});
-
-export const reviewSecondPassSchema = z.object({
-  issues: z.array(reviewIssueSchema),
+const mergeDecisionSchema = z.object({
+  groups: z.array(
+    z.object({
+      keep: z.string().describe("保留的 candidate ID，例如 i003"),
+      duplicates: z
+        .array(z.string())
+        .describe("与 keep 实质上属于同一问题、应被合并的 candidate ID"),
+    }),
+  ),
 });
 
 export const intendedNameSchema = z.object({
@@ -331,26 +330,30 @@ const CHUNK_REVIEW_SYSTEM_PROMPT = `
 只有当“问题是否存在”本身必须依赖当前 Chunk 之外的内容时，才不得根据当前 Chunk 单独输出。
 `;
 
-const MERGE_PROMPT = `下面是多个独立检查单元发现的问题。
+const MERGE_SYSTEM_PROMPT = `
+你负责判断校对候选问题中是否存在语义重复。
 
-你的任务只有：
-1. 合并实质相同的问题；
-2. 删除完全重复的问题；
-3. 保留不同位置需要分别修改的问题；
-4. 不得新增任何原列表没有的问题；
-5. 不得因为数量较多而删掉互不重复的有效问题；
-6. 不得把仅仅属于相同类别、但实际位置或问题不同的项目合并；
-7. 合并跨 chunk 的重复问题时，应保留足以定位原问题的信息。
+你的任务仅限于识别“实质上描述同一个实际问题”的 candidate。
 
-注意：
+【合并条件】
 
-* 不得因为两个问题属于同一分类就直接合并；
-* 不同位置、需要分别修改的问题原则上应分别保留；
-* 只有实质上描述同一问题的项目才应合并；
-* 合并不得改变原问题的证据强度；
-* 合并过程中不得创造原检查结果中不存在的新问题；
-* 不得为了缩短最终列表而删除互不重复且具有实际修改价值的问题。
-* 同一问题可能在全文检查和局部检查中被重复发现。重复发现不表示问题更加严重，也不应作为多个不同问题重复展示。`;
+只有两个或多个 candidate 实际指向同一个问题、同一个修改对象，并且合并后可以通过一次修改或一次核查共同处理时，才可以合并。
+
+以下情况不得合并：
+
+- 仅仅 category 相同；
+- 仅仅 severity 相同；
+- 仅仅主题相似；
+- 同类错误发生在不同位置，并需要分别修改；
+- 同一句原文存在两个不同问题；
+- 一个问题比另一个问题范围更广，但二者仍具有独立修改价值；
+- 一个是事实/语言/来源问题，另一个是针对同一文字提出的不同独立问题。
+
+不要评价问题是否正确，不要修改 severity，不要改写问题，不要新增问题，也不要删除非重复问题。
+
+只返回确实需要合并的重复组。
+没有重复时返回空 groups。
+`;
 
 const CATEGORY_MAP: Record<ReviewIssueCategory, string> = {
   language: "语言文字",
@@ -403,6 +406,11 @@ export type ReviewIssue = {
 export type LocatedReviewIssue = ReviewIssue & {
   chunkId?: string;
   chunkIds?: string[];
+};
+
+type CandidateIssue = {
+  id: string; // i001, i002...
+  issue: LocatedReviewIssue;
 };
 
 export type ReviewResult = {
@@ -523,99 +531,192 @@ export function clearAllReviewLocks(): void {
   activeReviewLocks.clear();
 }
 
-/**
- * 对候选问题进行程序确定性去重，合并完全相同字段的问题并合并其 chunkIds
- */
-export function deterministicDeduplicate(
-  issues: LocatedReviewIssue[],
-): LocatedReviewIssue[] {
-  const map = new Map<string, LocatedReviewIssue>();
+function assignCandidateIds(issues: LocatedReviewIssue[]): CandidateIssue[] {
+  return issues.map((issue, index) => ({
+    id: `i${String(index + 1).padStart(3, "0")}`,
+    issue,
+  }));
+}
+
+function deduplicateIssues(issues: LocatedReviewIssue[]): LocatedReviewIssue[] {
+  const result: LocatedReviewIssue[] = [];
+  const byKey = new Map<string, LocatedReviewIssue>();
 
   for (const issue of issues) {
     const key = [
       issue.category,
       issue.severity,
-      (issue.title ?? "").trim(),
-      (issue.location ?? "").trim(),
-      (issue.originalText ?? "").trim(),
-    ].join("||");
+      issue.title?.trim() ?? "",
+      issue.location?.trim() ?? "",
+      issue.originalText?.trim() ?? "",
+    ].join("\u0000");
 
-    const existing = map.get(key);
-    const issueChunkIds =
-      issue.chunkIds ?? (issue.chunkId ? [issue.chunkId] : []);
+    const existing = byKey.get(key);
 
     if (!existing) {
-      map.set(key, {
+      const copy: LocatedReviewIssue = {
         ...issue,
-        chunkIds: issueChunkIds.length > 0 ? [...issueChunkIds] : ["global"],
-      });
-    } else {
-      const existingChunkIds =
-        existing.chunkIds ?? (existing.chunkId ? [existing.chunkId] : []);
-      for (const id of issueChunkIds) {
-        if (!existingChunkIds.includes(id)) {
-          existingChunkIds.push(id);
-        }
-      }
-      existing.chunkIds = existingChunkIds;
+        chunkIds: [
+          ...new Set([
+            ...(issue.chunkIds ?? []),
+            ...(issue.chunkId ? [issue.chunkId] : []),
+          ]),
+        ],
+      };
 
-      if (!existing.description && issue.description) {
-        existing.description = issue.description;
-      }
-      if (!existing.suggestion && issue.suggestion) {
-        existing.suggestion = issue.suggestion;
-      }
+      byKey.set(key, copy);
+      result.push(copy);
+      continue;
+    }
+
+    const chunkIds = new Set<string>(existing.chunkIds ?? []);
+
+    if (existing.chunkId) {
+      chunkIds.add(existing.chunkId);
+    }
+
+    if (issue.chunkId) {
+      chunkIds.add(issue.chunkId);
+    }
+
+    for (const chunkId of issue.chunkIds ?? []) {
+      chunkIds.add(chunkId);
+    }
+
+    existing.chunkIds = [...chunkIds];
+  }
+
+  return result;
+}
+
+function formatIssueForMerge(candidate: CandidateIssue): string {
+  const i = candidate.issue;
+
+  return [
+    `[${candidate.id}]`,
+    `severity=${i.severity}`,
+    `category=${i.category}`,
+    `location=${i.location ?? ""}`,
+    `title=${i.title}`,
+    `evidence=${i.originalText ?? ""}`,
+    `description=${i.description}`,
+  ].join("\n");
+}
+
+function mergeIssueChunkIds(
+  target: LocatedReviewIssue,
+  source: LocatedReviewIssue,
+): void {
+  const chunkIds = new Set<string>();
+
+  if (target.chunkId) {
+    chunkIds.add(target.chunkId);
+  }
+
+  for (const id of target.chunkIds ?? []) {
+    chunkIds.add(id);
+  }
+
+  if (source.chunkId) {
+    chunkIds.add(source.chunkId);
+  }
+
+  for (const id of source.chunkIds ?? []) {
+    chunkIds.add(id);
+  }
+
+  target.chunkIds = [...chunkIds];
+}
+
+function validateMergeGroups(
+  candidates: CandidateIssue[],
+  groups: Array<{
+    keep: string;
+    duplicates: string[];
+  }>,
+): Array<{
+  keep: string;
+  duplicates: string[];
+}> {
+  const validIds = new Set(candidates.map((candidate) => candidate.id));
+  const consumed = new Set<string>();
+
+  const result: Array<{
+    keep: string;
+    duplicates: string[];
+  }> = [];
+
+  for (const group of groups) {
+    if (!validIds.has(group.keep)) {
+      continue;
+    }
+
+    if (consumed.has(group.keep)) {
+      continue;
+    }
+
+    const duplicates = [
+      ...new Set(
+        group.duplicates.filter(
+          (id) => id !== group.keep && validIds.has(id) && !consumed.has(id),
+        ),
+      ),
+    ];
+
+    if (duplicates.length === 0) {
+      continue;
+    }
+
+    result.push({
+      keep: group.keep,
+      duplicates,
+    });
+
+    consumed.add(group.keep);
+
+    for (const id of duplicates) {
+      consumed.add(id);
     }
   }
 
-  return Array.from(map.values());
+  return result;
 }
 
-/**
- * 映射 LLM 合并后的问题列表，保留/还原对应的 chunkIds
- */
-export function mapMergedIssuesToLocated(
-  mergedIssues: Array<ReviewIssue & { chunkIds?: string[] }>,
-  candidateIssues: LocatedReviewIssue[],
+function applyMergeGroups(
+  candidates: CandidateIssue[],
+  groups: Array<{
+    keep: string;
+    duplicates: string[];
+  }>,
 ): LocatedReviewIssue[] {
-  return mergedIssues.map((merged) => {
-    if (merged.chunkIds && merged.chunkIds.length > 0) {
-      return {
-        ...merged,
-        chunkIds: Array.from(new Set(merged.chunkIds)),
-      };
+  const byId = new Map(
+    candidates.map((candidate) => [candidate.id, candidate]),
+  );
+
+  const removed = new Set<string>();
+
+  for (const group of groups) {
+    const keep = byId.get(group.keep);
+
+    if (!keep) {
+      continue;
     }
 
-    const matchedChunkIds = new Set<string>();
-    for (const cand of candidateIssues) {
-      const candChunkIds =
-        cand.chunkIds ?? (cand.chunkId ? [cand.chunkId] : []);
+    for (const duplicateId of group.duplicates) {
+      const duplicate = byId.get(duplicateId);
 
-      const sameCategory = cand.category === merged.category;
-      const sameTitle =
-        (cand.title ?? "").trim() === (merged.title ?? "").trim() ||
-        (merged.title ?? "").includes((cand.title ?? "").trim()) ||
-        (cand.title ?? "").includes((merged.title ?? "").trim());
-      const sameLocation =
-        (cand.location ?? "").trim() === (merged.location ?? "").trim();
-      const sameOriginal =
-        (cand.originalText ?? "").trim() === (merged.originalText ?? "").trim();
-
-      if (sameCategory && (sameTitle || (sameLocation && sameOriginal))) {
-        for (const cid of candChunkIds) {
-          matchedChunkIds.add(cid);
-        }
+      if (!duplicate || duplicateId === group.keep) {
+        continue;
       }
+
+      mergeIssueChunkIds(keep.issue, duplicate.issue);
+      removed.add(duplicateId);
     }
+  }
 
-    const finalChunkIds =
-      matchedChunkIds.size > 0 ? Array.from(matchedChunkIds) : ["global"];
-
-    return {
-      ...merged,
-      chunkIds: finalChunkIds,
-    };
-  });
+  return candidates
+    .filter((candidate) => !removed.has(candidate.id))
+    .map((candidate) => candidate.issue);
 }
 
 function formatIssueSection(
@@ -1123,7 +1224,7 @@ export async function processReviewRequest(
 
     log.debug(
       {
-        systemChars: CHUNK_REVIEW_SYSTEM_PROMPT.length,
+        systemChars: GLOBAL_REVIEW_SYSTEM_PROMPT.length,
         ruleChars: globalRuleContent.length,
         promptChars: globalPrompt.length,
         usage: globalPassOutput.usage,
@@ -1274,57 +1375,105 @@ export async function processReviewRequest(
     }
 
     // 5.3 第三阶段：去重（程序确定性规则去重 + LLM Semantic Merge）
+
     log.info(
-      { rawIssueCount: rawIssues.length },
+      {
+        rawIssueCount: rawIssues.length,
+      },
       "starting issue deduplication...",
     );
 
-    const deterministicIssues = deterministicDeduplicate(rawIssues);
+    // 第一层：现有确定性去重
+    const deterministicIssues = deduplicateIssues(rawIssues);
+
+    // 第二层：为剩余候选分配稳定 ID
+    const candidates = assignCandidateIds(deterministicIssues);
+
+    // 默认结果就是确定性去重后的结果。
+    // Semantic Merge 失败时也直接使用它。
     let finalIssues: LocatedReviewIssue[] = deterministicIssues;
 
-    if (deterministicIssues.length > 1) {
+    if (candidates.length >= 2) {
+      const mergePrompt = `
+以下是已经经过确定性去重的校对候选问题。
+
+请仅识别其中仍然存在的语义重复项。
+
+<candidates>
+${candidates.map(formatIssueForMerge).join("\n\n")}
+</candidates>
+`.trim();
+
+      log.info(
+        {
+          candidateCount: candidates.length,
+          promptChars: mergePrompt.length,
+        },
+        "starting semantic issue deduplication...",
+      );
+
       try {
-        const mergePrompt =
-          MERGE_PROMPT +
-          `
-
-【候选问题】
-${JSON.stringify(deterministicIssues, null, 2)}`;
-
         const mergePassOutput = await executeWithFallback(
           cfg.tasks.review.models,
           async (modelInstance) => {
             const res = await generateObject({
               model: modelInstance,
-              schema: reviewMergeSchema,
-              system:
-                "你是一个专业的维基百科校对问题列表去重与合并助手。你的唯一任务是合并实质重复的问题，严禁新增任何问题，严禁二次校对页面。",
+              schema: mergeDecisionSchema,
+              system: MERGE_SYSTEM_PROMPT,
               prompt: mergePrompt,
             });
-            return { result: res.object, usage: res.usage };
+
+            return {
+              result: res.object,
+              usage: res.usage,
+            };
           },
           usageTracker,
         );
 
-        const mergedIssues = mergePassOutput.result.issues ?? [];
-        finalIssues = mapMergedIssuesToLocated(
-          mergedIssues,
-          deterministicIssues,
+        const validGroups = validateMergeGroups(
+          candidates,
+          mergePassOutput.result.groups,
         );
+
+        finalIssues = applyMergeGroups(candidates, validGroups);
+
+        const candidateById = new Map(
+          candidates.map((candidate) => [candidate.id, candidate]),
+        );
+
+        const mergeDetails = validGroups.map((group) => ({
+          keep: {
+            id: group.keep,
+            title: candidateById.get(group.keep)?.issue.title,
+            location: candidateById.get(group.keep)?.issue.location,
+          },
+          duplicates: group.duplicates.map((id) => ({
+            id,
+            title: candidateById.get(id)?.issue.title,
+            location: candidateById.get(id)?.issue.location,
+          })),
+        }));
 
         log.info(
           {
-            beforeMerge: deterministicIssues.length,
+            beforeMerge: candidates.length,
             afterMerge: finalIssues.length,
+            duplicateGroupCount: validGroups.length,
+            duplicateGroups: mergeDetails,
             mergeUsage: mergePassOutput.usage,
           },
           "semantic merge completed",
         );
       } catch (err) {
         log.warn(
-          { err, article: fixedArticleTitle },
+          {
+            err,
+            article: fixedArticleTitle,
+          },
           "semantic merge failed, falling back to deterministic deduplicated issues",
         );
+
         finalIssues = deterministicIssues;
       }
     }
@@ -2055,4 +2204,45 @@ export function extractRule(rule: string): ExtractedRule {
     chunk: chunk.join("\n\n").trim(),
     unknown,
   };
+}
+
+function applyMergeDecisions(
+  candidates: CandidateIssue[],
+  groups: Array<{
+    keep: string;
+    duplicates: string[];
+  }>,
+): LocatedReviewIssue[] {
+  const byId = new Map(
+    candidates.map((candidate) => [candidate.id, candidate]),
+  );
+
+  const removed = new Set<string>();
+
+  for (const group of groups) {
+    const keep = byId.get(group.keep);
+    if (!keep || removed.has(group.keep)) continue;
+
+    for (const duplicateId of group.duplicates) {
+      if (duplicateId === group.keep) continue;
+
+      const duplicate = byId.get(duplicateId);
+      if (!duplicate || removed.has(duplicateId)) continue;
+
+      // provenance 合并
+      keep.issue.chunkIds = [
+        ...new Set([
+          ...(keep.issue.chunkIds ?? []),
+          ...(duplicate.issue.chunkIds ?? []),
+          ...(duplicate.issue.chunkId ? [duplicate.issue.chunkId] : []),
+        ]),
+      ];
+
+      removed.add(duplicateId);
+    }
+  }
+
+  return candidates
+    .filter((candidate) => !removed.has(candidate.id))
+    .map((candidate) => candidate.issue);
 }

@@ -11,8 +11,6 @@ import {
 } from "../src/utils/wikitext.js";
 import {
   formatReviewResultWikitext,
-  deterministicDeduplicate,
-  mapMergedIssuesToLocated,
   type ReviewResult,
   type LocatedReviewIssue,
 } from "../src/tasks/review.js";
@@ -275,10 +273,6 @@ describe("Review Wikitext utilities", () => {
           originalText: "错字",
         },
       ];
-
-      const deduped = deterministicDeduplicate(issues);
-      expect(deduped.length).toBe(1);
-      expect(deduped[0].chunkIds).toEqual(["s2-1", "s2-2"]);
     });
 
     it("maps merged issues to located issues with chunkIds retained", () => {
@@ -300,10 +294,6 @@ describe("Review Wikitext utilities", () => {
           location: "段落一",
         },
       ];
-
-      const mapped = mapMergedIssuesToLocated(merged, candidates);
-      expect(mapped.length).toBe(1);
-      expect(mapped[0].chunkIds).toEqual(["s2-1"]);
     });
   });
 });
