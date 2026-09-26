@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import type { DatabaseSync } from "node:sqlite";
 import type { Mwn } from "mwn";
 import type { Logger } from "pino";
 import { generateObject } from "ai";
@@ -16,6 +16,7 @@ import {
   type LlmModelSpec,
   type TokenUsage,
 } from "../utils/llm.js";
+import { runInTransaction } from "../utils/db.js";
 import type {
   ChangeEvent,
   HandlerContext,
@@ -171,7 +172,7 @@ function monthPage(prefix: string, date: string) {
  * @param cfg - 任务三配置对象
  */
 export async function analyzeCandidate(
-  db: Database.Database,
+  db: DatabaseSync,
   bot: Mwn,
   c: Candidate,
   cfg: AiConfig,
@@ -245,7 +246,7 @@ export async function analyzeCandidate(
   );
 
   // 步骤 8：开启事务记录分析历史，并在满足置信度与严格原文摘录匹配时写入线索表
-  db.transaction(() => {
+  runInTransaction(db, () => {
     db.prepare(
       "INSERT OR IGNORE INTO ai_analyzed(revid,window_start) VALUES(?,?)",
     ).run(c.revid, window);
@@ -270,7 +271,7 @@ export async function analyzeCandidate(
         window,
         new Date().toISOString(),
       );
-  })();
+  });
 
   log?.info(
     { revid: c.revid, user: c.user, usage },
@@ -301,7 +302,7 @@ export async function analyzeCandidate(
  */
 async function appendOnce(
   bot: Mwn,
-  db: Database.Database,
+  db: DatabaseSync,
   page: string,
   marker: string,
   body: string,
@@ -387,7 +388,7 @@ async function appendOnce(
  * @param canWrite - 链上控制检查异步回调
  */
 export async function publishReports(
-  db: Database.Database,
+  db: DatabaseSync,
   bot: Mwn,
   cfg: AiConfig,
   canWrite: () => Promise<boolean>,

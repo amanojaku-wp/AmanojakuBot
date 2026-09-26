@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { Mwn } from "mwn";
 import type { Logger } from "pino";
 import type { AppConfig } from "./config/index.js";
@@ -25,13 +25,13 @@ export type ChangeEvent = {
  * 路由处理器依赖上下文
  */
 export type HandlerContext = {
-  db: Database.Database;
+  db: DatabaseSync;
   bot: Mwn;
   cfg: AppConfig;
   log: Logger;
   canWrite: () => Promise<boolean>;
-  seenStatement?: Database.Statement;
-  saveStatement?: Database.Statement;
+  seenStatement?: StatementSync;
+  saveStatement?: StatementSync;
 };
 
 /**

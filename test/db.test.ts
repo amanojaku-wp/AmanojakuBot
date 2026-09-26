@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import {
   openDb,
   runMigrations,
@@ -39,7 +39,7 @@ describe("Database migrations and schema management", () => {
   });
 
   it("applies migrations incrementally to an older database", () => {
-    const db = new Database(":memory:");
+    const db = new DatabaseSync(":memory:");
     // Manually apply first migration only
     MIGRATIONS[0].up(db);
     db.exec(`

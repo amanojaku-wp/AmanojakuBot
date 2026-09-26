@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import type { DatabaseSync } from "node:sqlite";
 import type { Mwn } from "mwn";
 import { generateText, stepCountIs } from "ai";
 import { pageText, revision } from "../utils/wiki.js";
@@ -21,7 +21,7 @@ import {
   type LlmModelSpec,
   type TokenUsage,
 } from "../utils/llm.js";
-import { EVENT_SAVE_SQL, EVENT_SEEN_SQL } from "../utils/db.js";
+import { EVENT_SAVE_SQL, EVENT_SEEN_SQL, runInTransaction } from "../utils/db.js";
 import type {
   ChangeEvent,
   HandlerContext,
@@ -304,7 +304,7 @@ export const chatHandler: TaskHandler = async (
     };
   });
 
-  db.transaction(() => {
+  runInTransaction(db, () => {
     save.run(
       revid,
       "done",
@@ -320,7 +320,7 @@ export const chatHandler: TaskHandler = async (
     db.prepare(
       "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'assistant',?,datetime('now'))",
     ).run(rev.actorId, revid, reply);
-  })();
+  });
   log.info({ revid, usage, model }, "chat replied");
 
   return { intercepted: true };
@@ -336,7 +336,7 @@ export const chatHandler: TaskHandler = async (
  * 4. 调用 LLM 生成客观、简短的回复。
  */
 export async function prepareChatReply(
-  db: Database.Database,
+  db: DatabaseSync,
   bot: Mwn,
   actorId: number,
   actorName: string,

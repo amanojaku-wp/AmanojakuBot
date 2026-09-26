@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 
 /**
  * 数据库 Migration 接口定义
@@ -7,7 +7,7 @@ export type Migration = {
   /** 格式如 20260123000000 的版本字符串，用于按升序依次应用 */
   version: string;
   name: string;
-  up: (db: Database.Database) => void;
+  up: (db: DatabaseSync) => void;
 };
 
 /**
@@ -179,11 +179,49 @@ export const MIGRATIONS: Migration[] = [
   },
 ];
 
+let savepointCounter = 0;
+
+/**
+ * 在 SQLite 事务中执行操作函数，失败时自动 ROLLBACK，支持嵌套事务（Savepoint）
+ */
+export function runInTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  if (db.isTransaction) {
+    const sp = `sp_${++savepointCounter}`;
+    db.exec(`SAVEPOINT ${sp}`);
+    try {
+      const result = fn();
+      db.exec(`RELEASE SAVEPOINT ${sp}`);
+      return result;
+    } catch (err) {
+      try {
+        db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+      } catch {
+        // 忽略回滚异常
+      }
+      throw err;
+    }
+  }
+
+  db.exec("BEGIN");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // 忽略回滚异常
+    }
+    throw err;
+  }
+}
+
 /**
  * 运行数据库迁移，记录已应用版本至 schema_migrations 表
  */
 export function runMigrations(
-  db: Database.Database,
+  db: DatabaseSync,
   migrations = MIGRATIONS,
 ): { applied: string[]; currentVersion: string | null } {
   db.exec(`
@@ -210,10 +248,10 @@ export function runMigrations(
 
   for (const m of sorted) {
     if (!appliedSet.has(m.version)) {
-      db.transaction(() => {
+      runInTransaction(db, () => {
         m.up(db);
         recordMigration.run(m.version, m.name);
-      })();
+      });
       newlyApplied.push(m.version);
     }
   }
@@ -233,7 +271,7 @@ export function runMigrations(
 /**
  * 获取当前数据库的 schema 版本
  */
-export function getSchemaVersion(db: Database.Database): string | null {
+export function getSchemaVersion(db: DatabaseSync): string | null {
   try {
     const row = db
       .prepare(
@@ -250,7 +288,7 @@ export function getSchemaVersion(db: Database.Database): string | null {
  * 获取所有已应用的迁移记录列表
  */
 export function getAppliedMigrations(
-  db: Database.Database,
+  db: DatabaseSync,
 ): { version: string; name: string; applied_at: string }[] {
   try {
     return db
@@ -276,7 +314,7 @@ export type ErrorLogEntry = {
 /**
  * 将错误日志记录到数据库 error_logs 表
  */
-export function recordError(db: Database.Database, entry: ErrorLogEntry): void {
+export function recordError(db: DatabaseSync, entry: ErrorLogEntry): void {
   try {
     const level = entry.level ?? "error";
     let errorName: string | null = null;
@@ -368,7 +406,7 @@ export type ReviewRequestRecord = {
  * 查询指定用户在特定 UTC 自然日内已成功完成的校对请求数量
  */
 export function countDailyCompletedReviews(
-  db: Database.Database,
+  db: DatabaseSync,
   actorId: number,
   utcDay: string,
 ): number {
@@ -384,7 +422,7 @@ export function countDailyCompletedReviews(
  * 保存或更新校对请求记录（基于 source_revid 唯一约束）
  */
 export function saveReviewRequest(
-  db: Database.Database,
+  db: DatabaseSync,
   record: ReviewRequestRecord,
 ): void {
   db.prepare(
@@ -440,7 +478,7 @@ export function saveReviewRequest(
  * 根据 source_revid 获取校对请求记录
  */
 export function getReviewRequest(
-  db: Database.Database,
+  db: DatabaseSync,
   sourceRevid: number,
 ): ReviewRequestRecord | undefined {
   return db
@@ -470,9 +508,9 @@ export function getReviewRequest(
  * 10. `error_logs`: 系统运行异常与错误日志记录表。
  * 11. `schema_migrations`: 数据库版本迁移追踪表。
  */
-export function openDb(path = "bot.sqlite"): Database.Database {
-  const db = new Database(path);
-  db.pragma("journal_mode = WAL");
+export function openDb(path = "bot.sqlite"): DatabaseSync {
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA journal_mode = WAL;");
   runMigrations(db);
   return db;
 }
