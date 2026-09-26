@@ -177,6 +177,39 @@ export const MIGRATIONS: Migration[] = [
       }
     },
   },
+  {
+    version: "20260926000000",
+    name: "create_afc_requests_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS afc_requests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_revid INTEGER NOT NULL UNIQUE,
+          actor_id INTEGER NOT NULL,
+          username TEXT NOT NULL,
+          article TEXT NOT NULL,
+          article_revid INTEGER,
+          status TEXT NOT NULL,
+          readiness TEXT,
+          result_name TEXT,
+          result_section TEXT,
+          result_page TEXT,
+          result_revid INTEGER,
+          reply_revid INTEGER,
+          utc_day TEXT NOT NULL,
+          afc_result_json TEXT,
+          error TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          model TEXT,
+          created_at TEXT NOT NULL,
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_afc_requests_actor_day ON afc_requests(actor_id, utc_day, status);
+        CREATE INDEX IF NOT EXISTS idx_afc_requests_source_revid ON afc_requests(source_revid);
+      `);
+    },
+  },
 ];
 
 let savepointCounter = 0;
@@ -484,6 +517,119 @@ export function getReviewRequest(
   return db
     .prepare("SELECT * FROM review_requests WHERE source_revid = ?")
     .get(sourceRevid) as ReviewRequestRecord | undefined;
+}
+
+/**
+ * 任务四：条目发布前评审请求记录结构
+ */
+export type AfcRequestRecord = {
+  id?: number;
+  source_revid: number;
+  actor_id: number;
+  username: string;
+  article: string;
+  article_revid?: number | null;
+  status: "pending" | "completed" | "rejected" | "failed";
+  readiness?: "not_ready" | "needs_work" | "appears_ready" | null;
+  result_name?: string | null;
+  result_section?: string | null;
+  result_page?: string | null;
+  result_revid?: number | null;
+  reply_revid?: number | null;
+  utc_day: string;
+  afc_result_json?: string | null;
+  error?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  model?: string | null;
+  created_at?: string;
+  completed_at?: string | null;
+};
+
+/**
+ * 查询指定用户在特定 UTC 自然日内已成功完成的发布前评审请求数量
+ */
+export function countDailyCompletedAfcReviews(
+  db: DatabaseSync,
+  actorId: number,
+  utcDay: string,
+): number {
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS count FROM afc_requests WHERE actor_id = ? AND utc_day = ? AND status = 'completed'",
+    )
+    .get(actorId, utcDay) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
+/**
+ * 保存或更新发布前评审请求记录（基于 source_revid 唯一约束）
+ */
+export function saveAfcRequest(
+  db: DatabaseSync,
+  record: AfcRequestRecord,
+): void {
+  db.prepare(
+    `INSERT INTO afc_requests (
+      source_revid, actor_id, username, article, article_revid, status,
+      readiness, result_name, result_section, result_page, result_revid, reply_revid,
+      utc_day, afc_result_json, error, input_tokens, output_tokens, model,
+      created_at, completed_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      datetime('now'), ?
+    ) ON CONFLICT(source_revid) DO UPDATE SET
+      article = excluded.article,
+      article_revid = COALESCE(excluded.article_revid, afc_requests.article_revid),
+      status = excluded.status,
+      readiness = COALESCE(excluded.readiness, afc_requests.readiness),
+      result_name = COALESCE(excluded.result_name, afc_requests.result_name),
+      result_section = COALESCE(excluded.result_section, afc_requests.result_section),
+      result_page = COALESCE(excluded.result_page, afc_requests.result_page),
+      result_revid = COALESCE(excluded.result_revid, afc_requests.result_revid),
+      reply_revid = COALESCE(excluded.reply_revid, afc_requests.reply_revid),
+      afc_result_json = COALESCE(excluded.afc_result_json, afc_requests.afc_result_json),
+      error = excluded.error,
+      input_tokens = COALESCE(excluded.input_tokens, afc_requests.input_tokens),
+      output_tokens = COALESCE(excluded.output_tokens, afc_requests.output_tokens),
+      model = COALESCE(excluded.model, afc_requests.model),
+      completed_at = COALESCE(excluded.completed_at, afc_requests.completed_at)`,
+  ).run(
+    record.source_revid,
+    record.actor_id,
+    record.username,
+    record.article,
+    record.article_revid ?? null,
+    record.status,
+    record.readiness ?? null,
+    record.result_name ?? null,
+    record.result_section ?? null,
+    record.result_page ?? null,
+    record.result_revid ?? null,
+    record.reply_revid ?? null,
+    record.utc_day,
+    record.afc_result_json ?? null,
+    record.error ?? null,
+    record.input_tokens ?? null,
+    record.output_tokens ?? null,
+    record.model ?? null,
+    record.completed_at ??
+      (record.status === "completed" ? new Date().toISOString() : null),
+  );
+}
+
+/**
+ * 根据 source_revid 获取发布前评审请求记录
+ */
+export function getAfcRequest(
+  db: DatabaseSync,
+  sourceRevid: number,
+): AfcRequestRecord | undefined {
+  return db
+    .prepare("SELECT * FROM afc_requests WHERE source_revid = ?")
+    .get(sourceRevid) as AfcRequestRecord | undefined;
 }
 
 /**

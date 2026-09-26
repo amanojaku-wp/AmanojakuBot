@@ -5,6 +5,7 @@ import type { AppConfig } from "./config/index.js";
 import { chatHandler } from "./tasks/chat.js";
 import { reviewHandler } from "./tasks/review.js";
 import { aiEditHandler } from "./tasks/aiEdit.js";
+import { afcHandler } from "./tasks/afc.js";
 import { recordError } from "./utils/db.js";
 
 /**
@@ -57,6 +58,7 @@ export const handlers: TaskHandler[] = [
   chatHandler,
   reviewHandler,
   aiEditHandler,
+  afcHandler,
 ];
 
 /**

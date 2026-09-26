@@ -10,6 +10,7 @@ import {
 import { createWiki, pageText } from "./utils/wiki.js";
 import { fetchRecentChanges, pollingStart } from "./utils/polling.js";
 import { cleanupBacklogReviews } from "./tasks/review.js";
+import { cleanupBacklogAfcs } from "./tasks/afc.js";
 import { publishReports } from "./tasks/aiEdit.js";
 import { handle, type ChangeEvent, type HandlerContext } from "./handle.js";
 
@@ -443,6 +444,21 @@ if (cfg.tasks.review.enabled) {
     setTimeout(runReviewCleanup, 3600_000);
   };
   void runReviewCleanup();
+}
+
+if (cfg.tasks.afc.enabled) {
+  const runAfcCleanup = async () => {
+    // 串行编排入全局任务队列，确保清理操作与事件处理互斥执行
+    queue = queue.then(() => cleanupBacklogAfcs(handlerContext));
+    try {
+      await queue;
+    } catch (error) {
+      log.error({ err: error }, "backlog afc cleanup failed");
+      queue = Promise.resolve();
+    }
+    setTimeout(runAfcCleanup, 3600_000);
+  };
+  void runAfcCleanup();
 }
 
 // -------------------------------------------------------------

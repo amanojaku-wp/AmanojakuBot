@@ -168,6 +168,36 @@ export const configSchema = z.object({
           maxAnalysesPerWindow: 20,
           minConfidence: 0.85,
         }),
+      /** 任务四：针对新手的条目发布前评审（AfC评审） */
+      afc: z
+        .object({
+          enabled: z.boolean().default(true),
+          talkPage: z
+            .string()
+            .regex(/^User talk:[^/]+(?:\/.+)?$/i)
+            .optional(),
+          rulePage: z
+            .string()
+            .regex(/^User:[^/]+\//i)
+            .optional(),
+          template: z.string().min(1).optional(),
+          draftNamespace: z
+            .union([
+              z.number().int().nonnegative(),
+              z.array(z.number().int().nonnegative()),
+            ])
+            .default([2, 118]),
+          /** 每个用户每个 UTC 自然日最多成功提交的发布前评审请求数量 */
+          userDailyLimit: z.number().int().min(1).default(50),
+          /** 兼容旧配置项 dailyLimit */
+          dailyLimit: z.number().int().min(1).optional(),
+          llm: llmConfigSchema.optional(),
+        })
+        .default({
+          enabled: true,
+          draftNamespace: [2, 118],
+          userDailyLimit: 50,
+        }),
     })
     .default({
       chat: { enabled: true },
@@ -177,6 +207,11 @@ export const configSchema = z.object({
         draftNamespace: 118,
         maxAnalysesPerWindow: 20,
         minConfidence: 0.85,
+      },
+      afc: {
+        enabled: true,
+        draftNamespace: [2, 118],
+        userDailyLimit: 50,
       },
     }),
   /** 写入使能总开关（兼容顶层定义） */
@@ -216,6 +251,20 @@ export function loadConfig(path = "config.yaml") {
   const reviewUserDailyLimit =
     parsed.tasks.review.userDailyLimit ?? parsed.tasks.review.dailyLimit ?? 5;
 
+  const afcTalkPage =
+    parsed.tasks.afc.talkPage ?? `User talk:${parsed.wiki.username}/afc`;
+  const afcRulePage =
+    parsed.tasks.afc.rulePage ?? `User:${parsed.wiki.username}/task/U4/rule`;
+  const afcTemplate =
+    parsed.tasks.afc.template ??
+    `User:${parsed.wiki.username}/template/ReviewRequest`;
+  const afcDraftNamespaceRaw = parsed.tasks.afc.draftNamespace;
+  const afcDraftNamespaces: number[] = Array.isArray(afcDraftNamespaceRaw)
+    ? afcDraftNamespaceRaw
+    : [afcDraftNamespaceRaw];
+  const afcUserDailyLimit =
+    parsed.tasks.afc.userDailyLimit ?? parsed.tasks.afc.dailyLimit ?? 50;
+
   // 校验归属权
   const isBotTalkPage = (p: string) => {
     const target = p.slice(10).replaceAll("_", " ").toLowerCase();
@@ -225,7 +274,13 @@ export function loadConfig(path = "config.yaml") {
   if (
     !isBotTalkPage(chatTalkPage) ||
     !isBotTalkPage(reviewTalkPage) ||
-    ![personaPage, parsed.wiki.controlPage, reviewRulePage].every((p) =>
+    !isBotTalkPage(afcTalkPage) ||
+    ![
+      personaPage,
+      parsed.wiki.controlPage,
+      reviewRulePage,
+      afcRulePage,
+    ].every((p) =>
       p
         .slice(5)
         .replaceAll("_", " ")
@@ -270,6 +325,7 @@ export function loadConfig(path = "config.yaml") {
   const chatModels = normalizeLlmConfig(parsed.tasks.chat.llm, globalLlm);
   const reviewModels = normalizeLlmConfig(parsed.tasks.review.llm, globalLlm);
   const aiEditModels = normalizeLlmConfig(parsed.tasks.aiEdit.llm, globalLlm);
+  const afcModels = normalizeLlmConfig(parsed.tasks.afc.llm, globalLlm);
 
   if (chatModels.length === 0 && parsed.tasks.chat.enabled) {
     throw new Error("No LLM configuration found for task: chat");
@@ -305,6 +361,15 @@ export function loadConfig(path = "config.yaml") {
       aiEdit: {
         ...parsed.tasks.aiEdit,
         models: aiEditModels,
+      },
+      afc: {
+        ...parsed.tasks.afc,
+        talkPage: afcTalkPage,
+        rulePage: afcRulePage,
+        template: afcTemplate,
+        draftNamespaces: afcDraftNamespaces,
+        userDailyLimit: afcUserDailyLimit,
+        models: afcModels,
       },
     },
   };
