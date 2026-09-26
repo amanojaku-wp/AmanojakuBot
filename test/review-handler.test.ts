@@ -2,7 +2,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Mwn } from "mwn";
 import pino, { type Logger } from "pino";
 import { openDb } from "../src/utils/db.js";
-import { reviewHandler } from "../src/tasks/review.js";
+import {
+  acquireReviewLock,
+  clearAllReviewLocks,
+  cleanupBacklogReviews,
+  isReviewLocked,
+  releaseReviewLock,
+  reviewHandler,
+} from "../src/tasks/review.js";
 import type { AppConfig } from "../src/config/index.js";
 import type { HandlerContext, ChangeEvent } from "../src/handle.js";
 
@@ -110,6 +117,7 @@ describe("Task 2 reviewHandler", () => {
   let canWriteMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    clearAllReviewLocks();
     db = openDb(":memory:");
     logger = pino({ level: "silent" }) as unknown as Logger;
     canWriteMock = vi.fn().mockResolvedValue(true);
@@ -1168,5 +1176,160 @@ describe("Task 2 reviewHandler", () => {
     expect(reqRow).toBeDefined();
     expect(reqRow.status).toBe("rejected");
     expect(reqRow.error).toBe("non_encyclopedic");
+  });
+
+  describe("review locking mechanism", () => {
+    it("manages lock acquisition, querying and release correctly", () => {
+      const talkPage = "User talk:AmanojakuBot/review";
+      const section = "== 请求校对：测试 ==";
+      const revid = 999;
+
+      expect(isReviewLocked(talkPage, section, revid)).toBe(false);
+
+      const acquired = acquireReviewLock(talkPage, section, revid, "测试");
+      expect(acquired).toBe(true);
+
+      // Subsequent attempt with same section or revid should be locked
+      expect(isReviewLocked(talkPage, section)).toBe(true);
+      expect(isReviewLocked(talkPage, "other section", revid)).toBe(true);
+      expect(acquireReviewLock(talkPage, section)).toBe(false);
+
+      releaseReviewLock(talkPage, section, revid);
+      expect(isReviewLocked(talkPage, section, revid)).toBe(false);
+    });
+
+    it("skips reviewHandler execution when request is already locked by another process", async () => {
+      const event: ChangeEvent = {
+        type: "edit",
+        title: "User talk:AmanojakuBot/review",
+        namespace: 3,
+        user: "Alice",
+        revision: { new: 201 },
+      };
+
+      const timestamp = "2026-09-20T12:00:00Z";
+      const afterContent = `== 请求校对 ==
+{{User:AmanojakuBot/template/ReviewRequest
+| article = 测试条目
+| status =
+}}
+校对请求--[[User:Alice|Alice]] 2026年9月20日 (日) 12:00 (UTC)`;
+
+      mockBot.request.mockImplementation((params: Record<string, unknown>) => {
+        if (params.revids === 201) {
+          return Promise.resolve({
+            query: {
+              pages: [
+                {
+                  revisions: [
+                    {
+                      revid: 201,
+                      user: "Alice",
+                      userid: 42,
+                      timestamp,
+                      slots: { main: { content: afterContent } },
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      // Manually acquire lock before handler runs
+      acquireReviewLock(cfg.tasks.review.talkPage, "请求校对", 201);
+
+      const ctx: HandlerContext = {
+        db,
+        bot: mockBot as unknown as Mwn,
+        cfg,
+        log: logger,
+        canWrite: canWriteMock,
+      };
+
+      const res = await reviewHandler(event, ctx);
+      expect(res?.intercepted).toBe(true);
+      // Because it was locked, bot.edit should NOT have been called
+      expect(mockBot.edit).not.toHaveBeenCalled();
+    });
+
+    it("skips cleanupBacklogReviews for sections currently locked", async () => {
+      const talkContent = `== 正在校对的章节 ==
+{{User:AmanojakuBot/template/ReviewRequest
+| article = 条目A
+| status =
+}}
+--[[User:Alice|Alice]] 2026年9月20日 (日) 12:00 (UTC)
+
+== 未锁定的章节 ==
+{{User:AmanojakuBot/template/ReviewRequest
+| article = 不存在的条目
+| status =
+}}
+--[[User:Alice|Alice]] 2026年9月20日 (日) 12:00 (UTC)`;
+
+      mockBot.read.mockImplementation((title: string) => {
+        if (title === cfg.tasks.review.talkPage) {
+          return Promise.resolve({ revisions: [{ content: talkContent }] });
+        }
+        return Promise.resolve({ revisions: [] });
+      });
+
+      mockBot.request.mockImplementation((params: Record<string, unknown>) => {
+        if (
+          params.action === "query" &&
+          params.prop === "revisions" &&
+          params.titles === cfg.tasks.review.talkPage
+        ) {
+          return Promise.resolve({
+            query: {
+              pages: [
+                {
+                  revisions: [
+                    {
+                      revid: 300,
+                      user: "Alice",
+                      userid: 42,
+                      timestamp: "2026-09-20T12:00:00Z",
+                      slots: { main: { content: talkContent } },
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        }
+        if (params.titles === "不存在的条目") {
+          return Promise.resolve({
+            query: {
+              pages: [{ title: "不存在的条目", missing: true }],
+            },
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      // Lock "正在校对的章节"
+      acquireReviewLock(cfg.tasks.review.talkPage, "正在校对的章节");
+
+      const ctx: HandlerContext = {
+        db,
+        bot: mockBot as unknown as Mwn,
+        cfg,
+        log: logger,
+        canWrite: canWriteMock,
+      };
+
+      await cleanupBacklogReviews(ctx);
+
+      // Only the unlocked section ("未锁定的章节") should be processed and edited
+      expect(mockBot.edit).toHaveBeenCalledTimes(1);
+      const editCall = mockBot.edit.mock.calls[0];
+      const transformFn = editCall[1];
+      const transformed = transformFn({ content: talkContent });
+      expect(transformed.text).toContain("页面“不存在的条目”不存在");
+    });
   });
 });

@@ -21,7 +21,11 @@ import {
   type LlmModelSpec,
   type TokenUsage,
 } from "../utils/llm.js";
-import { EVENT_SAVE_SQL, EVENT_SEEN_SQL, runInTransaction } from "../utils/db.js";
+import {
+  EVENT_SAVE_SQL,
+  EVENT_SEEN_SQL,
+  runInTransaction,
+} from "../utils/db.js";
 import type {
   ChangeEvent,
   HandlerContext,
