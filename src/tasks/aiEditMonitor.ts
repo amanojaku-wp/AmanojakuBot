@@ -613,13 +613,13 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
 
     lines.push(`=== ${safeTitle(row.title)} ===`);
     lines.push(`{{anchor|${sectionAnchor(row.scan_time, row.title)}}}`);
-    lines.push(`{{main|${safeTitle(row.title)}}}`);
+    lines.push(`* {{La|${safeTitle(row.title)}}}`);
     lines.push("");
     lines.push(
       `* Diff: ${diffs
         .map(
           (d) =>
-            `[[Special:Diff/${d.revid}|${d.revid}]]<sup>[[User:${safeWikitext(
+            `[[Special:Diff/${d.revid}|${d.revid}]]<sup>[[Special:Contributions/${safeWikitext(
               d.user,
             )}|${safeWikitext(d.user)}]]</sup>`,
         )
