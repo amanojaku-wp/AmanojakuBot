@@ -18,6 +18,8 @@ export type Migration = {
  * - 20260920000001: events 表新增 input_tokens, output_tokens, model 字段
  * - 20260920000002: 新增 error_logs 错误日志表
  * - 20260924000000: checkpoint 表新增 last_revid 字段
+ * - 20260926000000: 新增 afc_requests 发布前评审请求表
+ * - 20260928000000: 新增 ai_edit_reports 任务三按条目聚合的疑似 AI 线索表
  */
 export const MIGRATIONS: Migration[] = [
   {
@@ -210,8 +212,36 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    // 任务三（3-1 动态扫描）重写：按「条目」而非「单次修订」聚合疑似 AI 线索。
+    // 一次扫描内的同一批 diff 合并为一条记录（diffs 为 JSON 数组，元素形如 { revid, user }），
+    // issues 为结构化分析结果（JSON 数组，元素形如 { strength,title,location,evidence,analysis,alternative,check }），
+    // summary 为 AI 输出的整体结论。程序负责把这些结构化数据拼接为 Wikitext / Markdown。
+    version: "20260928000000",
+    name: "create_ai_edit_reports_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ai_edit_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          canonical_title TEXT NOT NULL,
+          scan_time TEXT NOT NULL,
+          diffs TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          summary TEXT,
+          issues TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          published INTEGER NOT NULL DEFAULT 0,
+          report_page TEXT,
+          section_anchor TEXT,
+          published_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_edit_reports_scan_time ON ai_edit_reports(scan_time);
+        CREATE INDEX IF NOT EXISTS idx_ai_edit_reports_published ON ai_edit_reports(published, confidence);
+      `);
+    },
+  },
 ];
-
 let savepointCounter = 0;
 
 /**
@@ -653,6 +683,7 @@ export function getAfcRequest(
  * 9. `publication`: 页面发布冷却时间记录，用于执行“任何报告页面发布间隔不快于 6 小时”的限频要求。
  * 10. `error_logs`: 系统运行异常与错误日志记录表。
  * 11. `schema_migrations`: 数据库版本迁移追踪表。
+ * 12. `ai_edit_reports`: 任务三（3-1 动态扫描）按条目聚合的疑似 AI 线索记录，包含合并后的 diff/user 列表、置信度与结构化分析结果，以及发布幂等状态。
  */
 export function openDb(path = "bot.sqlite"): DatabaseSync {
   const db = new DatabaseSync(path);

@@ -4,7 +4,7 @@ import type { Logger } from "pino";
 import type { AppConfig } from "./config/index.js";
 import { chatHandler } from "./tasks/chat.js";
 import { reviewHandler } from "./tasks/review.js";
-import { aiEditHandler } from "./tasks/aiEdit.js";
+import { aiEditHandler } from "./tasks/aiEditReview.js";
 import { afcHandler } from "./tasks/afc.js";
 import { recordError } from "./utils/db.js";
 

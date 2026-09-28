@@ -111,6 +111,7 @@ describe("Task 2 reviewHandler", () => {
     request: ReturnType<typeof vi.fn>;
     read: ReturnType<typeof vi.fn>;
     edit: ReturnType<typeof vi.fn>;
+    save: ReturnType<typeof vi.fn>;
   };
   let cfg: AppConfig;
   let logger: Logger;
@@ -126,6 +127,7 @@ describe("Task 2 reviewHandler", () => {
       request: vi.fn(),
       read: vi.fn(),
       edit: vi.fn().mockResolvedValue({ newrevid: 9999 }),
+      save: vi.fn().mockResolvedValue({ newrevid: 9998 }),
     };
 
     cfg = {
@@ -165,6 +167,7 @@ describe("Task 2 reviewHandler", () => {
           draftNamespace: [2, 118],
           draftNamespaces: [2, 118],
           userDailyLimit: 5,
+          cleanupCron: "0 * * * *",
           talkPage: "User talk:AmanojakuBot/review",
           rulePage: "User:AmanojakuBot/task/2/rule",
           template: "User:AmanojakuBot/template/ReviewRequest",
@@ -173,6 +176,11 @@ describe("Task 2 reviewHandler", () => {
         aiEdit: {
           enabled: false,
           draftNamespace: 118,
+          silent: true,
+          cron: "0 * * * *",
+          rulePage: "User:AmanojakuBot/task/U3/rule",
+          talkPage: "User talk:AmanojakuBot/ai",
+          template: "User:AmanojakuBot/template/AIcheck",
           maxAnalysesPerWindow: 20,
           minConfidence: 0.85,
           models: [],
@@ -182,6 +190,7 @@ describe("Task 2 reviewHandler", () => {
           draftNamespace: [2, 118],
           draftNamespaces: [2, 118],
           userDailyLimit: 50,
+          cleanupCron: "0 * * * *",
           talkPage: "User talk:AmanojakuBot/afc",
           rulePage: "User:AmanojakuBot/task/U4/rule",
           template: "User:AmanojakuBot/template/ReviewRequest",
@@ -662,29 +671,29 @@ describe("Task 2 reviewHandler", () => {
     const res = await reviewHandler(event, ctx);
     expect(res?.intercepted).toBe(true);
 
-    // Verify 2 edits: 1 for result page, 1 for talk page
-    expect(mockBot.edit).toHaveBeenCalledTimes(2);
+    // Verify writes: 1 save for result page, 1 edit for talk page
+    expect(mockBot.save).toHaveBeenCalledTimes(1);
+    expect(mockBot.edit).toHaveBeenCalledTimes(1);
 
-    // Check Result page edit
-    const resultPageEdit = mockBot.edit.mock.calls[0];
-    expect(resultPageEdit[0]).toBe("User talk:AmanojakuBot/review/测试条目");
-    const resultPageTransform = resultPageEdit[1];
-    const resultPageRes = resultPageTransform({ content: "" });
-    expect(resultPageRes.text).toContain("{{Talkarchive}}");
-    expect(resultPageRes.text).toContain("[[Special:Permalink/77777|77777]]");
-    expect(resultPageRes.text).toContain(
-      "【校对概述】条目语言流畅，发现一处错别字。",
+    // Check Result page write
+    const resultPageCall = mockBot.save.mock.calls[0];
+    expect(resultPageCall[0]).toBe("User talk:AmanojakuBot/review/测试条目");
+    const resultPageText = resultPageCall[1] as string;
+    expect(resultPageText).toContain("{{Talkarchive}}");
+    expect(resultPageText).toContain("[[Special:Permalink/77777|77777]]");
+    expect(resultPageText).toContain(
+      "'''校对结果：'''共1项：1项确认问题、0项建议进一步核对、0项改进建议。",
     );
-    expect(resultPageRes.text).toContain("=== 确认问题 ===");
-    expect(resultPageRes.text).toContain("<!-- 确认问题 -->");
-    expect(resultPageRes.text).toContain("; 1.<!-- 语言文字 -->发现一处错别字");
-    expect(resultPageRes.text).toContain(": '''原文'''：{{tq|测试错字}}");
-    expect(resultPageRes.text).toContain("第二轮发现遗漏的参考资料问题");
+    expect(resultPageText).toContain(":条目语言流畅，发现一处错别字。");
+    expect(resultPageText).toContain("=== 确认问题 ===");
+    expect(resultPageText).toContain("<!-- 确认问题 -->");
+    expect(resultPageText).toContain("; 1.<!-- 语言文字 -->发现一处错别字");
+    expect(resultPageText).toContain(": {{tq|测试错字}}");
 
     // Check Talk page edit
     const now = new Date();
     const expectedDate = `${now.getUTCFullYear()}年${now.getUTCMonth() + 1}月${now.getUTCDate()}日`;
-    const talkPageEdit = mockBot.edit.mock.calls[1];
+    const talkPageEdit = mockBot.edit.mock.calls[0];
     expect(talkPageEdit[0]).toBe("User talk:AmanojakuBot/review");
     const talkPageTransform = talkPageEdit[1];
     const talkPageRes = talkPageTransform({ content: afterContent });
@@ -695,9 +704,6 @@ describe("Task 2 reviewHandler", () => {
       "| resultpage = User talk:AmanojakuBot/review/测试条目",
     );
     expect(talkPageRes.text).toContain("{{ping|Alice}}校对已完成");
-    expect(talkPageRes.text).toContain(
-      "【校对概述】条目语言流畅，发现一处错别字。",
-    );
 
     // Check database
     const reqRow = db
@@ -788,12 +794,12 @@ describe("Task 2 reviewHandler", () => {
     const res = await reviewHandler(event, ctx);
     expect(res?.intercepted).toBe(true);
 
-    // Verify Result page edit target is inferred name
-    const resultPageEdit = mockBot.edit.mock.calls[0];
-    expect(resultPageEdit[0]).toBe("User talk:AmanojakuBot/review/某某人物");
+    // Verify Result page write target is inferred name
+    const resultPageCall = mockBot.save.mock.calls[0];
+    expect(resultPageCall[0]).toBe("User talk:AmanojakuBot/review/某某人物");
 
     // Verify Talk page edit has resultpage set to the full result page name
-    const talkPageEdit = mockBot.edit.mock.calls[1];
+    const talkPageEdit = mockBot.edit.mock.calls[0];
     const talkPageTransform = talkPageEdit[1];
     const talkPageRes = talkPageTransform({ content: afterContent });
     expect(talkPageRes.text).toContain("| status = done");
@@ -885,17 +891,14 @@ describe("Task 2 reviewHandler", () => {
     expect(res?.intercepted).toBe(true);
 
     // Verify Result page has unique section == ${expectedDate} (2) ==
-    const resultPageEdit = mockBot.edit.mock.calls[0];
-    const resultPageTransform = resultPageEdit[1];
-    const resultPageRes = resultPageTransform({ content: existingResultPage });
-    expect(resultPageRes.text).toContain(`== ${expectedDate} (2) ==`);
+    const resultPageCall = mockBot.save.mock.calls[0];
+    const resultPageText = resultPageCall[1] as string;
+    expect(resultPageText).toContain(`== ${expectedDate} (2) ==`);
     // Should NOT duplicate {{Talkarchive}}
-    expect(
-      (resultPageRes.text.match(/\{\{Talkarchive\}\}/g) || []).length,
-    ).toBe(1);
+    expect((resultPageText.match(/\{\{Talkarchive\}\}/g) || []).length).toBe(1);
 
     // Verify Talk page section parameter matches
-    const talkPageEdit = mockBot.edit.mock.calls[1];
+    const talkPageEdit = mockBot.edit.mock.calls[0];
     const talkPageTransform = talkPageEdit[1];
     const talkPageRes = talkPageTransform({ content: afterContent });
     expect(talkPageRes.text).toContain(`| section = ${expectedDate} (2)`);
@@ -1001,7 +1004,7 @@ describe("Task 2 reviewHandler", () => {
     const res = await reviewHandler(event, ctx);
     expect(res?.intercepted).toBe(true);
 
-    const talkPageEdit = mockBot.edit.mock.calls[1];
+    const talkPageEdit = mockBot.edit.mock.calls[0];
     const talkPageTransform = talkPageEdit[1];
     const updatedTalk = talkPageTransform({ content: fullTalkContent });
 

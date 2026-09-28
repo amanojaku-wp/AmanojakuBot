@@ -1,4 +1,3 @@
-import { EventSource } from "eventsource";
 import pino from "pino";
 import { loadConfig } from "./config/index.js";
 import {
@@ -8,11 +7,12 @@ import {
   EVENT_SEEN_SQL,
 } from "./utils/db.js";
 import { createWiki, pageText } from "./utils/wiki.js";
-import { fetchRecentChanges, pollingStart } from "./utils/polling.js";
+import { startChangeFeed } from "./utils/changeFeed.js";
+import { scheduleCron } from "./utils/schedule.js";
 import { cleanupBacklogReviews } from "./tasks/review.js";
 import { cleanupBacklogAfcs } from "./tasks/afc.js";
-import { publishReports } from "./tasks/aiEdit.js";
-import { handle, type ChangeEvent, type HandlerContext } from "./handle.js";
+import { publishAiReports, scanAiEdits } from "./tasks/aiEditMonitor.js";
+import { handle, type HandlerContext } from "./handle.js";
 
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 
@@ -23,13 +23,17 @@ setGlobalDispatcher(new EnvHttpProxyAgent());
  * 机器人常驻主服务守护进程入口
  *
  * 核心架构与设计模式：
- * 1. 串行任务队列 (`queue`)：通过 Promise 链串行化处理所有事件消费与定时发版任务，
- *    彻底避免 SQLite 并发写入冲突与 MediaWiki 编辑冲突 (Edit Conflict)。
+ * 1. 串行任务队列 (`enqueue`)：通过 Promise 链串行化处理所有事件消费与定时任务，
+ *    彻底避免 SQLite 并发写入冲突与 MediaWiki 编辑冲突 (Edit Conflict)；
+ *    单次任务失败只影响该次调用，不会阻断后续任务。
  * 2. 链上控制与紧急熔断 (`canWrite`)：在每一次写入维基前，动态拉取机器人配置的控制页，
  *    实现外部维基页面对机器人行为的实时停止（emergencyStop）与启动（enabled）。
  * 3. 幂等与状态机保障：结合本地 SQLite 记录与维基页面 HTML 注释标记（source revid 锚点），
  *    防止网络重试、进程重启或位点回退导致重复回复。
- * 4. 双事件驱动支持：支持 Wikimedia EventStreams (SSE) 高效流式消费与 Action API 定期重叠轮询。
+ * 4. 变更事件源统一入口：EventStreams (SSE) 与 RecentChanges 轮询两种底层驱动都封装在
+ *    `src/utils`（changeFeed / eventstream / polling），此处只保留一个参数形态一致的调用。
+ * 5. 定时任务统一 cron 调度：任务二/任务四的积压兜底清理与任务三（3-1）定期扫描
+ *    都由 `src/utils/schedule` 按 UTC 时区的 cron 表达式驱动。
  */
 
 const cfg = loadConfig(process.env.CONFIG_PATH ?? "config.yaml");
@@ -86,22 +90,21 @@ if (cfg.writeEnabled) {
 // 预编译 SQLite 语句
 const seen = db.prepare(EVENT_SEEN_SQL);
 const save = db.prepare(EVENT_SAVE_SQL);
-const mark = db.prepare(
-  "INSERT OR REPLACE INTO checkpoint(name,event_id,timestamp,last_revid) VALUES(?,?,?,?)",
-);
-const checkpoint = db.prepare(
-  "SELECT event_id,timestamp,last_revid FROM checkpoint WHERE name=?",
-);
 
-const streamKey = `stream:${cfg.events.streamUrl}:${cfg.wiki.wikiId ?? "default"}`;
-const initialCheckpoint = checkpoint.get(streamKey) as
-  { event_id?: string; timestamp?: string; last_revid?: number } | undefined;
-let lastEventId = initialCheckpoint?.event_id;
-let lastRevid = initialCheckpoint?.last_revid;
-let checkpointTimestamp = initialCheckpoint?.timestamp;
+/** 串行任务调度队列的队尾 */
+let queue: Promise<void> = Promise.resolve();
 
-/** 串行任务调度队列 */
-let queue = Promise.resolve();
+/**
+ * 把任务追加到串行队列并返回该任务的完成 Promise。
+ *
+ * 队列自身吞掉异常（`queue` 始终保持 resolved），因此单次任务失败不会阻断后续任务；
+ * 异常会原样抛给调用方，由调用方决定如何记录。
+ */
+const enqueue = (task: () => Promise<void>): Promise<void> => {
+  const run = queue.then(task);
+  queue = run.catch(() => undefined);
+  return run;
+};
 
 /**
  * 实时读取维基链上控制页面，校验机器人是否处于允许运行且未触发紧急停止的状态
@@ -124,368 +127,80 @@ const handlerContext: HandlerContext = {
   saveStatement: save,
 };
 
-// watchdog
-let lastActivityAt = Date.now();
-const IDLE_TIMEOUT = 5 * 60_000;
-function touch() {
-  lastActivityAt = Date.now();
+/**
+ * 把一个定时任务串行编排进全局队列，并兜底记录异常。
+ */
+async function runScheduled(
+  label: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  try {
+    await enqueue(task);
+  } catch (error) {
+    log.error({ err: error, label }, "scheduled task failed");
+  }
+}
+
+/**
+ * 按 cron 表达式登记一个串行化的定时任务。
+ */
+function scheduleTask(
+  expression: string,
+  label: string,
+  task: () => Promise<void>,
+): void {
+  scheduleCron({
+    expression,
+    label,
+    log,
+    run: () => runScheduled(label, task),
+  });
 }
 
 // -------------------------------------------------------------
-// 事件监听驱动：EventStreams (SSE) vs RecentChanges Polling
+// 变更事件监听：EventStreams (SSE) / RecentChanges 轮询
+// 两种底层机制均由 src/utils 内部按 mode 选择，这里只保留一个统一调用。
 // -------------------------------------------------------------
-if (cfg.events.mode === "eventstream") {
-  let prevSource: EventSource | null = null;
-  const RETRY_DELAYS = [10, 30, 60, 120, 300];
-  let errorTimer: NodeJS.Timeout | null = null;
-  let failCount = 0;
-
-  const request = (params: Record<string, string | number>) =>
-    bot.request(params);
-
-  const compensateMissingEdits = async (
-    startRevid: number,
-    startTimestamp?: string,
-  ) => {
-    let start = startTimestamp
-      ? pollingStart(startTimestamp, cfg.events.overlapSeconds)
-      : undefined;
-
-    if (!start) {
-      try {
-        const res = await bot.request({
-          action: "query",
-          prop: "revisions",
-          revids: startRevid,
-          rvprop: "timestamp",
-          formatversion: 2,
-        });
-        const revTimestamp = res.query?.pages?.[0]?.revisions?.[0]?.timestamp;
-        if (revTimestamp) {
-          start = pollingStart(revTimestamp, cfg.events.overlapSeconds);
-        }
-      } catch {
-        // fallback
-      }
-    }
-    if (!start) {
-      start = new Date(Date.now() - 3600_000).toISOString();
-    }
-    const end = new Date().toISOString();
-
-    log.info(
-      { startRevid, start, end },
-      "compensating missing edits via recentchanges",
-    );
-
-    const changes = await fetchRecentChanges(request, undefined, start, end);
-
-    let count = 0;
-    for (const rc of changes) {
-      // 1. 过滤 bot 编辑
-      if (rc.bot) {
-        continue;
-      }
-      // 2. 仅对 last revid 之后的编辑进行补偿
-      if (rc.revid <= startRevid) {
-        continue;
-      }
-
-      // 3. 补偿时向上游提供的数据结构和实时推送一样
-      const changeEvent: ChangeEvent = {
-        wiki: cfg.wiki.wikiId,
-        type: rc.type,
-        title: rc.title,
-        namespace: rc.ns,
-        bot: rc.bot,
-        user: rc.user,
-        revision: { new: rc.revid },
-        length:
-          rc.oldlen !== undefined && rc.newlen !== undefined
-            ? { old: rc.oldlen, new: rc.newlen }
-            : undefined,
-      };
-
-      await handle(changeEvent, handlerContext);
-
-      count++;
-      if (rc.revid > (lastRevid ?? 0)) {
-        lastRevid = rc.revid;
-      }
-      checkpointTimestamp = new Date().toISOString();
-      mark.run(
-        streamKey,
-        lastEventId ?? null,
-        checkpointTimestamp,
-        lastRevid ?? null,
-      );
-    }
-
-    log.info({ count, lastRevid }, "compensation completed");
-  };
-
-  const createSource = () => {
-    if (prevSource !== null) {
-      try {
-        prevSource.close();
-      } catch {
-        // ignore
-      }
-    }
-    const source = new EventSource(cfg.events.streamUrl, {
-      fetch: (input, init) =>
-        fetch(input, {
-          ...init,
-          headers: {
-            ...init?.headers,
-            ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
-          },
-        }),
-    });
-
-    source.addEventListener("message", (event) => {
-      queue = queue.then(async () => {
-        try {
-          touch();
-          const data = JSON.parse(event.data) as ChangeEvent;
-          await handle(data, handlerContext);
-          if (data.revision?.new) {
-            lastRevid = data.revision.new;
-          }
-          if (event.lastEventId) {
-            lastEventId = event.lastEventId;
-          }
-          checkpointTimestamp = new Date().toISOString();
-          mark.run(
-            streamKey,
-            lastEventId ?? null,
-            checkpointTimestamp,
-            lastRevid ?? null,
-          );
-        } catch (error) {
-          log.error(
-            { err: error },
-            "event processing failed; checkpoint unchanged",
-          );
-          source.close();
-          process.exit(1);
-        }
-      });
-    });
-
-    source.addEventListener("error", (error) => {
-      log.warn(
-        { err: error },
-        "stream disconnected; EventSource encountered error",
-      );
-
-      if (errorTimer) {
-        clearTimeout(errorTimer);
-        errorTimer = null;
-      }
-      const delaySec =
-        RETRY_DELAYS[Math.min(failCount, RETRY_DELAYS.length - 1)];
-      failCount++;
-
-      log.warn(
-        { delaySec, failCount },
-        `EventSource error; waiting ${delaySec}s before forcing reconnect`,
-      );
-
-      errorTimer = setTimeout(() => {
-        errorTimer = null;
-        log.warn(
-          { delaySec },
-          "EventSource did not open within timeout; forcing reconnect",
-        );
-        if (prevSource) {
-          try {
-            prevSource.close();
-          } catch {
-            // ignore
-          }
-          prevSource = null;
-        }
-        createSource();
-      }, delaySec * 1000);
-    });
-
-    source.addEventListener("open", () => {
-      touch();
-      log.info({}, "stream connected; EventSource is open");
-
-      if (errorTimer) {
-        clearTimeout(errorTimer);
-        errorTimer = null;
-      }
-      failCount = 0;
-
-      if (lastRevid) {
-        const compensateFromRevid = lastRevid;
-        const compensateFromTime = checkpointTimestamp;
-        queue = queue.then(async () => {
-          try {
-            await compensateMissingEdits(
-              compensateFromRevid,
-              compensateFromTime,
-            );
-          } catch (err) {
-            log.error({ err }, "compensation during stream open failed");
-          }
-        });
-      }
-    });
-
-    prevSource = source;
-  };
-
-  createSource();
-} else {
-  const request = (params: Record<string, string | number>) =>
-    bot.request(params);
-
-  const poll = async (
-    key: string,
-    title: string | undefined,
-    namespaces?: number[],
-  ) => {
-    const end = new Date().toISOString();
-    const previous = (checkpoint.get(key) as { timestamp?: string } | undefined)
-      ?.timestamp;
-    if (!previous) {
-      mark.run(key, null, end, null); // 首次启动建立基准位点，不补回历史留言
-      return;
-    }
-    const changes = await fetchRecentChanges(
-      request,
-      title,
-      pollingStart(previous, cfg.events.overlapSeconds),
-      end,
-      namespaces,
-    );
-    //if (changes.length > 0) {
-    //  log.debug({ changes }, "fetched recent changes for polling");
-    //}
-    for (const rc of changes) {
-      await handle(
-        {
-          wiki: cfg.wiki.wikiId,
-          type: rc.type,
-          title: rc.title,
-          namespace: rc.ns,
-          bot: rc.bot,
-          user: rc.user,
-          revision: { new: rc.revid },
-        },
-        handlerContext,
-      );
-    }
-    mark.run(key, null, end, null); // 整批变更全部成功后再提交位点
-  };
-
-  const tick = async () => {
-    if (cfg.tasks.chat.enabled) {
-      try {
-        await poll(
-          `poll:chat:${cfg.wiki.apiUrl}:${cfg.tasks.chat.talkPage}`,
-          cfg.tasks.chat.talkPage,
-        );
-      } catch (error) {
-        log.error(
-          { err: error },
-          "chat discussion polling failed; retaining checkpoint",
-        );
-      }
-    }
-    if (cfg.tasks.review.enabled) {
-      try {
-        await poll(
-          `poll:review:${cfg.wiki.apiUrl}:${cfg.tasks.review.talkPage}`,
-          cfg.tasks.review.talkPage,
-        );
-      } catch (error) {
-        log.error(
-          { err: error },
-          "review discussion polling failed; retaining checkpoint",
-        );
-      }
-    }
-    if (cfg.tasks.aiEdit.enabled) {
-      try {
-        await poll(`ai:${cfg.wiki.apiUrl}`, undefined, [
-          0,
-          cfg.tasks.aiEdit.draftNamespace,
-        ]);
-      } catch (error) {
-        log.error(
-          { err: error },
-          "article polling failed; retaining checkpoint",
-        );
-      }
-    }
-    setTimeout(tick, cfg.events.pollIntervalSeconds * 1000);
-  };
-  void tick();
-}
+startChangeFeed({
+  mode: cfg.events.mode,
+  cfg,
+  db,
+  bot,
+  log,
+  enqueue,
+  onEvent: (event) => handle(event, handlerContext),
+});
 
 // -------------------------------------------------------------
-// 任务二：定期/启动清理积压校对请求兜底机制（启动时及每 1 小时执行一次）
+// 任务二：积压校对请求兜底清理（启动时立即执行一次，之后按 cleanupCron 定期执行）
 // -------------------------------------------------------------
 if (cfg.tasks.review.enabled) {
-  const runReviewCleanup = async () => {
-    // 串行编排入全局任务队列，确保清理操作与事件处理互斥执行
-    queue = queue.then(() => cleanupBacklogReviews(handlerContext));
-    try {
-      await queue;
-    } catch (error) {
-      log.error({ err: error }, "backlog review cleanup failed");
-      queue = Promise.resolve();
-    }
-    setTimeout(runReviewCleanup, 3600_000);
-  };
-  void runReviewCleanup();
-}
-
-if (cfg.tasks.afc.enabled) {
-  const runAfcCleanup = async () => {
-    // 串行编排入全局任务队列，确保清理操作与事件处理互斥执行
-    queue = queue.then(() => cleanupBacklogAfcs(handlerContext));
-    try {
-      await queue;
-    } catch (error) {
-      log.error({ err: error }, "backlog afc cleanup failed");
-      queue = Promise.resolve();
-    }
-    setTimeout(runAfcCleanup, 3600_000);
-  };
-  void runAfcCleanup();
+  const label = "review backlog cleanup";
+  const task = () => cleanupBacklogReviews(handlerContext);
+  void runScheduled(label, task); // 启动时兜底
+  scheduleTask(cfg.tasks.review.cleanupCron, label, task);
 }
 
 // -------------------------------------------------------------
-// 任务三：定时报告发布任务（每 60 秒轮询检查是否有满足条件的窗口可发布）
+// 任务四：积压 AfC 请求兜底清理（启动时立即执行一次，之后按 cleanupCron 定期执行）
+// -------------------------------------------------------------
+if (cfg.tasks.afc.enabled) {
+  const label = "afc backlog cleanup";
+  const task = () => cleanupBacklogAfcs(handlerContext);
+  void runScheduled(label, task); // 启动时兜底
+  scheduleTask(cfg.tasks.afc.cleanupCron, label, task);
+}
+
+// -------------------------------------------------------------
+// 任务三（3-1）：按 tasks.aiEdit.cron 定期执行动态扫描
+// 扫描完成后立即汇总发布（tasks.aiEdit.silent=true 时仅写本地 debugLog，不写维基）
+// 首次 tick 仅建立基准位点，不回溯历史编辑。
 // -------------------------------------------------------------
 if (cfg.tasks.aiEdit.enabled) {
-  const reportCfg = {
-    draftNamespace: cfg.tasks.aiEdit.draftNamespace,
-    models: cfg.tasks.aiEdit.models,
-    minConfidence: cfg.tasks.aiEdit.minConfidence,
-    maxAnalysesPerWindow: cfg.tasks.aiEdit.maxAnalysesPerWindow,
-    reportPagePrefix: cfg.tasks.aiEdit.reportPagePrefix!,
-    usersPage: cfg.tasks.aiEdit.usersPage!,
-    writeEnabled: cfg.writeEnabled,
-  };
-  const publish = async () => {
-    // 串行编排入全局任务队列，确保发版操作与事件处理互斥执行
-    queue = queue.then(() => publishReports(db, bot, reportCfg, canWrite));
-    try {
-      await queue;
-    } catch (error) {
-      log.error({ err: error }, "report publication failed");
-      queue = Promise.resolve();
-    }
-    setTimeout(publish, 60_000);
-  };
-  setTimeout(publish, 60_000);
+  scheduleTask(cfg.tasks.aiEdit.cron, "aiEdit 3-1 scan", async () => {
+    await scanAiEdits(handlerContext);
+    await publishAiReports(handlerContext);
+  });
 }
 
 log.info(

@@ -1,6 +1,13 @@
 import { readFileSync } from "node:fs";
 import YAML from "yaml";
 import { z } from "zod";
+import { isValidCron } from "../utils/schedule.js";
+
+/** cron 表达式校验（统一按 UTC 解释，由 utils/schedule 提供） */
+const cronExpressionSchema = z
+  .string()
+  .min(1)
+  .refine(isValidCron, "invalid cron expression (UTC timezone)");
 
 /**
  * 机器人全局配置契约定义
@@ -134,37 +141,61 @@ export const configSchema = z.object({
           userDailyLimit: z.number().int().min(1).default(5),
           /** 兼容旧配置项 dailyLimit */
           dailyLimit: z.number().int().min(1).optional(),
+          /** 积压校对请求兜底清理的 cron 表达式（UTC 时区），默认每小时整点 */
+          cleanupCron: cronExpressionSchema.default("0 * * * *"),
           llm: llmConfigSchema.optional(),
         })
         .default({
           enabled: true,
           draftNamespace: [2, 118],
           userDailyLimit: 5,
+          cleanupCron: "0 * * * *",
         }),
       /** 任务三：近期编辑疑似 AI 辅助内容的人工复核线索报告（默认关闭，需显式启用） */
       aiEdit: z
         .object({
           enabled: z.boolean().default(false),
+          /** 保留字段：3-1 动态扫描当前仅处理主命名空间（条目，ns 0） */
           draftNamespace: z.number().int().nonnegative().default(118),
-          /** 按月分段的线索报告页前缀（如 User:AmanojakuBot/AI线索） */
+          /** 按月分段的线索报告页前缀（如 User:AmanojakuBot/task/U3/check），实际写入 <前缀>/YYYY-MM */
           reportPagePrefix: z
             .string()
             .regex(/^User:[^/]+\/.+$/i)
             .optional(),
-          /** 跨 3 个不同条目触发线索的用户汇总页（如 User:AmanojakuBot/AI用户） */
+          /** 跨 3 个不同条目触发线索的用户汇总页（如 User:AmanojakuBot/task/U3/checkuser） */
           usersPage: z
             .string()
             .regex(/^User:[^/]+\/.+$/i)
             .optional(),
-          /** 每个 6 小时 UTC 聚合窗口内送审 LLM 的最大候选编辑数（防预算超支） */
+          /** 3-1 扫描时用于判断“疑似 AI 线索”的规则页面 */
+          rulePage: z
+            .string()
+            .regex(/^User:[^/]+\//i)
+            .optional(),
+          /** 静默模式：true 时仅写本地日志，不向维基写入任何报告页（默认安全） */
+          silent: z.boolean().default(true),
+          /** 3-1 动态扫描的 cron 表达式（UTC 时区），默认每小时整点 */
+          cron: cronExpressionSchema.default("0 * * * *"),
+          /** 3-1 结构化分析结果的本地 Markdown 调试日志文件路径 */
+          debugLog: z.string().min(1).optional(),
+          /** 3-2 请求监听所在机器人讨论页（模板请求） */
+          talkPage: z
+            .string()
+            .regex(/^User talk:[^/]+(?:\/.+)?$/i)
+            .optional(),
+          /** 3-2 请求模板名称 */
+          template: z.string().min(1).optional(),
+          /** 每次扫描最多送审 LLM 的条目数（同时限制 6 小时窗口与单次扫描预算） */
           maxAnalysesPerWindow: z.number().int().min(1).max(100).default(20),
-          /** 记录为有效线索的最低置信度阈值（要求高置信度与严格原文摘录） */
-          minConfidence: z.number().min(0.7).max(1).default(0.85),
+          /** 记录为有效线索（写入 check 页与 checkuser 页）的最低置信度阈值 */
+          minConfidence: z.number().min(0.5).max(1).default(0.85),
           llm: llmConfigSchema.optional(),
         })
         .default({
           enabled: false,
           draftNamespace: 118,
+          silent: true,
+          cron: "0 * * * *",
           maxAnalysesPerWindow: 20,
           minConfidence: 0.85,
         }),
@@ -191,20 +222,30 @@ export const configSchema = z.object({
           userDailyLimit: z.number().int().min(1).default(50),
           /** 兼容旧配置项 dailyLimit */
           dailyLimit: z.number().int().min(1).optional(),
+          /** 积压 AfC 请求兜底清理的 cron 表达式（UTC 时区），默认每小时整点 */
+          cleanupCron: cronExpressionSchema.default("0 * * * *"),
           llm: llmConfigSchema.optional(),
         })
         .default({
           enabled: true,
           draftNamespace: [2, 118],
           userDailyLimit: 50,
+          cleanupCron: "0 * * * *",
         }),
     })
     .default({
       chat: { enabled: true },
-      review: { enabled: true, draftNamespace: [2, 118], userDailyLimit: 5 },
+      review: {
+        enabled: true,
+        draftNamespace: [2, 118],
+        userDailyLimit: 5,
+        cleanupCron: "0 * * * *",
+      },
       aiEdit: {
         enabled: false,
         draftNamespace: 118,
+        silent: true,
+        cron: "0 * * * *",
         maxAnalysesPerWindow: 20,
         minConfidence: 0.85,
       },
@@ -212,6 +253,7 @@ export const configSchema = z.object({
         enabled: true,
         draftNamespace: [2, 118],
         userDailyLimit: 50,
+        cleanupCron: "0 * * * *",
       },
     }),
   /** 写入使能总开关（兼容顶层定义） */
@@ -265,6 +307,14 @@ export function loadConfig(path = "config.yaml") {
   const afcUserDailyLimit =
     parsed.tasks.afc.userDailyLimit ?? parsed.tasks.afc.dailyLimit ?? 50;
 
+  const aiEditTalkPage =
+    parsed.tasks.aiEdit.talkPage ?? `User talk:${parsed.wiki.username}/ai`;
+  const aiEditRulePage =
+    parsed.tasks.aiEdit.rulePage ?? `User:${parsed.wiki.username}/task/U3/rule`;
+  const aiEditTemplate =
+    parsed.tasks.aiEdit.template ??
+    `User:${parsed.wiki.username}/template/AIcheck`;
+
   // 校验归属权
   const isBotTalkPage = (p: string) => {
     const target = p.slice(10).replaceAll("_", " ").toLowerCase();
@@ -275,11 +325,13 @@ export function loadConfig(path = "config.yaml") {
     !isBotTalkPage(chatTalkPage) ||
     !isBotTalkPage(reviewTalkPage) ||
     !isBotTalkPage(afcTalkPage) ||
+    !isBotTalkPage(aiEditTalkPage) ||
     ![
       personaPage,
       parsed.wiki.controlPage,
       reviewRulePage,
       afcRulePage,
+      aiEditRulePage,
     ].every((p) =>
       p
         .slice(5)
@@ -294,9 +346,12 @@ export function loadConfig(path = "config.yaml") {
 
   if (
     parsed.tasks.aiEdit.enabled &&
+    !parsed.tasks.aiEdit.silent &&
     (!parsed.tasks.aiEdit.reportPagePrefix || !parsed.tasks.aiEdit.usersPage)
   )
-    throw new Error("AI-edit reports require reportPagePrefix and usersPage");
+    throw new Error(
+      "AI-edit reports require reportPagePrefix and usersPage when silent=false",
+    );
 
   for (const p of [
     parsed.tasks.aiEdit.reportPagePrefix,
@@ -331,6 +386,10 @@ export function loadConfig(path = "config.yaml") {
     throw new Error("No LLM configuration found for task: chat");
   }
 
+  if (aiEditModels.length === 0 && parsed.tasks.aiEdit.enabled) {
+    throw new Error("No LLM configuration found for task: aiEdit");
+  }
+
   return {
     ...parsed,
     writeEnabled,
@@ -360,6 +419,9 @@ export function loadConfig(path = "config.yaml") {
       },
       aiEdit: {
         ...parsed.tasks.aiEdit,
+        rulePage: aiEditRulePage,
+        talkPage: aiEditTalkPage,
+        template: aiEditTemplate,
         models: aiEditModels,
       },
       afc: {

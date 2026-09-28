@@ -1,3 +1,9 @@
+import type { DatabaseSync } from "node:sqlite";
+import type { Mwn } from "mwn";
+import type { Logger } from "pino";
+import type { AppConfig } from "../config/index.js";
+import type { ChangeEvent } from "../handle.js";
+
 /**
  * MediaWiki RecentChanges API 增量事件数据结构
  */
@@ -12,6 +18,10 @@ export type RecentChange = {
   newlen?: number;
   timestamp: string;
   bot?: boolean;
+  /** 匿名（IP）编者标记，`rcprop=flags` 会返回该布尔字段 */
+  anon?: boolean;
+  /** 变更标签（如 AWB、Twinkle、回退功能），用于排除机械化/回退编辑 */
+  tags?: string[];
   rcid: number;
 };
 
@@ -44,7 +54,7 @@ export async function fetchRecentChanges(
       ...(title ? { rctitle: title } : {}),
       ...(namespaces ? { rcnamespace: namespaces.join("|") } : {}),
       rctype: "edit|new",
-      rcprop: "title|ids|user|timestamp|flags|sizes",
+      rcprop: "title|ids|user|timestamp|flags|sizes|tags",
       rcdir: "newer",
       rcstart: start,
       rcend: end,
@@ -72,4 +82,140 @@ export function pollingStart(
   overlapSeconds: number,
 ): string {
   return new Date(Date.parse(checkpoint) - overlapSeconds * 1000).toISOString();
+}
+
+/**
+ * RecentChanges 轮询驱动配置
+ */
+export type PollingFeedOptions = {
+  cfg: AppConfig;
+  db: DatabaseSync;
+  bot: Mwn;
+  log: Logger;
+  /** 串行任务队列：把处理任务追加到全局队列，保证与其它定时任务互斥执行 */
+  enqueue: (task: () => Promise<void>) => Promise<void>;
+  /** 与驱动方式无关的单条变更事件处理入口 */
+  onEvent: (event: ChangeEvent) => Promise<void>;
+};
+
+/**
+ * 启动 RecentChanges 定期轮询（常驻，不返回）
+ *
+ * 可靠性设计：
+ * 1. 每个受监听讨论页各维护独立 checkpoint，首次运行仅建立基准位点，不回溯历史留言。
+ * 2. 整批变更全部成功处理后才推进位点，保证 At-least-once 语义（重叠窗口内的重复由幂等状态机去重）。
+ * 3. 每个页面的轮询任务都经过串行队列，避免与定时清理/扫描任务并发写入 SQLite 或产生编辑冲突。
+ */
+export function startPollingFeed(options: PollingFeedOptions): void {
+  const { cfg, db, bot, log, enqueue, onEvent } = options;
+
+  const mark = db.prepare(
+    "INSERT OR REPLACE INTO checkpoint(name,event_id,timestamp,last_revid) VALUES(?,?,?,?)",
+  );
+  const checkpoint = db.prepare(
+    "SELECT event_id,timestamp,last_revid FROM checkpoint WHERE name=?",
+  );
+
+  const request = (params: Record<string, string | number>) =>
+    bot.request(params);
+
+  const poll = async (
+    key: string,
+    title: string | undefined,
+    namespaces?: number[],
+  ) => {
+    const end = new Date().toISOString();
+    const previous = (checkpoint.get(key) as { timestamp?: string } | undefined)
+      ?.timestamp;
+    if (!previous) {
+      mark.run(key, null, end, null); // 首次启动建立基准位点，不补回历史留言
+      return;
+    }
+    const changes = await fetchRecentChanges(
+      request,
+      title,
+      pollingStart(previous, cfg.events.overlapSeconds),
+      end,
+      namespaces,
+    );
+    for (const rc of changes) {
+      await onEvent({
+        wiki: cfg.wiki.wikiId,
+        type: rc.type,
+        title: rc.title,
+        namespace: rc.ns,
+        bot: rc.bot,
+        user: rc.user,
+        revision: { new: rc.revid },
+      });
+    }
+    mark.run(key, null, end, null); // 整批变更全部成功后再提交位点
+  };
+
+  const tick = async () => {
+    if (cfg.tasks.chat.enabled) {
+      try {
+        await enqueue(() =>
+          poll(
+            `poll:chat:${cfg.wiki.apiUrl}:${cfg.tasks.chat.talkPage}`,
+            cfg.tasks.chat.talkPage,
+          ),
+        );
+      } catch (error) {
+        log.error(
+          { err: error },
+          "chat discussion polling failed; retaining checkpoint",
+        );
+      }
+    }
+    if (cfg.tasks.review.enabled) {
+      try {
+        await enqueue(() =>
+          poll(
+            `poll:review:${cfg.wiki.apiUrl}:${cfg.tasks.review.talkPage}`,
+            cfg.tasks.review.talkPage,
+          ),
+        );
+      } catch (error) {
+        log.error(
+          { err: error },
+          "review discussion polling failed; retaining checkpoint",
+        );
+      }
+    }
+    if (cfg.tasks.afc.enabled) {
+      try {
+        await enqueue(() =>
+          poll(
+            `poll:afc:${cfg.wiki.apiUrl}:${cfg.tasks.afc.talkPage}`,
+            cfg.tasks.afc.talkPage,
+          ),
+        );
+      } catch (error) {
+        log.error(
+          { err: error },
+          "afc discussion polling failed; retaining checkpoint",
+        );
+      }
+    }
+    // 任务三（3-2）：模板请求监听页在轮询模式下同样需要拉取
+    if (cfg.tasks.aiEdit.enabled && cfg.tasks.aiEdit.talkPage) {
+      try {
+        await enqueue(() =>
+          poll(
+            `poll:aiEdit:${cfg.wiki.apiUrl}:${cfg.tasks.aiEdit.talkPage}`,
+            cfg.tasks.aiEdit.talkPage,
+          ),
+        );
+      } catch (error) {
+        log.error(
+          { err: error },
+          "aiEdit discussion polling failed; retaining checkpoint",
+        );
+      }
+    }
+    setTimeout(tick, cfg.events.pollIntervalSeconds * 1000);
+  };
+
+  void tick();
 }

@@ -159,7 +159,7 @@ describe("discussion filtering & timestamp handling", () => {
       ),
     ).toBe(":::四就是四。 ~~~~ <!-- marker -->");
     expect(formatDiscussionReply("第一行回复\n::: —~~~~", 2, marker)).toBe(
-      ":::第一行回复 —~~~~ <!-- marker -->",
+      ":::第一行回复 ~~~~ <!-- marker -->",
     );
     expect(
       formatDiscussionReply(
@@ -168,7 +168,7 @@ describe("discussion filtering & timestamp handling", () => {
         marker,
         "Bot",
       ),
-    ).toBe(":这是回复 —~~~~ <!-- marker -->");
+    ).toBe(":这是回复 ~~~~ <!-- marker -->");
 
     // Preserve user mentions when botUsername is provided
     expect(
@@ -179,13 +179,13 @@ describe("discussion filtering & timestamp handling", () => {
         "AmanojakuBot",
       ),
     ).toBe(
-      "::正如 [[User:Alice|Alice]] 在 2026年9月20日 所提到的那样，这个方案可行。 —~~~~ <!-- marker -->",
+      "::正如 [[User:Alice|Alice]] 在 2026年9月20日 所提到的那样，这个方案可行。 ~~~~ <!-- marker -->",
     );
 
     // Clean AI-generated colons on each line
     const aiColoned = ":第一行说明\n:第二行说明\n::第三行列表";
     expect(formatDiscussionReply(aiColoned, 1, marker)).toBe(
-      "::第一行说明\n::第二行说明\n::第三行列表 —~~~~ <!-- marker -->",
+      "::第一行说明\n::第二行说明\n::第三行列表 ~~~~ <!-- marker -->",
     );
   });
 

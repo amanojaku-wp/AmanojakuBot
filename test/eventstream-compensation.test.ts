@@ -65,7 +65,7 @@ describe("EventStream compensation and retry mechanism", () => {
     expect(mockRequest).toHaveBeenCalledWith(
       expect.objectContaining({
         list: "recentchanges",
-        rcprop: "title|ids|user|timestamp|flags|sizes",
+        rcprop: "title|ids|user|timestamp|flags|sizes|tags",
       }),
     );
 

@@ -169,31 +169,34 @@ describe("Review Wikitext utilities", () => {
     };
 
     const formatted = formatReviewResultWikitext(sampleResult);
-    expect(formatted).toContain("【校对概述】条目整体结构清晰");
+    expect(formatted).toContain(
+      "'''校对结果：'''共3项：1项确认问题、1项建议进一步核对、1项改进建议。",
+    );
+    expect(formatted).toContain(
+      ":条目整体结构清晰，但存在几处错别字和维基语法错误。",
+    );
     expect(formatted).toContain("=== 确认问题 ===");
     expect(formatted).toContain("<!-- 确认问题 -->");
     expect(formatted).toContain(
-      "; 1.<!-- 语言文字 -->错字“建构”疑似应为“架构”",
+      "; 1.<!-- 语言文字 -->错字“建构”疑似应为“架构”<small>（导言区第二段）</small>",
     );
-    expect(formatted).toContain(": '''位置'''：导言区第二段");
-    expect(formatted).toContain(": '''原文'''：{{tq|该项目于2020年建立}}");
-    expect(formatted).toContain(": '''说明'''：缺少句号");
-    expect(formatted).toContain(": '''建议'''：在句末补全句号。");
+    expect(formatted).toContain(": {{tq|该项目于2020年建立}}");
+    expect(formatted).toContain(": <small>缺少句号</small>");
+    expect(formatted).toContain(": ➡️ <u>在句末补全句号。</u>");
 
     expect(formatted).toContain("=== 建议进一步核对 ===");
     expect(formatted).toContain("<!-- 疑似问题 -->");
     expect(formatted).toContain(
-      "; 1.<!-- 逻辑与连贯性 -->工期“1462天”与日期疑似不符",
+      "; 2.<!-- 逻辑与连贯性 -->工期“1462天”与日期疑似不符<small>（建设历史章节）</small>",
     );
-    expect(formatted).toContain(": '''位置'''：建设历史章节");
-    expect(formatted).toContain(": '''说明'''：日期计算可能存在偏差");
-    expect(formatted).toContain(": '''建议'''：核实准确日期");
+    expect(formatted).toContain(": <small>日期计算可能存在偏差</small>");
+    expect(formatted).toContain(": ➡️ <u>核实准确日期</u>");
 
     expect(formatted).toContain("=== 改进建议 ===");
     expect(formatted).toContain("<!-- 改进建议 -->");
-    expect(formatted).toContain("; 1.<!-- 结构与排版 -->建议增加参考资料章节");
-    expect(formatted).toContain(": '''说明'''：建议增加参考资料章节");
-    expect(formatted).toContain(": '''建议'''：在文末添加参考资料章节");
+    expect(formatted).toContain("; 3.<!-- 结构与排版 -->建议增加参考资料章节");
+    expect(formatted).toContain(": <small>建议增加参考资料章节</small>");
+    expect(formatted).toContain(": ➡️ <u>在文末添加参考资料章节</u>");
 
     expect(formatted).not.toContain("~~~~");
   });
@@ -205,12 +208,12 @@ describe("Review Wikitext utilities", () => {
     };
 
     const formatted = formatReviewResultWikitext(emptyResult);
-    expect(formatted).toContain("【校对概述】未发现任何问题，条目质量良好。");
-    expect(formatted).toContain("=== 确认问题 ===\n<!-- 确认问题 -->\n无");
     expect(formatted).toContain(
-      "=== 建议进一步核对 ===\n<!-- 疑似问题 -->\n无",
+      "'''校对结果：'''共0项：0项确认问题、0项建议进一步核对、0项改进建议。",
     );
-    expect(formatted).toContain("=== 改进建议 ===\n<!-- 改进建议 -->\n无");
+    expect(formatted).toContain(":未发现任何问题，条目质量良好。");
+    // 空分类不再输出章节标题
+    expect(formatted).not.toContain("===");
   });
 
   describe("splitWikitextIntoChunks", () => {
@@ -244,12 +247,14 @@ describe("Review Wikitext utilities", () => {
       const wikitext = `短导言。\n\n${longSectionText}`;
 
       const chunks = splitWikitextIntoChunks(wikitext);
-      expect(chunks.length).toBe(3);
+      expect(chunks.length).toBe(4);
       expect(chunks[0].chunkId).toBe("lead");
       expect(chunks[1].chunkId).toBe("s2-1-1");
       expect(chunks[1].title).toBe("超长章节（前言）");
       expect(chunks[2].chunkId).toBe("s2-1-2");
       expect(chunks[2].title).toBe("超长章节 - 子章节 A");
+      expect(chunks[3].chunkId).toBe("s2-1-3");
+      expect(chunks[3].title).toBe("超长章节 - 子章节 B");
     });
   });
 
