@@ -177,6 +177,16 @@ describe("Task 2 reviewHandler", () => {
           minConfidence: 0.85,
           models: [],
         },
+        afc: {
+          enabled: false,
+          draftNamespace: [2, 118],
+          draftNamespaces: [2, 118],
+          userDailyLimit: 50,
+          talkPage: "User talk:AmanojakuBot/afc",
+          rulePage: "User:AmanojakuBot/task/U4/rule",
+          template: "User:AmanojakuBot/template/ReviewRequest",
+          models: [],
+        },
       },
     } as AppConfig;
   });
@@ -681,6 +691,9 @@ describe("Task 2 reviewHandler", () => {
     expect(talkPageRes.text).toContain("| status = done");
     expect(talkPageRes.text).toContain("| oldid = 77777");
     expect(talkPageRes.text).toContain(`| section = ${expectedDate}`);
+    expect(talkPageRes.text).toContain(
+      "| resultpage = User talk:AmanojakuBot/review/测试条目",
+    );
     expect(talkPageRes.text).toContain("{{ping|Alice}}校对已完成");
     expect(talkPageRes.text).toContain(
       "【校对概述】条目语言流畅，发现一处错别字。",
@@ -779,13 +792,15 @@ describe("Task 2 reviewHandler", () => {
     const resultPageEdit = mockBot.edit.mock.calls[0];
     expect(resultPageEdit[0]).toBe("User talk:AmanojakuBot/review/某某人物");
 
-    // Verify Talk page edit has resultpage set
+    // Verify Talk page edit has resultpage set to the full result page name
     const talkPageEdit = mockBot.edit.mock.calls[1];
     const talkPageTransform = talkPageEdit[1];
     const talkPageRes = talkPageTransform({ content: afterContent });
     expect(talkPageRes.text).toContain("| status = done");
     expect(talkPageRes.text).toContain("| oldid = 66666");
-    expect(talkPageRes.text).toContain("| resultpage = 某某人物");
+    expect(talkPageRes.text).toContain(
+      "| resultpage = User talk:AmanojakuBot/review/某某人物",
+    );
   });
 
   it("handles duplicate section titles by appending sequence number", async () => {

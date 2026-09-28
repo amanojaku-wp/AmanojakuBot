@@ -1508,7 +1508,6 @@ ${candidates.map(formatIssueForMerge).join("\n\n")}
 
   // 6. 确定结果名称 name
   let resultName = fixedArticleTitle;
-  let resultpageParam = resultName;
 
   if (namespace === 2) {
     resultName = await inferIntendedArticleName(
@@ -1518,7 +1517,6 @@ ${candidates.map(formatIssueForMerge).join("\n\n")}
       usageTracker,
       log,
     );
-    resultpageParam = resultName;
   }
 
   // 7. 写入结果页
@@ -1637,10 +1635,9 @@ ${formattedIssuesWikitext}
           status: "done",
           oldid: String(fixedRevid),
           section: actualSectionTitle,
+          // 结果页参数使用完整页面名（含命名空间与子页面前缀），便于模板直接链接
+          resultpage: resultPageTitle,
         };
-        if (resultpageParam) {
-          templateUpdates.resultpage = resultpageParam;
-        }
 
         const updatedTemplateSec = updateWikiTemplate(
           currentSec.content,
