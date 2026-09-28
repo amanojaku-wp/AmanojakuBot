@@ -640,11 +640,8 @@ export function formatAfcResultWikitext(result: AfcResult): string {
 }
 
 /**
-
  * 执行单次发布前评审请求的核心业务逻辑
-
  */
-
 export async function processAfcRequest(
   ctx: HandlerContext,
   request: IncomingRequest,
@@ -1132,7 +1129,8 @@ export const afcHandler = createTemplateRequestHandler({
 /**
  * 任务四：定期/启动清理积压发布前评审请求兜底机制
  *
- * 遍历配置的讨论页中所有二级标题章节，扫描处于待处理状态（status 既非 done 也非 not done）的评审请求模板，
+ * 遍历配置的讨论页中所有二级标题章节，扫描处于待处理状态（status 为空）的评审请求模板
+ * （status 非空即视为该章节已处理过，不再触碰），
  * 自动回溯提交者并执行补处理（实现见 utils/requestWorkflow 的 sweepBacklogRequests）。
  */
 export async function cleanupBacklogAfcs(ctx: HandlerContext): Promise<void> {

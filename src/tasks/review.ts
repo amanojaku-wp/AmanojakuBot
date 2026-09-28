@@ -982,7 +982,8 @@ export const reviewHandler = createTemplateRequestHandler({
 /**
  * 任务二：定期/启动清理积压校对请求兜底机制
  *
- * 遍历配置的讨论页中所有二级标题章节，扫描处于待处理状态（status 既非 done 也非 not done）的校对请求模板，
+ * 遍历配置的讨论页中所有二级标题章节，扫描处于待处理状态（status 为空）的校对请求模板
+ * （status 非空即视为该章节已处理过，不再触碰），
  * 自动回溯提交者并执行补处理（实现见 utils/requestWorkflow 的 sweepBacklogRequests）。
  */
 export async function cleanupBacklogReviews(

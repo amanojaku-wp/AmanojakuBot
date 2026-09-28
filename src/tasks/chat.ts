@@ -162,6 +162,8 @@ const WIKITEXT_OUTPUT_POLICY = `
 
 const MAX_TOKENS = 2000;
 const MAX_REPLY_CHARS = 20000;
+/** 留言超过该时长（毫秒）即视为过期，不再尝试回复（避免回复积压的旧留言） */
+const MAX_REPLY_AGE_MS = 30 * 60 * 1000;
 
 /**
  * 任务一：讨论页自由对话处理器
@@ -202,6 +204,15 @@ export const chatHandler: TaskHandler = async (
     rev.before === undefined ||
     rev.after === undefined
   ) {
+    return { intercepted: true };
+  }
+
+  const editedAt = rev.timestamp ? Date.parse(rev.timestamp) : NaN;
+  if (Number.isFinite(editedAt) && Date.now() - editedAt > MAX_REPLY_AGE_MS) {
+    log.info(
+      { revid, timestamp: rev.timestamp },
+      "chat skipped: comment is older than 30 minutes",
+    );
     return { intercepted: true };
   }
 

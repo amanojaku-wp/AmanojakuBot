@@ -792,7 +792,40 @@ export function parseSections(wikitext: string): SectionInfo[] {
 }
 
 /**
+ * 提取文本末尾的「签名时间戳锚点」：带时间戳的末位签名行及其中的时间戳片段
+ *
+ * 签名时间戳由该条留言唯一产生。机器人处理请求时会改写模板参数
+ * （status / oldid / section / resultpage…），使留言正文不再逐字命中，
+ * 但签名行始终原样保留，因此可用来在同名二级标题之间唯一定位章节。
+ * 未展开的 `~~~~`、未签名模板等无法用于文本匹配的情况返回 null。
+ */
+export function extractSignatureAnchor(
+  text?: string,
+): { line: string; timestamp: string } | null {
+  if (!text) return null;
+
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!hasEndSignature(line)) continue;
+
+    const stamps = [
+      ...line.matchAll(new RegExp(WIKI_TIMESTAMP_REGEX.source, "gi")),
+    ];
+    const lastStamp = stamps[stamps.length - 1];
+    // 仅末尾签名行携带可见时间戳时才可作为锚点
+    if (!lastStamp) continue;
+    return { line, timestamp: lastStamp[0].trim() };
+  }
+
+  return null;
+}
+
+/**
  * 从页面章节列表中精准定位目标章节（避免当页面存在多个同名二级标题时误匹配到首个章节）
+ *
+ * 定位优先级：完整留言内容 → 签名时间戳锚点 → 首行（仅无时间戳依据时）→ 同名未处理模板 →
+ * 章节序号 → 同名章节就近选择。
  */
 export function findMatchingSection(
   sections: SectionInfo[],
@@ -801,45 +834,60 @@ export function findMatchingSection(
   templateName?: string,
 ): SectionInfo | undefined {
   const normTitle = target.title?.trim().toLowerCase() ?? "";
+  const trimmedComment = comment?.trim() ?? "";
+
+  const withSameTitle = (
+    predicate: (section: SectionInfo) => boolean,
+  ): SectionInfo | undefined => {
+    if (!normTitle) return undefined;
+    return sections.find(
+      (section) =>
+        section.title.trim().toLowerCase() === normTitle && predicate(section),
+    );
+  };
 
   // 1. 如果指定了 comment，优先查找内容包含该 comment 的章节
-  if (comment) {
-    const trimmedComment = comment.trim();
-    if (trimmedComment) {
-      // 优先在同名章节中查找包含 comment 的章节
-      if (normTitle) {
-        const inTitleMatch = sections.find(
-          (s) =>
-            s.title.trim().toLowerCase() === normTitle &&
-            s.content.includes(trimmedComment),
-        );
-        if (inTitleMatch) return inTitleMatch;
-      }
+  if (trimmedComment) {
+    // 优先在同名章节中查找包含 comment 的章节
+    const inTitleMatch = withSameTitle((s) =>
+      s.content.includes(trimmedComment),
+    );
+    if (inTitleMatch) return inTitleMatch;
 
-      // 在所有章节中查找包含 comment 的章节
-      const anyMatch = sections.find((s) => s.content.includes(trimmedComment));
-      if (anyMatch) return anyMatch;
+    // 在所有章节中查找包含 comment 的章节
+    const anyMatch = sections.find((s) => s.content.includes(trimmedComment));
+    if (anyMatch) return anyMatch;
+  }
 
-      // 如果 comment 包含多行，尝试匹配第一行
-      const firstLine = trimmedComment.split("\n")[0]?.trim();
-      if (firstLine && firstLine.length > 5) {
-        if (normTitle) {
-          const lineMatchInTitle = sections.find(
-            (s) =>
-              s.title.trim().toLowerCase() === normTitle &&
-              s.content.includes(firstLine),
-          );
-          if (lineMatchInTitle) return lineMatchInTitle;
-        }
-        const lineMatchAny = sections.find((s) =>
-          s.content.includes(firstLine),
-        );
-        if (lineMatchAny) return lineMatchAny;
-      }
+  // 2. 签名时间戳锚点匹配：留言（或目标章节正文）末尾的签名行/时间戳在同名章节中唯一，
+  //    即使模板参数已被改写也能定位到正确的章节，避免按首行猜测而落入同名的旧章节
+  const anchor =
+    extractSignatureAnchor(trimmedComment) ??
+    extractSignatureAnchor(target.content);
+  if (anchor) {
+    const matchesAnchor = (s: SectionInfo) =>
+      s.content.includes(anchor.line) || s.content.includes(anchor.timestamp);
+
+    const inTitleMatch = withSameTitle(matchesAnchor);
+    if (inTitleMatch) return inTitleMatch;
+
+    const anyMatch = sections.find(matchesAnchor);
+    if (anyMatch) return anyMatch;
+  } else if (trimmedComment) {
+    // 3. 仅在留言不含可用时间戳时，才退回按首行猜测（兼容未带签名的留言，如仅插入模板）
+    const firstLine = trimmedComment.split("\n")[0]?.trim();
+    if (firstLine && firstLine.length > 5) {
+      const lineMatchInTitle = withSameTitle((s) =>
+        s.content.includes(firstLine),
+      );
+      if (lineMatchInTitle) return lineMatchInTitle;
+
+      const lineMatchAny = sections.find((s) => s.content.includes(firstLine));
+      if (lineMatchAny) return lineMatchAny;
     }
   }
 
-  // 2. 如果指定了 templateName，查找同名章节中未处理的模板（status 不为 done/not done）
+  // 4. 如果指定了 templateName，查找同名章节中未处理的模板（status 不为 done/not done）
   if (templateName && normTitle) {
     const titleMatches = sections.filter(
       (s) => s.title.trim().toLowerCase() === normTitle,
@@ -855,7 +903,7 @@ export function findMatchingSection(
     }
   }
 
-  // 3. 检查特定 index 处的章节标题是否匹配
+  // 5. 检查特定 index 处的章节标题是否匹配
   if (
     typeof target.index === "number" &&
     target.index >= 0 &&
@@ -867,7 +915,7 @@ export function findMatchingSection(
     }
   }
 
-  // 4. 在同名章节中进行选择
+  // 6. 在同名章节中进行选择
   if (normTitle) {
     const titleMatches = sections.filter(
       (s) => s.title.trim().toLowerCase() === normTitle,

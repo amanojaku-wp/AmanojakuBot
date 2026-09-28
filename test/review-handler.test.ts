@@ -175,7 +175,8 @@ describe("Task 2 reviewHandler", () => {
         },
         aiEdit: {
           enabled: false,
-          draftNamespace: 118,
+          draftNamespace: [2, 118],
+          draftNamespaces: [2, 118],
           silent: true,
           cron: "0 * * * *",
           rulePage: "User:AmanojakuBot/task/U3/rule",

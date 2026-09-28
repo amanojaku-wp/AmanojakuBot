@@ -187,26 +187,34 @@ export async function runWithRequestLock(
 /**
  * 从留言提取结果定位「发生修改的二级标题章节」。
  *
- * 依次尝试：按标题+留言内容匹配 → 按标题匹配 → 按留言内容匹配；
+ * 依次尝试：按标题+留言内容（或签名时间戳锚点）匹配 → 按标题+序号匹配 → 按留言内容匹配；
  * 若最终落在导言区/非二级标题章节（无 title/header），视为不相关。
  */
 export function resolveTargetSection(
   sections: SectionInfo[],
   extraction: Pick<
     CommentExtractionResult,
-    "sectionTitle" | "sectionIndex" | "comment"
+    "sectionTitle" | "sectionIndex" | "comment" | "sectionFullText"
   >,
   templateName: string,
 ): SectionInfo | undefined {
   let target = findMatchingSection(
     sections,
-    { title: extraction.sectionTitle, index: extraction.sectionIndex },
+    {
+      title: extraction.sectionTitle,
+      index: extraction.sectionIndex,
+      content: extraction.sectionFullText,
+    },
     extraction.comment,
     templateName,
   );
   if (!target && extraction.sectionTitle) {
-    target = sections.find(
-      (s) => s.title.toLowerCase() === extraction.sectionTitle.toLowerCase(),
+    // 留言内容定位失败时，退回「同名章节 + 序号」定位（不再直接取首个同名章节）
+    target = findMatchingSection(
+      sections,
+      { title: extraction.sectionTitle, index: extraction.sectionIndex },
+      undefined,
+      templateName,
     );
   }
   if (!target && sections.length > 0) {
@@ -239,6 +247,17 @@ export function normalizeRequestStatus(params: Record<string, string>): string {
 /** 判断 status 是否已终结（done / not done）。 */
 export function isHandledStatus(status: string): boolean {
   return status === "done" || status === "not done";
+}
+
+/**
+ * 积压扫描专用判定：只有 status 为空的模板才视为「尚未处理」的积压请求。
+ *
+ * 与事件流入口的 isHandledStatus（仅 done / not done 终结）不同，积压兜底扫描更保守：
+ * 只要章节内模板已写入任何非空 status（含中间态），即视为该章节已被处理过，
+ * 不再补处理，也不改写其模板与回复内容。
+ */
+export function isBacklogPendingStatus(status: string): boolean {
+  return status.trim() === "";
 }
 
 /**
@@ -473,7 +492,7 @@ export type ResolveIncomingRequestOptions = {
 
 /**
  * 各任务 Handler 的公共前置流程：幂等检查 → 修订校验 → 留言提取 → 章节定位 → 模板解析 →
- * 缺模板提示 → 状态检查 → 请求者身份校验 → 控制页熔断检查。
+ * 缺模板提示 → 状态检查 → 请求者身份校验 → 控制页熔断检查 → 当前页面幂等复核。
  */
 export async function resolveIncomingRequest(
   ctx: HandlerContext,
@@ -586,6 +605,39 @@ export async function resolveIncomingRequest(
   if (!(await ctx.canWrite())) {
     log.info({ revid }, `${label} disabled by control page`);
     return { kind: "ignored" };
+  }
+
+  // 幂等复核（尽力而为）：上面的判定基于触发修订当时的页面内容，但事件可能是位点回放
+  // （进程重启、曾在其它实例上处理过），也可能已被并发实例处理。这里回到「当前页面」确认该请求
+  // 模板是否已处理完成：只有当当前页面确实还在且状态已终结时才跳过，避免重复送去评测
+  // （浪费大量 token）并把回复写进错误章节。页面读取失败或定位不到章节时保持原有行为。
+  try {
+    const currentSection = findMatchingSection(
+      parseSections(await pageText(bot, talkPage)),
+      targetSection,
+      extraction.comment,
+      templateName,
+    );
+    if (currentSection) {
+      const currentState = readRequestTemplate(currentSection, templateName);
+      if (currentState.count !== 1 || currentState.handled) {
+        log.info(
+          {
+            revid,
+            section: targetSection.title,
+            count: currentState.count,
+            status: currentState.status,
+          },
+          `${label} request is already handled or no longer present on the current page, skipping`,
+        );
+        return { kind: "ignored" };
+      }
+    }
+  } catch (err) {
+    log.warn(
+      { err, revid },
+      `${label} failed to re-read talk page for idempotency check`,
+    );
   }
 
   return {
@@ -723,7 +775,8 @@ export async function sweepBacklogRequests(
     if (!sec.title || !sec.header) continue;
 
     const state = readRequestTemplate(sec, templateName);
-    if (state.count !== 1 || state.handled) continue;
+    // 积压扫描只处理 status 为空的模板：任何非空 status 都表示该章节已处理过，不得再动
+    if (state.count !== 1 || !isBacklogPendingStatus(state.status)) continue;
 
     if (lock.isLocked(talkPage, sec.title)) {
       log.info(

@@ -11,6 +11,7 @@ import {
   createTemplateRequestHandler,
   replyToRequest,
   REQUEST_LOCK_TIMEOUT_MS,
+  unwrapPageParam,
   type IncomingRequest,
   type RequestLockRegistry,
   type RequestSectionRef,
@@ -34,7 +35,8 @@ import type { HandlerContext } from "../handle.js";
  * 任务三（3-2）疑似 AI 分析（模板请求驱动，工作流类似 afc）
  *
  * 监听 tasks.aiEdit.talkPage 上使用 tasks.aiEdit.template 的请求章节，
- * 支持 article1、article2……article20 参数，按任务（日期 + 提交人用户名）汇总到同一结果页。
+ * 支持 article1、article2……article20 参数（可为正式条目或 tasks.aiEdit.draftNamespace 允许的草稿），
+ * 按任务（日期 + 提交人用户名）汇总到同一结果页。
  *
  * 章节定位、模板解析、互斥锁与「就地回报进度」等共性流程复用 utils/requestWorkflow；
  * 线索判定的 Schema、系统提示词与规则加载复用 aiEditMonitor.ts 中的 3-1/3-2 共用契约，
@@ -58,15 +60,13 @@ function renderAiCheckSection(
   const lines: string[] = [
     `== ${sectionTitle} ==`,
     "'''注意：以下内容仅为疑似生成式 AI 辅助编辑线索的初步分析，不代表确认或否认该用户滥用 AI。'''",
-    `请求版本：[[Special:Permalink/${sourceRevid}|${sourceRevid}]]；提交人：[[User:${safeWikitext(
-      actor,
-    )}|${safeWikitext(actor)}]]`,
-    "",
   ];
 
   for (const item of results) {
     lines.push(`=== [[${safeTitle(item.title)}]] ===`);
-    lines.push(`* Confidence: ${item.result.confidence}`);
+    // 无线索时不展示线索强度，避免读者把「未发现线索」与高分并列误读为「很可能用了 AI」
+    if (item.result.issues.length > 0)
+      lines.push(`* 线索强度：${item.result.confidence}`);
     lines.push(`* 结论：${safeWikitext(item.result.summary)}`);
     lines.push("");
 
@@ -81,15 +81,15 @@ function renderAiCheckSection(
         ? `<small>（${safeWikitext(issue.location)}）</small>`
         : "";
       lines.push(`; 线索强度：${issue.strength}${loc}`);
-      lines.push(`: 具体特征：${safeWikitext(issue.evidence)}`);
-      lines.push(`: 分析：${safeWikitext(issue.analysis)}`);
+      lines.push(`: {{tq|${safeWikitext(issue.evidence)}}}`);
+      lines.push(`: ${safeWikitext(issue.analysis)}`);
       lines.push(`: 其他可能解释：${safeWikitext(issue.alternative)}`);
       lines.push(`: 建议核查：${safeWikitext(issue.check)}`);
     }
     lines.push("");
   }
 
-  lines.push(marker);
+  lines.push("~~~~" + marker);
   return lines.join("\n");
 }
 
@@ -142,8 +142,12 @@ async function processAiCheckRequest(
   const { revid, actor, actorId, comment, targetSection, reqTemplate } =
     request;
 
-  // 1. 收集 article1..article20 参数。
+  // 1. 收集 article / article1..article20 参数（与任务二、任务四一致，支持无编号的 article）。
+  const article0 = unwrapPageParam(reqTemplate.params.article);
   const articles = collectIndexedParams(reqTemplate.params, "article", 20);
+  if (article0) {
+    articles.push(article0);
+  }
   if (articles.length === 0) {
     await replyAiNotDone(ctx, {
       revid,
@@ -157,13 +161,13 @@ async function processAiCheckRequest(
     return;
   }
 
-  // 2. 逐条解析并读取条目固定版本（仅条目命名空间 ns 0）。
+  // 2. 逐条解析并读取条目固定版本（条目命名空间 ns 0 及 tasks.aiEdit.draftNamespace 允许的草稿命名空间）。
   const resolved: ArticleSnapshot[] = [];
   for (const requested of articles) {
     try {
       const outcome = await fetchArticleSnapshot(ctx, {
         article: requested,
-        allowedNamespaces: [0],
+        allowedNamespaces: [0, ...ai.draftNamespaces],
       });
       if (outcome.status !== "ok") continue;
 
@@ -187,7 +191,8 @@ async function processAiCheckRequest(
       actorId,
       targetSection,
       comment,
-      replyText: "指定的条目不存在、不在条目命名空间或内容为空，无法分析。~~~~",
+      replyText:
+        "指定的条目不存在、不在受支持的名字空间（条目或草稿）或内容为空，无法分析。~~~~",
       summary: "疑似 AI 线索请求处理：条目无效",
     });
     return;

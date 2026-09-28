@@ -155,8 +155,16 @@ export const configSchema = z.object({
       aiEdit: z
         .object({
           enabled: z.boolean().default(false),
-          /** 保留字段：3-1 动态扫描当前仅处理主命名空间（条目，ns 0） */
-          draftNamespace: z.number().int().nonnegative().default(118),
+          /**
+           * 3-2 模板请求额外允许的草稿命名空间（与条目命名空间 0 一并接受，可为单个数字或数组）。
+           * 3-1 动态扫描仍仅处理主命名空间（条目，ns 0）。
+           */
+          draftNamespace: z
+            .union([
+              z.number().int().nonnegative(),
+              z.array(z.number().int().nonnegative()),
+            ])
+            .default([2, 118]),
           /** 按月分段的线索报告页前缀（如 User:AmanojakuBot/task/U3/check），实际写入 <前缀>/YYYY-MM */
           reportPagePrefix: z
             .string()
@@ -187,13 +195,16 @@ export const configSchema = z.object({
           template: z.string().min(1).optional(),
           /** 每次扫描最多送审 LLM 的条目数（同时限制 6 小时窗口与单次扫描预算） */
           maxAnalysesPerWindow: z.number().int().min(1).max(100).default(20),
-          /** 记录为有效线索（写入 check 页与 checkuser 页）的最低置信度阈值 */
+          /**
+           * 记录为有效线索的最低线索强度阈值（0-1）：仅当该次分析确实记录了线索、
+           * 且线索强度 >= 该阈值时，才写入 check 页与 checkuser 页。
+           */
           minConfidence: z.number().min(0.5).max(1).default(0.85),
           llm: llmConfigSchema.optional(),
         })
         .default({
           enabled: false,
-          draftNamespace: 118,
+          draftNamespace: [2, 118],
           silent: true,
           cron: "0 * * * *",
           maxAnalysesPerWindow: 20,
@@ -243,7 +254,7 @@ export const configSchema = z.object({
       },
       aiEdit: {
         enabled: false,
-        draftNamespace: 118,
+        draftNamespace: [2, 118],
         silent: true,
         cron: "0 * * * *",
         maxAnalysesPerWindow: 20,
@@ -314,6 +325,10 @@ export function loadConfig(path = "config.yaml") {
   const aiEditTemplate =
     parsed.tasks.aiEdit.template ??
     `User:${parsed.wiki.username}/template/AIcheck`;
+  const aiEditDraftNamespaceRaw = parsed.tasks.aiEdit.draftNamespace;
+  const aiEditDraftNamespaces: number[] = Array.isArray(aiEditDraftNamespaceRaw)
+    ? aiEditDraftNamespaceRaw
+    : [aiEditDraftNamespaceRaw];
 
   // 校验归属权
   const isBotTalkPage = (p: string) => {
@@ -422,6 +437,7 @@ export function loadConfig(path = "config.yaml") {
         rulePage: aiEditRulePage,
         talkPage: aiEditTalkPage,
         template: aiEditTemplate,
+        draftNamespaces: aiEditDraftNamespaces,
         models: aiEditModels,
       },
       afc: {

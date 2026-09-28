@@ -102,9 +102,11 @@ export type PollingFeedOptions = {
  * 启动 RecentChanges 定期轮询（常驻，不返回）
  *
  * 可靠性设计：
- * 1. 每个受监听讨论页各维护独立 checkpoint，首次运行仅建立基准位点，不回溯历史留言。
+ * 1. 每个受监听的讨论页各维护独立 checkpoint，首次运行仅建立基准位点，不回溯历史留言。
  * 2. 整批变更全部成功处理后才推进位点，保证 At-least-once 语义（重叠窗口内的重复由幂等状态机去重）。
  * 3. 每个页面的轮询任务都经过串行队列，避免与定时清理/扫描任务并发写入 SQLite 或产生编辑冲突。
+ * 4. 轮询窗口的上界固定为「本次 tick 开始时刻」：tick 本身也是串行的（前一个 tick 完成后才排下一个），
+ *    若把上界推迟到任务实际执行时刻，队列积压期间到达的编辑将被永久跳过。
  */
 export function startPollingFeed(options: PollingFeedOptions): void {
   const { cfg, db, bot, log, enqueue, onEvent } = options;
@@ -122,9 +124,9 @@ export function startPollingFeed(options: PollingFeedOptions): void {
   const poll = async (
     key: string,
     title: string | undefined,
+    end: string,
     namespaces?: number[],
   ) => {
-    const end = new Date().toISOString();
     const previous = (checkpoint.get(key) as { timestamp?: string } | undefined)
       ?.timestamp;
     if (!previous) {
@@ -153,12 +155,17 @@ export function startPollingFeed(options: PollingFeedOptions): void {
   };
 
   const tick = async () => {
+    // 窗口上界在本次 tick 开始时即固定：本 tick 的检查任务经串行队列排队，可能因前序任务
+    // （如多个耗时评审）而推迟数分钟才真正执行。若改用任务执行时刻作为上界，推迟期间新增的
+    // 编辑就会被永久跳过（首次建立基准位点时尤其致命），故此处统一取 tick 开始时刻。
+    const end = new Date().toISOString();
     if (cfg.tasks.chat.enabled) {
       try {
         await enqueue(() =>
           poll(
             `poll:chat:${cfg.wiki.apiUrl}:${cfg.tasks.chat.talkPage}`,
             cfg.tasks.chat.talkPage,
+            end,
           ),
         );
       } catch (error) {
@@ -174,6 +181,7 @@ export function startPollingFeed(options: PollingFeedOptions): void {
           poll(
             `poll:review:${cfg.wiki.apiUrl}:${cfg.tasks.review.talkPage}`,
             cfg.tasks.review.talkPage,
+            end,
           ),
         );
       } catch (error) {
@@ -189,6 +197,7 @@ export function startPollingFeed(options: PollingFeedOptions): void {
           poll(
             `poll:afc:${cfg.wiki.apiUrl}:${cfg.tasks.afc.talkPage}`,
             cfg.tasks.afc.talkPage,
+            end,
           ),
         );
       } catch (error) {
@@ -205,6 +214,7 @@ export function startPollingFeed(options: PollingFeedOptions): void {
           poll(
             `poll:aiEdit:${cfg.wiki.apiUrl}:${cfg.tasks.aiEdit.talkPage}`,
             cfg.tasks.aiEdit.talkPage,
+            end,
           ),
         );
       } catch (error) {
