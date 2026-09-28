@@ -242,9 +242,14 @@ async function processAiCheckRequest(
   const now = new Date();
   const dateKey = now.toISOString().slice(0, 10).replace(/-/g, "");
   const resultPage = `${talkPage}/${dateKey}-${actor}`;
-  const existingContent = await pageText(bot, resultPage, {
+  let existingContent = await pageText(bot, resultPage, {
     redirects: false,
   });
+
+  if ((existingContent || "").trim() === "") {
+    existingContent = "{{Talkarchive}}";
+  }
+
   const sectionTitle = generateUniqueSectionTitle(
     parseSections(existingContent).map((s) => s.title),
     formatUtcMinute(now),
