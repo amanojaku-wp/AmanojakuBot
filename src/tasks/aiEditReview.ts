@@ -64,7 +64,7 @@ function renderAiCheckSection(
 
   for (const item of results) {
     lines.push(`=== ${safeTitle(item.title)} ===`);
-    lines.push(`* {{La|${safeWikitext(item.result.summary)}}}`);
+    lines.push(`* {{La|${safeWikitext(item.title)}}}`);
     // 无线索时不展示线索强度，避免读者把「未发现线索」与高分并列误读为「很可能用了 AI」
     if (item.result.issues.length > 0) {
       lines.push(`* 线索强度：${item.result.confidence}`);
@@ -85,7 +85,9 @@ function renderAiCheckSection(
       lines.push(`; 线索强度：${issue.strength}${loc}`);
       lines.push(`: {{tq|${safeWikitext(issue.evidence)}}}`);
       lines.push(`: ${safeWikitext(issue.analysis)}`);
-      lines.push(`: '''其他可能解释：'''<i>${safeWikitext(issue.alternative)}</i>`);
+      lines.push(
+        `: '''其他可能解释：'''<i>${safeWikitext(issue.alternative)}</i>`,
+      );
       lines.push(`: '''建议：'''<u>${safeWikitext(issue.check)}</u>`);
     }
     lines.push("");
