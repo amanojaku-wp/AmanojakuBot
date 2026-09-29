@@ -1,5 +1,6 @@
-import { pageText } from "../utils/wiki.js";
+import { pageText, revisionDiff } from "../utils/wiki.js";
 import {
+  canonicalTitle,
   generateUniqueSectionTitle,
   parseSections,
   safeWikitext,
@@ -19,15 +20,20 @@ import {
 import {
   fetchArticleSnapshot,
   rejectArticleRequest,
-  type ArticleSnapshot,
 } from "../utils/articleReview.js";
 import {
   analyzeWikitextClues,
   formatUtcMinute,
   loadAiRules,
+  markFullArticleSent,
   MAX_ARTICLE_CHARS,
+  renderDiffLinks,
   safeTitle,
+  shouldSendFullArticle,
+  toDiffInput,
   type AiClueResult,
+  type AiDiffInput,
+  type AiDiffRef,
 } from "./aiEditMonitor.js";
 import type { HandlerContext } from "../handle.js";
 
@@ -35,26 +41,84 @@ import type { HandlerContext } from "../handle.js";
  * 任务三（3-2）疑似 AI 分析（模板请求驱动，工作流类似 afc）
  *
  * 监听 tasks.aiEdit.talkPage 上使用 tasks.aiEdit.template 的请求章节，
- * 支持 article1、article2……article20 参数（可为正式条目或 tasks.aiEdit.draftNamespace 允许的草稿），
+ * 支持 article1、article2……article20 参数（条目名，可为正式条目或 tasks.aiEdit.draftNamespace 允许的草稿）
+ * 以及 diff1、diff2……diff20 参数（修订版本号或 [[Special:Diff/…]] 差异链接），
  * 按任务（日期 + 提交人用户名）汇总到同一结果页。
  *
+ * 送检规则（与 3-1 一致）：
+ * - 先按「规范化条目名」把 article 与 diff 参数合并：同一条目只送检一次，其全部差异合并为同一次请求；
+ * - 送检内容 = 全部差异 + 完整条目正文；但该条目 24 小时内已送检过完整正文（或正文过长）时只送差异；
+ * - 报告页用 {{La}} 整理条目相关链接（条目、编辑、讨论、历史等），并按送检差异逐条列出 Diff。
+ *
  * 章节定位、模板解析、互斥锁与「就地回报进度」等共性流程复用 utils/requestWorkflow；
- * 线索判定的 Schema、系统提示词与规则加载复用 aiEditMonitor.ts 中的 3-1/3-2 共用契约，
+ * 线索判定的 Schema、系统提示词、送检输入与规则加载复用 aiEditMonitor.ts 中的 3-1/3-2 共用契约，
  * 保证两条路径的中立性与证据要求完全一致。
  */
 
 /** 3-2 请求互斥锁超时时间（15 分钟，与其它请求类任务一致）。 */
 export const AI_LOCK_TIMEOUT_MS = REQUEST_LOCK_TIMEOUT_MS;
 
+/** 单次请求最多接受的差异参数数量（diff1…diff20）。 */
+export const MAX_DIFF_PARAMS = 20;
+
 /** 3-2 请求锁注册表（键为 `talkPage#sectionTitle` 与 `revid:xxx`）。 */
 const aiEditLocks: RequestLockRegistry = createRequestLockRegistry();
 
-/** 渲染 3-2 结果页中的一次请求章节（程序完成文字拼接）。 */
+/** 请求中解析出的差异引用：目标修订号 + 可选对比基准修订号。 */
+export type DiffRef = { revid: number; fromRevid?: number };
+
+/**
+ * 解析模板中的 diff 参数。
+ *
+ * 支持：裸修订号（`12345`）、`[[Special:Diff/12345]]`、`[[Special:差异/12345]]`，
+ * 以及双版本形式 `[[Special:Diff/12345/67890]]`（以 67890 为目标版本、12345 为基准版本）。
+ * 无法识别时返回 null（由调用方回报给提交人）。
+ */
+export function parseDiffParam(value: string | undefined): DiffRef | null {
+  if (!value) return null;
+  const raw = unwrapPageParam(value).trim();
+  if (!raw) return null;
+
+  const linkMatch = raw.match(
+    /(?:(?:Special|特别|特別|特殊)\s*:\s*)?(?:Diff|diff|差异|差異)\s*\/\s*(\d+)(?:\s*\/\s*(\d+))?/,
+  );
+  if (linkMatch) {
+    const first = Number(linkMatch[1]);
+    const second = linkMatch[2] ? Number(linkMatch[2]) : undefined;
+    return second ? { revid: second, fromRevid: first } : { revid: first };
+  }
+
+  if (/^\d+$/.test(raw)) return { revid: Number(raw) };
+  return null;
+}
+
+/** 3-2 结果页中的一个条目（一个条目只出现一次，其全部送检差异合并展示）。 */
+type AiCheckResultItem = {
+  title: string;
+  /** 附带完整条目正文时对应的修订号（否则为差异所属修订） */
+  revid?: number;
+  diffs: AiDiffRef[];
+  result: AiClueResult;
+};
+
+/** 3-2 送检前按规范化条目名合并的分析对象。 */
+type AiCheckTarget = {
+  title: string;
+  canonical: string;
+  /** 完整条目正文是否来自 article 参数快照（否则取差异所属修订的正文） */
+  fromArticle: boolean;
+  content?: string;
+  revid?: number;
+  diffs: AiDiffInput[];
+};
+
+/**
+ * 渲染 3-2 结果页中的一次请求章节（程序完成文字拼接）。
+ */
 function renderAiCheckSection(
   sectionTitle: string,
-  actor: string,
-  sourceRevid: number,
-  results: { title: string; revid: number; result: AiClueResult }[],
+  results: AiCheckResultItem[],
+  unreadable: string[],
   marker: string,
 ): string {
   const lines: string[] = [
@@ -64,7 +128,11 @@ function renderAiCheckSection(
 
   for (const item of results) {
     lines.push(`=== ${safeTitle(item.title)} ===`);
+    // {{La}} 负责整理条目相关链接（条目、编辑、讨论、历史等），此处只按送检差异列出具体 Diff
     lines.push(`* {{La|${safeWikitext(item.title)}}}`);
+    if (item.diffs.length > 0) {
+      lines.push(`* Diff: ${renderDiffLinks(item.diffs)}`);
+    }
     // 无线索时不展示线索强度，避免读者把「未发现线索」与高分并列误读为「很可能用了 AI」
     if (item.result.issues.length > 0) {
       lines.push(`* 线索强度：${item.result.confidence}`);
@@ -82,7 +150,12 @@ function renderAiCheckSection(
       const loc = issue.location
         ? `<small>（${safeWikitext(issue.location)}）</small>`
         : "";
-      lines.push(`; 线索强度：${issue.strength}${loc}`);
+      // 同一条目送检多条差异时标注线索归属，便于人工对照具体编辑
+      const diffTag =
+        issue.diff && item.diffs.length > 1
+          ? `<small>（差异 [[Special:Diff/${issue.diff}|${issue.diff}]]）</small>`
+          : "";
+      lines.push(`; 线索强度：${issue.strength}${loc}${diffTag}`);
       lines.push(`: {{tq|${safeWikitext(issue.evidence)}}}`);
       lines.push(`: ${safeWikitext(issue.analysis)}`);
       lines.push(
@@ -90,6 +163,13 @@ function renderAiCheckSection(
       );
       lines.push(`: '''建议：'''<u>${safeWikitext(issue.check)}</u>`);
     }
+    lines.push("");
+  }
+
+  if (unreadable.length > 0) {
+    lines.push(
+      `: '''未能读取或分析的送检对象：'''${safeWikitext([...new Set(unreadable)].join("、"))}`,
+    );
     lines.push("");
   }
 
@@ -139,56 +219,138 @@ async function processAiCheckRequest(
   ctx: HandlerContext,
   request: IncomingRequest,
 ): Promise<void> {
-  const { bot, cfg, log } = ctx;
+  const { db, bot, cfg, log } = ctx;
   const ai = cfg.tasks.aiEdit;
   const talkPage = ai.talkPage!;
   const templateName = ai.template!;
   const { revid, actor, actorId, comment, targetSection, reqTemplate } =
     request;
 
-  // 1. 收集 article / article1..article20 参数（与任务二、任务四一致，支持无编号的 article）。
+  // 1. 收集 article / article1..article20（条目名，与任务二、任务四一致）与
+  //    diff / diff1..diff20（修订版本号或差异链接）参数。
   const article0 = unwrapPageParam(reqTemplate.params.article);
   const articles = collectIndexedParams(reqTemplate.params, "article", 20);
   if (article0) {
     articles.push(article0);
   }
-  if (articles.length === 0) {
+
+  const diff0 = reqTemplate.params.diff;
+  const diffParamValues = [
+    ...(diff0 ? [diff0] : []),
+    ...collectIndexedParams(reqTemplate.params, "diff", MAX_DIFF_PARAMS),
+  ];
+  const diffRefs: DiffRef[] = [];
+  /** 无法读取 / 无法解析的送检对象，最终在结果页与回复中如实列出 */
+  const unreadable: string[] = [];
+  for (const raw of diffParamValues) {
+    const parsed = parseDiffParam(raw);
+    if (!parsed) {
+      unreadable.push(raw);
+      continue;
+    }
+    if (
+      !diffRefs.some(
+        (d) => d.revid === parsed.revid && d.fromRevid === parsed.fromRevid,
+      )
+    ) {
+      diffRefs.push(parsed);
+    }
+  }
+
+  if (articles.length === 0 && diffRefs.length === 0) {
     await replyAiNotDone(ctx, {
       revid,
       actorId,
       targetSection,
       comment,
       replyText:
-        "未指定待分析条目。请使用 article1、article2……article20 参数提供条目名。~~~~",
-      summary: "疑似 AI 线索请求处理：未指定条目",
+        "未指定待分析条目或差异。请使用 article1、article2……article20 提供条目名，或使用 diff1、diff2……diff20 提供修订版本号。~~~~",
+      summary: "疑似 AI 线索请求处理：未指定条目或差异",
     });
     return;
   }
 
-  // 2. 逐条解析并读取条目固定版本（条目命名空间 ns 0 及 tasks.aiEdit.draftNamespace 允许的草稿命名空间）。
-  const resolved: ArticleSnapshot[] = [];
+  // 2. 按「规范化条目名」把条目与差异合并：同一条目只分析一次，其全部差异合并为一次送检。
+  //    条目命名空间为 ns 0 及 tasks.aiEdit.draftNamespace 允许的草稿命名空间。
+  const allowedNamespaces = [0, ...ai.draftNamespaces];
+  const targets = new Map<string, AiCheckTarget>();
+
   for (const requested of articles) {
     try {
       const outcome = await fetchArticleSnapshot(ctx, {
         article: requested,
-        allowedNamespaces: [0, ...ai.draftNamespaces],
+        allowedNamespaces,
       });
-      if (outcome.status !== "ok") continue;
-
-      const snapshot = outcome.snapshot;
-      if (snapshot.content.length > MAX_ARTICLE_CHARS) {
-        log.info(
-          { title: snapshot.title, length: snapshot.content.length },
-          "aiEdit skip oversized article",
-        );
+      if (outcome.status !== "ok") {
+        unreadable.push(requested);
         continue;
       }
-      resolved.push(snapshot);
+
+      const snapshot = outcome.snapshot;
+      const key = canonicalTitle(snapshot.title);
+      const existingDiffs = targets.get(key)?.diffs ?? [];
+      targets.set(key, {
+        title: snapshot.title,
+        canonical: key,
+        fromArticle: true,
+        content: snapshot.content,
+        revid: snapshot.revid,
+        diffs: existingDiffs,
+      });
     } catch (err) {
       log.warn({ err, requested }, "aiEdit failed to fetch article content");
+      unreadable.push(requested);
     }
   }
 
+  for (const ref of diffRefs) {
+    try {
+      const diff = await revisionDiff(bot, ref.revid, {
+        fromRevid: ref.fromRevid,
+      });
+      if (!diff) {
+        unreadable.push(`Special:Diff/${ref.revid}`);
+        continue;
+      }
+      if (
+        typeof diff.namespace === "number" &&
+        !allowedNamespaces.includes(diff.namespace)
+      ) {
+        log.info(
+          { revid: ref.revid, ns: diff.namespace },
+          "aiEdit 3-2 diff in disallowed namespace",
+        );
+        unreadable.push(`Special:Diff/${ref.revid}`);
+        continue;
+      }
+
+      const key = canonicalTitle(diff.title);
+      const target: AiCheckTarget = targets.get(key) ?? {
+        title: diff.title,
+        canonical: key,
+        fromArticle: false,
+        diffs: [],
+      };
+      if (!target.diffs.some((d) => d.revid === diff.revid)) {
+        target.diffs.push(toDiffInput(diff));
+      }
+      // 未由 article 参数提供完整条目时，以差异所属修订的正文作为「完整条目」
+      if (
+        !target.fromArticle &&
+        diff.content &&
+        (!target.revid || diff.revid >= target.revid)
+      ) {
+        target.content = diff.content;
+        target.revid = diff.revid;
+      }
+      targets.set(key, target);
+    } catch (err) {
+      log.warn({ err, revid: ref.revid }, "aiEdit failed to read diff");
+      unreadable.push(`Special:Diff/${ref.revid}`);
+    }
+  }
+
+  const resolved = [...targets.values()];
   if (resolved.length === 0) {
     await replyAiNotDone(ctx, {
       revid,
@@ -196,31 +358,72 @@ async function processAiCheckRequest(
       targetSection,
       comment,
       replyText:
-        "指定的条目不存在、不在受支持的名字空间（条目或草稿）或内容为空，无法分析。~~~~",
-      summary: "疑似 AI 线索请求处理：条目无效",
+        "指定的条目或差异不存在、不可读取，或不在受支持的名字空间（条目或草稿），无法分析。~~~~",
+      summary: "疑似 AI 线索请求处理：条目或差异无效",
     });
     return;
   }
 
-  // 3. 按规则逐条调用 LLM，输出结构化线索。
+  // 3. 按规则逐条调用 LLM（一个条目一轮只请求一次，携带该条目本次全部差异）。
   const ruleContent = await loadAiRules(ctx);
   const usage = createTokenUsage();
-  const results: { title: string; revid: number; result: AiClueResult }[] = [];
+  const results: AiCheckResultItem[] = [];
 
-  for (const article of resolved) {
+  for (const target of resolved) {
+    // 24 小时内已送检过完整正文（或正文过长）时只送差异，避免重复整篇送审；
+    // 但若本次没有任何差异可送，则仍必须送完整条目，否则该请求没有可判断的内容。
+    let content = target.content;
+    let revidForRequest = target.revid;
+    if (content && content.length > MAX_ARTICLE_CHARS) {
+      log.info(
+        { title: target.title, length: content.length },
+        "aiEdit 3-2 oversized article, sending diff only",
+      );
+      content = undefined;
+    } else if (
+      content &&
+      target.diffs.length > 0 &&
+      !shouldSendFullArticle(db, target.canonical)
+    ) {
+      log.info(
+        { title: target.title },
+        "aiEdit 3-2 article sent within reuse window, sending diff only",
+      );
+      content = undefined;
+    }
+
+    // 送检前记录完整条目的发送时间，供后续 24 小时窗口复用判断。
+    if (content) markFullArticleSent(db, target.canonical, target.title);
+
+    // 既无完整条目也没有可送检差异时无法分析（如仅供条目名但正文过长），如实回报。
+    if (!content && target.diffs.length === 0) {
+      log.info(
+        { title: target.title },
+        "aiEdit 3-2 skip target without analyzable content or diff",
+      );
+      unreadable.push(target.title);
+      continue;
+    }
+
     try {
       const result = await analyzeWikitextClues(ctx, {
         phase: "3-2",
-        title: article.title,
-        revid: article.revid,
-        content: article.content,
+        title: target.title,
+        revid: revidForRequest,
+        content,
+        diffs: target.diffs,
         ruleContent,
         usageTracker: usage,
       });
-      results.push({ title: article.title, revid: article.revid, result });
+      results.push({
+        title: target.title,
+        revid: revidForRequest,
+        diffs: target.diffs.map((d) => ({ revid: d.revid, user: d.user })),
+        result,
+      });
     } catch (err) {
       log.error(
-        { err, article: article.title },
+        { err, article: target.title },
         "aiEdit 3-2 article analysis failed",
       );
     }
@@ -257,9 +460,8 @@ async function processAiCheckRequest(
   const marker = `<!-- ai-request:${revid} -->`;
   const sectionBody = renderAiCheckSection(
     sectionTitle,
-    actor,
-    revid,
     results,
+    unreadable,
     marker,
   );
 
@@ -329,7 +531,8 @@ async function processAiCheckRequest(
  * 任务三（3-2）疑似 AI 分析请求处理器。
  *
  * 监听 tasks.aiEdit.talkPage 上使用 tasks.aiEdit.template 的请求章节，
- * 支持 article1、article2……article20 参数，按任务（日期 + 提交人用户名）汇总结果页。
+ * 支持 article1、article2……article20（条目名）与 diff1、diff2……diff20（修订版本或差异链接）参数，
+ * 按任务（日期 + 提交人用户名）汇总结果页。
  * 页面展示可疑之处，作为发起 AI 调查的初步分析线索，不代表确认或否认此人滥用 AI。
  *
  * 公共入口流程（幂等检查 → 修订校验 → 留言提取 → 章节定位 → 模板解析 → 身份校验 →

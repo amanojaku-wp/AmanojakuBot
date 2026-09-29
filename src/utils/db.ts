@@ -20,6 +20,7 @@ export type Migration = {
  * - 20260924000000: checkpoint 表新增 last_revid 字段
  * - 20260926000000: 新增 afc_requests 发布前评审请求表
  * - 20260928000000: 新增 ai_edit_reports 任务三按条目聚合的疑似 AI 线索表
+ * - 20260929000000: 新增 ai_edit_sends 任务三「完整条目」送检记录表（24 小时内同一目只送差异）
  */
 export const MIGRATIONS: Migration[] = [
   {
@@ -238,6 +239,22 @@ export const MIGRATIONS: Migration[] = [
         );
         CREATE INDEX IF NOT EXISTS idx_ai_edit_reports_scan_time ON ai_edit_reports(scan_time);
         CREATE INDEX IF NOT EXISTS idx_ai_edit_reports_published ON ai_edit_reports(published, confidence);
+      `);
+    },
+  },
+  {
+    // 任务三（3-1 / 3-2）送检节流：记录每个规范化条目最近一次「连同完整条目一起送检」的时间。
+    // 24 小时内再次送检同一条目时不再附带完整条目正文，只送本次编辑差异，避免重复消耗大量 token。
+    version: "20260929000000",
+    name: "create_ai_edit_sends_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ai_edit_sends (
+          canonical_title TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          sent_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_edit_sends_sent_at ON ai_edit_sends(sent_at);
       `);
     },
   },
@@ -684,6 +701,7 @@ export function getAfcRequest(
  * 10. `error_logs`: 系统运行异常与错误日志记录表。
  * 11. `schema_migrations`: 数据库版本迁移追踪表。
  * 12. `ai_edit_reports`: 任务三（3-1 动态扫描）按条目聚合的疑似 AI 线索记录，包含合并后的 diff/user 列表、置信度与结构化分析结果，以及发布幂等状态。
+ * 13. `ai_edit_sends`: 任务三（3-1 / 3-2）按规范化条目名记录「完整条目」最近一次送检时间，用于 24 小时内只送编辑差异、不重复送完整正文。
  */
 export function openDb(path = "bot.sqlite"): DatabaseSync {
   const db = new DatabaseSync(path);

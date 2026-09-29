@@ -2,17 +2,16 @@ import { tool } from "ai";
 import { z } from "zod";
 import type { Mwn } from "mwn";
 import type { Logger } from "pino";
-import { diffLines } from "diff";
 import {
   hasDiscussionComments,
   parseStructuredDiscussionPage,
   type StructuredDiscussionSection,
 } from "./wikitext.js";
+import { revisionDiff } from "./wiki.js";
 
 const MAX_RESULTS = 20;
 const MAX_SEARCH_RESULTS = 10;
 const MAX_CONTENT_CHARS = 120000;
-const MAX_DIFF_CHARS = 120000;
 
 export type WikiPageResult =
   | {
@@ -518,20 +517,8 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
         const startedAt = Date.now();
         log?.debug({ revid, fromRevid }, "tool getWikiDiff started");
 
-        // 1. 获取目标版本详情与内容
-        const targetRes = await bot.request({
-          action: "query",
-          prop: "revisions",
-          revids: revid,
-          rvprop: "ids|timestamp|user|comment|flags|content",
-          rvslots: "main",
-          formatversion: 2,
-        });
-
-        const targetPage = targetRes?.query?.pages?.[0];
-        const targetRev = targetPage?.revisions?.[0];
-
-        if (!targetPage || targetPage.missing || !targetRev) {
+        const diff = await revisionDiff(bot, revid, { fromRevid });
+        if (!diff) {
           return {
             found: false,
             revid,
@@ -540,80 +527,10 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
           };
         }
 
-        const targetContent =
-          targetRev.slots?.main?.content ??
-          targetRev.slots?.main?.["*"] ??
-          targetRev.content ??
-          targetRev["*"] ??
-          "";
-
-        // 2. 确定对比的基准版本 (baseRevId)
-        const baseRevId = fromRevid ?? targetRev.parentid;
-
-        let baseContent = "";
-        let baseRevInfo: {
-          revid?: number;
-          user?: string;
-          timestamp?: string;
-          comment?: string;
-        } | null = null;
-
-        if (baseRevId && baseRevId > 0) {
-          const baseRes = await bot.request({
-            action: "query",
-            prop: "revisions",
-            revids: baseRevId,
-            rvprop: "ids|timestamp|user|comment|flags|content",
-            rvslots: "main",
-            formatversion: 2,
-          });
-          const basePage = baseRes?.query?.pages?.[0];
-          const bRev = basePage?.revisions?.[0];
-          if (bRev) {
-            baseContent =
-              bRev.slots?.main?.content ??
-              bRev.slots?.main?.["*"] ??
-              bRev.content ??
-              bRev["*"] ??
-              "";
-            baseRevInfo = {
-              revid: bRev.revid,
-              user: bRev.user,
-              timestamp: bRev.timestamp,
-              comment: bRev.comment ?? "",
-            };
-          }
-        }
-
-        // 3. 计算文本差异
-        const diffs = diffLines(baseContent, targetContent);
-
-        const changes: {
-          type: "added" | "removed";
-          value: string;
-        }[] = [];
-
-        let diffText = "";
-        for (const part of diffs) {
-          if (part.added) {
-            changes.push({ type: "added", value: part.value });
-            diffText += `+ ${part.value.trimEnd()}\n`;
-          } else if (part.removed) {
-            changes.push({ type: "removed", value: part.value });
-            diffText += `- ${part.value.trimEnd()}\n`;
-          }
-        }
-
-        const truncated = diffText.length > MAX_DIFF_CHARS;
-        if (truncated) {
-          diffText =
-            diffText.slice(0, MAX_DIFF_CHARS) + "\n...[差异过长已截断]";
-        }
-
         log?.debug(
           {
             revid,
-            fromRevid: baseRevId,
+            fromRevid: diff.parentid,
             elapsedMs: Date.now() - startedAt,
           },
           "tool getWikiDiff completed",
@@ -621,21 +538,21 @@ export function createWikiTools(bot: Mwn, log?: Logger) {
 
         return {
           found: true,
-          title: targetPage.title,
-          pageid: targetPage.pageid,
+          title: diff.title,
+          pageid: diff.pageid,
           targetRevision: {
-            revid: targetRev.revid,
-            parentid: targetRev.parentid,
-            user: targetRev.user,
-            timestamp: targetRev.timestamp,
-            comment: targetRev.comment ?? "",
-            minor: !!targetRev.minor,
+            revid: diff.revid,
+            parentid: diff.parentid,
+            user: diff.user,
+            timestamp: diff.timestamp,
+            comment: diff.comment,
+            minor: diff.minor,
           },
-          baseRevision: baseRevInfo,
-          isNewPage: !baseRevId || baseRevId === 0,
-          diffText: diffText.trim(),
-          changesCount: changes.length,
-          truncated,
+          baseRevision: diff.base,
+          isNewPage: diff.isNewPage,
+          diffText: diff.diffText,
+          changesCount: diff.changesCount,
+          truncated: diff.truncated,
         };
       },
     }),
