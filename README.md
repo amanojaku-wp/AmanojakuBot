@@ -260,6 +260,7 @@ src/
     ├── workQueue.ts          # 键控有界并发队列 + 页面级互斥锁（同键串行、异键并行、不丢任务）
     ├── workDispatch.ts       # 后台工作派发（认领后异步执行；未注入队列时退化为同步内联）
     ├── pageWriteLock.ts      # 维基页面写入互斥（同一页面的读-改-写串行，避免丢更新与编辑冲突）
+    ├── linkCheck.ts          # 参考文献 URL 可达性检查（提取 URL、探测、本地复用缓存）
     ├── changeFeed.ts         # 变更事件统一入口（按 mode 分发）
     ├── eventstream.ts        # EventStreams(SSE) 驱动（含 checkpoint、断线重连与补偿）
     ├── polling.ts            # RecentChanges 轮询驱动（窗口增量、分页、重叠去重）
@@ -308,7 +309,8 @@ src/
 
 - **入口**：`src/tasks/aiEditMonitor.ts` → `scanAiEdits` + `publishAiReports`
 - **触发**：按 `tasks.aiEdit.cron`（UTC，默认每小时整点）定时执行；**首次 tick 只建立基准位点**，不回溯历史编辑
-- **流程**：RecentChanges API 扫描自上次 checkpoint 以来的编辑（周期超过 API 上限时自动分段查询）→ 只保留命名空间 0 的 `edit`/`new` → 忽略机器人/机器用户/匿名 IP 与 AWB、Twinkle、回退功能标签 → 丢弃净增加量 < 100 字节的 diff → **同一条目的全部差异合并为一次请求**（一个条目一轮只送检一次）→ 送检「全部差异 + 完整条目正文」（24 小时内已送过完整正文或正文过长时降级为只送差异）→ LLM 输出结构化线索 → 程序拼接 Markdown 追加到 `tasks.aiEdit.debugLog`。
+- **流程**：RecentChanges API 扫描自上次 checkpoint 以来的编辑（周期超过 API 上限时自动分段查询）→ 只保留命名空间 0 的 `edit`/`new` → 忽略机器人/机器用户/匿名 IP 与 AWB、Twinkle、回退功能标签 → 丢弃净增加量 < 100 字节的 diff → **同一条目的全部差异合并为一次请求**（一个条目一轮只送检一次）→ 送检「全部差异 + 完整条目正文」（24 小时内已送过完整正文或正文过长时降级为只送差异）→ LLM 输出结构化线索 → 程序拼接 Markdown 追加到 `tasks.aiEdit.debugLog`（含 `* links: N checked, M unreachable`）。
+- **确定性检查（不依赖 LLM，且在送检之前）**：每次分析前先跑一次纯程序化的**参考文献 URL 可达性检查**（`tasks.aiEdit.linkCheck`，默认开启）——提取条目参考文献 / 外部链接中的 URL 并实际探测一次，检查结果与「本次编辑新增的链接」失效统计（`stats`：`newReferences / checkedNewUrls / deadNewUrls / deadRate`）会作为**确定性事实**写进提示词（`deadUrls` 带 `httpStatus`、`httpError` 分类与 `referenceName`），让模型判断「新增引用集中失效」这类线索；同时程序自己也记一条线索：异常链接 1 个为 low、≥2 个为 medium。**模板已提供 `archive-url`（存档）或标注 `url-status` 为 dead / usurped / unfit 时，其原链接失效属正常情况，不计入异常**（存档链接本身仍检查）。检查结果缓存在本地 `citation_links` 表，复用窗口（7 天）内不重复探测，避免重复跑测试；即使因复用窗口 / 正文过长只送差异，也仍用完整条目正文做这项检查（不消耗 token）。链接失效也可能只是站点反爬、临时故障或来源抄录有误，因此线索强度不高于 medium，且必须写明其他可能解释与人工核查方法。
 - **线索字段**：线索强度 `confidence`（**整体线索强度**，越大越指向疑似 AI 辅助编辑，**不是**「使用 AI 的概率」）、问题概述、位置、具体证据、分析、其他合理解释、建议核查、所属差异修订号。
 - **发布（可选）**：`silent = false` 时才写维基 —— `reportPagePrefix/YYYY-MM`（按扫描时间设二级标题、条目设三级标题、`{{anchor|紧凑时间+条目名}}` 锚点、`{{La}}` 整理链接、逐条 Diff）与 `usersPage`（同一编者在 ≥3 个不同规范化条目中出现达标线索时，在 `== YYYY-MM ==` 下合并/追加编者行）。
 - **`silent` 默认 `true`**（仅写本地日志）；发布与 checkuser 汇总都额外要求「记录中确实存在线索」，无线索记录绝不公开。
@@ -318,7 +320,8 @@ src/
 - **入口**：`src/tasks/aiEditReview.ts` → `aiEditHandler`（参数解析 `parseDiffParam`，主流程 `processAiCheckRequest`）
 - **触发**：`tasks.aiEdit.talkPage` 上使用 `tasks.aiEdit.template` 的请求章节
 - **参数**：`article1` … `article20`（条目名，允许命名空间 0 与 `tasks.aiEdit.draftNamespace`），以及 `diff1` … `diff20`（裸修订号、`[[Special:Diff/修订号]]`、`[[Special:Diff/A/B]]` 以 B 为目标）；不带编号的 `article` / `diff` 也支持
-- **流程**：先按规范化条目名把 article 与 diff 参数合并 → **同一条目只分析一次，全部差异合并为一次送检** → 命名空间校验、24 小时完整正文复用与降级规则同 3-1（共用 `ai_edit_sends` 表；若本次没有任何差异可送，则仍送完整条目）→ 按任务（日期 + 提交人用户名）汇总到同一结果页。
+- **流程**：先按规范化条目名把 article 与 diff 参数合并 → **同一条目只分析一次，全部差异合并为一次送检** → 命名空间校验、24 小时完整正文复用与降级规则同 3-1（共用 `ai_edit_sends` 表；若本次没有任何差异可送，则仍送完整条目）→ 先做与 3-1 相同的确定性链接检查（含 `archive-url` 例外与新增引用失效统计），再逐条 LLM 结构化分析，最后合并程序生成的链接线索 → 按任务（日期 + 提交人用户名）汇总到同一结果页。
+- **跳过规则**：**逐项跳过、不影响其它对象**——article / diff 参数无法识别、页面不存在 / 不可读取、命名空间不在条目与 `draftNamespace` 内、或 **diff 的编辑时间早于 2023 年**（早于生成式 AI 广泛使用，不可能是 AI 编辑，不送模型也不做链接检查）时，只跳过该项并列入结果页「未能读取或已跳过的送检对象」；**只有提供的全部 article 与 diff 都无效时才回复 not done**，只要有一项有效就照常分析有效部分。
 - **结果页**：用 `{{La}}` 整理条目相关链接，按送检差异逐条列出 Diff；无法识别的参数、不存在/不可读取的修订或命名空间不受支持的页面会如实列入结果页与日志。
 - **定位说明**：页面展示的是**人工复核线索**，作为发起 AI 调查的初步分析，**不代表确认或否认**该编者滥用 AI。
 
@@ -341,6 +344,7 @@ src/
 | 配置 | `src/config/index.ts` → `loadConfig` | YAML + Zod 校验，含安全约束（可写页面必须属于机器人） |
 | LLM | `src/utils/llm.ts` → `executeWithFallback` | 多模型依次降级，`generateObject` + Zod 结构化输出 |
 | 差异读取 | `src/utils/wiki.ts` → `revisionDiff` | 读取目标/基准修订元数据与 `+`/`-` 差异文本（有长度上限） |
+| 链接可达性 | `src/utils/linkCheck.ts` → `extractReferenceLinks` / `checkLinks` | 提取参考文献 URL（支持 archive-url 例外与来源标识）、探测可达性并按本地 `citation_links` 表复用结果 |
 
 ---
 

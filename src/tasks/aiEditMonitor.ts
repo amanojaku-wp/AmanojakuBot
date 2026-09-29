@@ -16,6 +16,17 @@ import {
 } from "../utils/llm.js";
 import { runInTransaction } from "../utils/db.js";
 import {
+  checkLinks,
+  classifyLinkError,
+  describeLinkFailure,
+  extractAddedReferenceLinks,
+  extractReferenceLinks,
+  isSuspectCitationLink,
+  MAX_LINKS_PER_ARTICLE,
+  type ExtractedReference,
+  type LinkCheckResult,
+} from "../utils/linkCheck.js";
+import {
   fetchRecentChanges,
   pollingStart,
   type RecentChange,
@@ -73,6 +84,8 @@ const DEFAULT_AI_EDIT_RULES = `
 * 只判断当前实际提供的内容，不得根据编辑者身份、编辑历史、用户名、经验程度或模型记忆猜测。
 * 不得把“写得很好”“写得很正式”“篇幅很长”“语言流畅”等本身作为线索。
 * 没有具体、可展示、可解释的线索时，不得记录。
+* 参考文献已提供存档链接（archive-url 参数）或标注 url-status 为 dead / usurped / unfit 时，
+  其原链接无法访问属正常情况，不得作为线索。
 * 每条线索都必须指出：具体位置、具体词句/格式/URL 等可观察特征、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能解释该现象的合理可能性与建议人工核查方法。
 * 线索强度分为 high（相对直接、指向性强的痕迹）、medium（较有辨识度但仍存在较多其他解释）、
@@ -98,6 +111,12 @@ const AI_EDIT_SYSTEM_PROMPT = `
 * 提供编辑差异时，应优先判断差异中实际新增的内容；不得把既有内容、被引用来源原文或模板产生的文字归因于本次编辑。
 * 未提供完整条目时，只能依据差异判断，不得臆测条目其余部分的内容。
 * 不得把文风流畅、措辞正式、篇幅长、一次新增大量内容等本身作为线索。
+* 程序化链接检查结果（deadUrls、stats）是程序在送检前实测的确定性事实，可以直接作为线索依据：
+  若本次编辑新增的引用中较高比例无法访问（deadRate 偏高、deadNewUrls 较多），应重点核查该批新增引用
+  （例如来源不存在、标题/作者/日期与来源不符）；但单个链接失效也可能只是站点反爬（如对数据中心 IP 返回 403）、
+  临时故障或抄录错误，不得仅因此断言使用了 AI。
+* 参考文献已提供存档链接（archive-url）或标注 url-status 为 dead / usurped / unfit 时，
+  其原链接失效属正常情况，不得作为线索（这类原链接已在送检前被程序排除）。
 * 没有具体、可展示、可解释的线索时，issues 返回空数组，并在 summary 说明未发现达到记录门槛的线索。
 * 每条线索都必须给出：具体位置、最短必要的可观察证据（原文/格式/URL）、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能成立的合理解释与建议人工核查的方法。
@@ -329,7 +348,8 @@ export async function loadAiRules(ctx: HandlerContext): Promise<string> {
 /**
  * 3-1 / 3-2 共用的单次疑似 AI 线索分析（结构化输出，模型不生成最终 Wikitext）。
  *
- * 送检输入 = 本次编辑差异（可多条，同一条目的差异合并为一次请求）+ 可选的完整条目 Wikitext。
+ * 送检输入 = 本次编辑差异（可多条，同一条目的差异合并为一次请求）+ 可选的完整条目 Wikitext
+ * + 可选的程序化链接检查报告（deadUrls / stats，确定性事实）。
  * 只送差异是刻意的降级模式：该条目在 24 小时内已送检过完整正文（或正文过长）时不再整篇送审，
  * 仍可基于差异发现线索，但模型看不到条目其余部分，结论中应体现这一限制。
  *
@@ -345,6 +365,8 @@ export async function analyzeWikitextClues(
     content?: string;
     /** 本次编辑差异（同一目的多条差异合并为一次请求） */
     diffs?: AiDiffInput[];
+    /** 送检前的程序化链接检查结果（确定性事实） */
+    linkReport?: AiLinkReport;
     ruleContent: string;
     /** 跨条目累计的 Token 统计（由调用方持有） */
     usageTracker: TokenUsage;
@@ -378,6 +400,15 @@ export async function analyzeWikitextClues(
   } else {
     sections.push(
       "【完整条目 Wikitext】\n（本次未提供完整条目，请仅依据下列编辑差异判断，不得臆测条目其余部分）",
+    );
+  }
+  if (input.linkReport) {
+    sections.push(
+      `【程序化链接检查结果】（确定性事实，由程序在送检前实测得到，不是模型推断；若对应引用已提供 archive-url 或标注 url-status=dead，其原链接失效属正常情况，已在检查前排除）\n${JSON.stringify(
+        { deadUrls: input.linkReport.deadUrls, stats: input.linkReport.stats },
+        null,
+        2,
+      )}`,
     );
   }
   if (diffs.length > 0) {
@@ -429,12 +460,318 @@ export async function analyzeWikitextClues(
         .map((diff) => diff.revid),
       confidence: result.confidence,
       issues: result.issues.length,
+      linkReport: input.linkReport
+        ? {
+            deadUrls: input.linkReport.deadUrls.length,
+            stats: input.linkReport.stats,
+          }
+        : undefined,
       usage,
     },
     `aiEdit ${phase} article analyzed`,
   );
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// 确定性检查：参考文献 URL 可达性（不依赖 LLM）
+// ---------------------------------------------------------------------------
+
+/** 触发「多条异常链接」升级为 medium 的异常链接数量下限。 */
+export const SUSPECT_LINK_ESCALATE_COUNT = 2;
+
+/** 程序化线索的 confidence 下限（single → low，multiple → medium）。 */
+const LINK_CLUE_CONFIDENCE_FLOOR = { low: 0.3, medium: 0.6 } as const;
+
+/**
+ * 送检大模型的单条异常链接（确定性事实，由程序实测得到）。
+ *
+ * `httpError` 为稳定分类：timeout（访问超时）/ reject（拒绝连接、HTTP 403）/ other（其余失败）。
+ * `referenceName` 为该链接所属来源的标识（`<ref name>` 或引用模板的 title）。
+ */
+export type AiDeadUrl = {
+  url: string;
+  httpStatus: number | null;
+  httpError: "timeout" | "reject" | "other";
+  referenceName?: string;
+};
+
+/**
+ * 程序化链接检查的统计（同样作为确定性事实送检）。
+ *
+ * `newReferences` 为本次编辑新增的链接数，`checkedNewUrls` 为其中实际检查过的数量，
+ * `deadNewUrls` 为其中失效的数量，`deadRate` = deadNewUrls / checkedNewUrls（无检查时为 0）。
+ */
+export type AiLinkStats = {
+  newReferences: number;
+  checkedNewUrls: number;
+  deadNewUrls: number;
+  deadRate: number;
+};
+
+/** 送检大模型的链接检查报告（deadUrls + stats）。 */
+export type AiLinkReport = {
+  deadUrls: AiDeadUrl[];
+  stats: AiLinkStats;
+};
+
+/** 一次链接检查的结果（报告 + 明细），供调用方写日志、生成确定性线索。 */
+export type ReferenceLinkCheckOutcome = {
+  report: AiLinkReport;
+  /** 本次实际检查（含命中本地缓存）的链接数 */
+  checked: number;
+  /** 判定为疑似异常（确定性失效或网络层不可达）的链接 */
+  suspect: LinkCheckResult[];
+};
+
+/**
+ * 把「参考文献 URL 无法访问」渲染为一条确定性线索，并与模型给出的结果合并。
+ *
+ * 规则（与需求一致）：
+ * - 存在访问超时 / 拒绝连接 / 403 / 404 等异常链接时记为 **low** 线索；
+ * - 异常链接有多个（≥ SUSPECT_LINK_ESCALATE_COUNT）时提升为 **medium**；
+ * - 该线索由程序生成（`diff` 为 null），并抬升整体线索强度至对应下限，
+ *   保证「模型没看到问题」时这条客观线索仍然会被记录与展示。
+ *
+ * 注意与误报控制：链接失效也可能只是站点反爬（对数据中心 IP 返回 403）、临时故障或来源抄录有误，
+ * 因此线索文本必须写明「其他可能解释」与人工核查方式，且强度只到 low / medium，不据此作任何归因。
+ */
+export function mergeCitationLinkClues(
+  result: AiClueResult,
+  suspect: LinkCheckResult[],
+  stats?: AiLinkStats,
+): AiClueResult {
+  if (suspect.length === 0) return result;
+
+  const strength: AiClueIssue["strength"] =
+    suspect.length >= SUSPECT_LINK_ESCALATE_COUNT ? "medium" : "low";
+  // 证据保持单行：报告页按 `: {{tq|…}}` 渲染，换行会打断列表缩进
+  const listed = suspect
+    .slice(0, 8)
+    .map((link) => `${link.url}（${describeLinkFailure(link)}）`)
+    .join("；");
+  const evidence = listed.length > 600 ? `${listed.slice(0, 597)}…` : listed;
+
+  // 新增引用的失效情况与本次编辑直接相关，单独写进分析文本（旧链接失效可能与本次编辑无关）。
+  const newRefNote =
+    stats && stats.newReferences > 0
+      ? `本次编辑新增引用 ${stats.newReferences} 个，其中已检查 ${stats.checkedNewUrls} 个、无法访问 ${stats.deadNewUrls} 个（失效比例 ${stats.deadRate}）。`
+      : "";
+
+  const issue: AiClueIssue = {
+    strength,
+    title: `参考文献 URL 无法访问（${suspect.length} 个）`,
+    location: null,
+    evidence,
+    analysis: `程序化可达性检查（不依赖模型判断）：条目参考文献 / 外部链接中的 ${suspect.length} 个 URL 在本次检查时无法正常访问（访问超时、拒绝连接、403、404 等）。${newRefNote}引用来源不存在、已失效或被删除时会出现该现象，建议人工核实后再判断是否与疑似 AI 生成引用有关。`,
+    alternative:
+      "目标站点可能限制自动访问（如对数据中心 IP 返回 403）、临时故障或仅对特定网络 / 地区开放；URL 也可能存在抄录错误，或原文已被存档站收录。",
+    check:
+      "请在浏览器中逐一打开上述链接核实；若确已失效，可检查引用是否应改用存档（如 web.archive.org）或更正为可用来源。",
+    diff: null,
+  };
+
+  // 模型未记录任何线索时，摘要里补一句程序化检查的结论，避免摘要与线索列表相互矛盾。
+  const summary = (
+    result.issues.length === 0
+      ? `${result.summary.trim()} 程序化链接检查另发现 ${suspect.length} 个参考文献 URL 无法访问。`
+      : result.summary
+  ).slice(0, 800);
+
+  return {
+    confidence: Math.max(
+      result.confidence,
+      LINK_CLUE_CONFIDENCE_FLOOR[strength],
+    ),
+    summary,
+    issues: [...result.issues, issue],
+  };
+}
+
+/** 从维基 API 地址解析出本维基自身的主机名（用于跳过内部链接）。 */
+function wikiHostOf(apiUrl: string | undefined): string[] {
+  if (!apiUrl) return [];
+  try {
+    return [new URL(apiUrl).hostname];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 3-1 / 3-2 共用的确定性检查：提取条目参考文献 / 外部链接中的 URL 并探测可达性。
+ *
+ * 顺序要求：链接检查在调用模型**之前**完成，并把结果（异常 URL + 新增引用失效统计）
+ * 作为确定性事实一并送检，模型据此判断「新增引用集中失效」这类线索；
+ * 同时程序自己也会生成一条线索（mergeCitationLinkClues），保证不完全依赖模型输出。
+ *
+ * 送检正文与本次检查解耦：即使因为 24 小时复用窗口 / 正文过长而没有把完整条目送给模型，
+ * 仍然使用完整条目 Wikitext 做链接检查（这是纯程序化检查，不涉及 token 消耗）。
+ */
+export async function runReferenceLinkCheck(
+  ctx: HandlerContext,
+  input: {
+    phase: "3-1" | "3-2";
+    title: string;
+    /** 完整条目 Wikitext；省略时只用差异中的新增引用 */
+    wikitext?: string;
+    /** 本次编辑差异（用于统计新增引用的失效比例） */
+    diffs?: AiDiffInput[];
+  },
+): Promise<ReferenceLinkCheckOutcome | undefined> {
+  const { db, cfg, log } = ctx;
+  const ai = cfg.tasks.aiEdit;
+  if (!ai.linkCheck) return undefined;
+
+  const options = { skipHosts: wikiHostOf(cfg.wiki.apiUrl) };
+  const articleLinks = input.wikitext
+    ? extractReferenceLinks(input.wikitext, options)
+    : [];
+  const newLinks = (input.diffs ?? []).flatMap((diff) =>
+    extractAddedReferenceLinks(diff.diffText, options),
+  );
+
+  // 新增引用优先检查（它们才是与本次编辑直接相关的证据），其余链接按正文顺序补足。
+  const ordered: ExtractedReference[] = [];
+  const seen = new Set<string>();
+  for (const link of [...newLinks, ...articleLinks]) {
+    if (seen.has(link.url)) continue;
+    seen.add(link.url);
+    ordered.push(link);
+  }
+  if (ordered.length === 0) return undefined;
+
+  const selected = ordered.slice(0, MAX_LINKS_PER_ARTICLE);
+  if (selected.length < ordered.length)
+    log.info(
+      { phase: input.phase, title: input.title, total: ordered.length },
+      `aiEdit ${input.phase} too many reference links, checking the first ${selected.length}`,
+    );
+
+  let results: LinkCheckResult[];
+  try {
+    results = await checkLinks(
+      db,
+      selected.map((link) => link.url),
+      log,
+      { timeoutMs: ai.linkCheckTimeoutSeconds * 1000 },
+    );
+  } catch (err) {
+    // 链接检查是「附加线索」，失败不应影响本次分析结果
+    log.warn(
+      { err, phase: input.phase, title: input.title },
+      `aiEdit ${input.phase} reference link check failed`,
+    );
+    return undefined;
+  }
+
+  const byUrl = new Map(results.map((result) => [result.url, result]));
+  const nameOf = new Map(
+    selected.map((link) => [link.url, link.referenceName] as const),
+  );
+  const suspect = results.filter(isSuspectCitationLink);
+
+  // 新增引用（上次编辑新加的链接）中实际完成检查 / 失效的数量与比例。
+  const newUrls = new Set(newLinks.map((link) => link.url));
+  const checkedNewUrls = [...newUrls].filter((url) => byUrl.has(url)).length;
+  const deadNewUrls = [...newUrls].filter(
+    (url) => byUrl.get(url) && isSuspectCitationLink(byUrl.get(url)!),
+  ).length;
+  const stats: AiLinkStats = {
+    newReferences: newUrls.size,
+    checkedNewUrls,
+    deadNewUrls,
+    deadRate:
+      checkedNewUrls === 0
+        ? 0
+        : Math.round((deadNewUrls / checkedNewUrls) * 100) / 100,
+  };
+
+  const deadUrls: AiDeadUrl[] = suspect
+    .slice(0, MAX_LINKS_PER_ARTICLE)
+    .map((result) => {
+      const referenceName = nameOf.get(result.url);
+      return {
+        url: result.url,
+        httpStatus: result.httpStatus ?? null,
+        httpError: classifyLinkError(result),
+        ...(referenceName ? { referenceName } : {}),
+      };
+    });
+
+  log.info(
+    {
+      phase: input.phase,
+      title: input.title,
+      checked: results.length,
+      stats,
+      suspect: deadUrls,
+    },
+    `aiEdit ${input.phase} reference links checked`,
+  );
+
+  return {
+    report: { deadUrls, stats },
+    suspect,
+    checked: results.length,
+  };
+}
+
+/**
+ * 3-1 / 3-2 共用的完整分析入口：先做程序化链接检查，再把结果作为确定性事实送模型，
+ * 最后把程序生成的链接线索与模型结果合并。
+ *
+ * 顺序是刻意的：模型需要先看到「哪些 URL 实测打不开、新增引用失效比例多少」，
+ * 才能把「新增引用集中失效」当作线索判断；同时程序也会自己记一条线索，
+ * 避免模型忽略该事实时线索丢失（不完全依赖 LLM）。
+ */
+export async function analyzeWithReferenceLinks(
+  ctx: HandlerContext,
+  input: {
+    phase: "3-1" | "3-2";
+    title: string;
+    revid?: number;
+    /** 送模型（可能被降级省略）的正文 */
+    content?: string;
+    /** 用于链接检查的完整条目 Wikitext（不受降级影响） */
+    wikitext?: string;
+    /** 本次编辑差异（同一目的多条差异合并为一次请求） */
+    diffs?: AiDiffInput[];
+    ruleContent: string;
+    usageTracker: TokenUsage;
+  },
+): Promise<{ result: AiClueResult; linkCheck?: ReferenceLinkCheckOutcome }> {
+  // 1. 程序化链接检查（在模型之前，不消耗 token）
+  const linkCheck = await runReferenceLinkCheck(ctx, {
+    phase: input.phase,
+    title: input.title,
+    wikitext: input.wikitext,
+    diffs: input.diffs,
+  });
+
+  // 2. 送模型分析（携带链接检查的确定性事实）
+  const analyzed = await analyzeWikitextClues(ctx, {
+    phase: input.phase,
+    title: input.title,
+    revid: input.revid,
+    content: input.content,
+    diffs: input.diffs,
+    linkReport: linkCheck?.report,
+    ruleContent: input.ruleContent,
+    usageTracker: input.usageTracker,
+  });
+
+  // 3. 合并程序生成的链接线索（模型没记录时也保证这条客观线索不丢失）
+  const result = linkCheck
+    ? mergeCitationLinkClues(
+        analyzed,
+        linkCheck.suspect,
+        linkCheck.report.stats,
+      )
+    : analyzed;
+
+  return { result, linkCheck };
 }
 
 /** 将时间格式化为 `YYYY-MM-DD HH:mm`（UTC）。 */
@@ -551,6 +888,7 @@ function appendDebugLog(
  * * diff: 1, 2
  * * user: A, B
  * * content: full / diff-only
+ * * links: 12 checked, 2 unreachable
  * * confidence: 0.5
  * * result:
  *
@@ -561,7 +899,10 @@ function renderDebugEntry(
   title: string,
   edits: AiDiffRef[],
   result: { confidence: number; issues: AiClueIssue[] },
-  options: { withContent: boolean },
+  options: {
+    withContent: boolean;
+    linkCheck?: { checked: number; suspect: number; stats?: AiLinkStats };
+  },
 ): string {
   const lines: string[] = [
     `## ${title}`,
@@ -572,10 +913,18 @@ function renderDebugEntry(
       .filter(Boolean)
       .join(", ")}`,
     `* content: ${options.withContent ? "full" : "diff-only"}`,
-    `* confidence: ${result.confidence}`,
-    `* result:`,
-    "",
   ];
+  // 确定性检查（参考文献 URL 可达性）不依赖 LLM，单独记录检查规模，便于人工核对
+  if (options.linkCheck) {
+    const stats = options.linkCheck.stats;
+    const newRefs = stats
+      ? ` (new refs ${stats.newReferences}: ${stats.checkedNewUrls} checked, ${stats.deadNewUrls} dead, rate ${stats.deadRate})`
+      : "";
+    lines.push(
+      `* links: ${options.linkCheck.checked} checked, ${options.linkCheck.suspect} unreachable${newRefs}`,
+    );
+  }
+  lines.push(`* confidence: ${result.confidence}`, `* result:`, "");
   if (result.issues.length === 0) {
     lines.push("（未发现达到记录门槛的疑似线索）");
   } else {
@@ -602,6 +951,8 @@ type AiArticleAnalysis = {
   diffs: AiDiffRef[];
   /** 本次是否附带了完整条目正文（否则为只送差异的降级模式） */
   withContent: boolean;
+  /** 确定性检查（参考文献 URL 可达性）规模：检查数 / 异常数 / 新增引用统计 */
+  linkCheck: { checked: number; suspect: number; stats?: AiLinkStats };
 };
 
 /**
@@ -649,9 +1000,13 @@ async function analyzeArticle(
   }
 
   // 2. 读取条目当前版本正文（跟随重定向），并按窗口/长度决定是否附带送检。
+  //    fullText 保留完整正文：除了（可选地）送检模型，还用于程序化的参考文献链接检查
+  //    （链接检查不消耗 token，因此与「本次是否把完整正文送给模型」无关）。
   const canonical = canonicalTitle(agg.title);
   const page = await bot.read(agg.title, { redirects: true });
-  let content: string | undefined = page?.revisions?.[0]?.content ?? undefined;
+  const fullText: string | undefined =
+    page?.revisions?.[0]?.content ?? undefined;
+  let content: string | undefined = fullText;
   const revid = page?.revisions?.[0]?.revid;
 
   if (!content || content.trim().length === 0) {
@@ -673,15 +1028,17 @@ async function analyzeArticle(
   // 3. 送检前记录「完整条目」发送时间，供后续 24 小时窗口复用判断。
   if (content) markFullArticleSent(db, canonical, agg.title);
 
-  const result = await analyzeWikitextClues(ctx, {
+  const outcome = await analyzeWithReferenceLinks(ctx, {
     phase: "3-1",
     title: agg.title,
     revid,
     content,
+    wikitext: fullText,
     diffs: diffInputs,
     ruleContent,
     usageTracker: createTokenUsage(),
   });
+  const result = outcome.result;
 
   return {
     confidence: result.confidence,
@@ -689,6 +1046,11 @@ async function analyzeArticle(
     issues: result.issues,
     diffs,
     withContent: !!content,
+    linkCheck: {
+      checked: outcome.linkCheck?.checked ?? 0,
+      suspect: outcome.linkCheck?.suspect.length ?? 0,
+      stats: outcome.linkCheck?.report.stats,
+    },
   };
 }
 
@@ -703,7 +1065,10 @@ async function analyzeArticle(
  * 4. 单条 diff 净增加量小于 100 字节的排除；同一条目的多次编辑按条目名称合并。
  * 5. 对涉及变化的条目，读取其本次全部差异并合并为一次送检（一个条目一轮只请求一次 LLM）；
  *    条目当前版本正文仅在 24 小时复用窗口之外（且长度未超限）时附带，否则只送差异。
- * 6. 按 rulePage 规则调用 LLM 输出结构化线索。
+ * 6. 先执行一次不依赖 LLM 的确定性检查（提取条目参考文献 / 外部链接中的 URL 探测可达性；
+ *    模板已提供 archive-url 或 url-status=dead 的原链接不算问题；结果缓存在 citation_links 表，
+ *    复用窗口内不重复探测）；随后按 rulePage 规则调用 LLM，并把链接检查结果（deadUrls + stats）
+ *    一并送检；最后程序自己也记一条「URL 无法访问」线索（单个 low、多个 medium）。
  * 7. 结构化结果写入 ai_edit_reports 表，并由程序拼接文字追加到 tasks.aiEdit.debugLog。
  *
  * 幂等与预算：
@@ -858,6 +1223,7 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
       debugParts.push(
         renderDebugEntry(agg.title, result.diffs, result, {
           withContent: result.withContent,
+          linkCheck: result.linkCheck,
         }),
       );
     } catch (err) {

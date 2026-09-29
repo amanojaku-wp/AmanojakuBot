@@ -23,7 +23,7 @@ import {
   withResultPageLock,
 } from "../utils/articleReview.js";
 import {
-  analyzeWikitextClues,
+  analyzeWithReferenceLinks,
   formatUtcMinute,
   loadAiRules,
   markFullArticleSent,
@@ -51,6 +51,16 @@ import type { HandlerContext } from "../handle.js";
  * - 送检内容 = 全部差异 + 完整条目正文；但该条目 24 小时内已送检过完整正文（或正文过长）时只送差异；
  * - 报告页用 {{La}} 整理条目相关链接（条目、编辑、讨论、历史等），并按送检差异逐条列出 Diff。
  *
+ * 线索来源有两类：
+ * - 先执行程序化确定性检查（runReferenceLinkCheck，不依赖 LLM）：提取参考文献 / 外部链接的 URL 探测可达性，
+ *   并把异常 URL（deadUrls）与新增引用失效统计（stats）作为确定性事实一并送检；
+ * - 模型据此输出文风 / 格式 / 内容层面的疑似线索，程序再合并一条「URL 无法访问」的线索
+ *   （单个 low、多个 medium），保证不完全依赖模型输出。
+ *
+ * 跳过规则（逐项跳过，不影响其它有效对象；只有全部无效时才回复 not done）：
+ * - article / diff 参数无法识别，或对应页面不存在、不可读取、不在条目与 draftNamespace 命名空间内；
+ * - diff 的编辑时间早于 MIN_AI_EDIT_YEAR（2023）——早于生成式 AI 广泛使用的编辑不可能是 AI 编辑。
+ *
  * 章节定位、模板解析、互斥锁与「就地回报进度」等共性流程复用 utils/requestWorkflow；
  * 线索判定的 Schema、系统提示词、送检输入与规则加载复用 aiEditMonitor.ts 中的 3-1/3-2 共用契约，
  * 保证两条路径的中立性与证据要求完全一致。
@@ -62,8 +72,36 @@ export const AI_LOCK_TIMEOUT_MS = REQUEST_LOCK_TIMEOUT_MS;
 /** 单次请求最多接受的差异参数数量（diff1…diff20）。 */
 export const MAX_DIFF_PARAMS = 20;
 
+/**
+ * 生成式 AI 辅助编辑的时间下限（年）。
+ *
+ * ChatGPT 于 2022 年 11 月底发布、2023 年起被广泛使用；早于该年的编辑不可能由生成式 AI 生成，
+ * 因此 3-2 请求中编辑时间早于该年的差异直接跳过：不送模型、也不做链接检查，不计入线索。
+ */
+export const MIN_AI_EDIT_YEAR = 2023;
+
+/**
+ * 该修订时间是否早于生成式 AI 广泛使用的年份。
+ *
+ * 时间戳缺失或无法解析时返回 false（照常分析），避免因 API 未返回时间而漏检。
+ */
+export function isBeforeAiEra(timestamp: string | undefined): boolean {
+  if (!timestamp) return false;
+  const time = Date.parse(timestamp);
+  if (!Number.isFinite(time)) return false;
+  return new Date(time).getUTCFullYear() < MIN_AI_EDIT_YEAR;
+}
+
 /** 3-2 请求锁注册表（键为 `talkPage#sectionTitle` 与 `revid:xxx`）。 */
 const aiEditLocks: RequestLockRegistry = createRequestLockRegistry();
+
+/** 快照校验失败时在「已跳过」清单中展示的原因（逐项跳过，不影响其它送检对象）。 */
+const ARTICLE_SNAPSHOT_SKIP_REASONS: Record<string, string> = {
+  "page-missing": "页面不存在",
+  namespace: "所在页面不在条目或草稿命名空间",
+  empty: "页面内容为空",
+  "no-revid": "无法读取修订版本号",
+};
 
 /** 请求中解析出的差异引用：目标修订号 + 可选对比基准修订号。 */
 export type DiffRef = { revid: number; fromRevid?: number };
@@ -119,7 +157,7 @@ type AiCheckTarget = {
 function renderAiCheckSection(
   sectionTitle: string,
   results: AiCheckResultItem[],
-  unreadable: string[],
+  skipped: string[],
   marker: string,
 ): string {
   const lines: string[] = [
@@ -163,9 +201,11 @@ function renderAiCheckSection(
     lines.push("");
   }
 
-  if (unreadable.length > 0) {
+  if (skipped.length > 0) {
     lines.push(
-      `: '''未能读取或分析的送检对象：'''${safeWikitext([...new Set(unreadable)].join("、"))}`,
+      `: '''未能读取或已跳过的送检对象：'''${safeWikitext(
+        [...new Set(skipped)].join("；"),
+      )}`,
     );
     lines.push("");
   }
@@ -237,12 +277,16 @@ async function processAiCheckRequest(
     ...collectIndexedParams(reqTemplate.params, "diff", MAX_DIFF_PARAMS),
   ];
   const diffRefs: DiffRef[] = [];
-  /** 无法读取 / 无法解析的送检对象，最终在结果页与回复中如实列出 */
-  const unreadable: string[] = [];
+  /**
+   * 被跳过的送检对象及原因（无法解析、修订不可读取、时间早于生成式 AI 时代、
+   * 命名空间不受支持、页面不存在等）。逐项跳过不影响其它有效对象，
+   * 但全部无效时会在回复与结果页中如实说明。
+   */
+  const skipped: string[] = [];
   for (const raw of diffParamValues) {
     const parsed = parseDiffParam(raw);
     if (!parsed) {
-      unreadable.push(raw);
+      skipped.push(`${raw}（无法识别为修订版本号或差异链接）`);
       continue;
     }
     if (
@@ -279,7 +323,10 @@ async function processAiCheckRequest(
         allowedNamespaces,
       });
       if (outcome.status !== "ok") {
-        unreadable.push(requested);
+        // 单个条目无效只跳过该条目，不影响同一请求中的其它条目 / 差异
+        skipped.push(
+          `${requested}（${ARTICLE_SNAPSHOT_SKIP_REASONS[outcome.status]}）`,
+        );
         continue;
       }
 
@@ -296,7 +343,7 @@ async function processAiCheckRequest(
       });
     } catch (err) {
       log.warn({ err, requested }, "aiEdit failed to fetch article content");
-      unreadable.push(requested);
+      skipped.push(`${requested}（读取失败）`);
     }
   }
 
@@ -306,7 +353,21 @@ async function processAiCheckRequest(
         fromRevid: ref.fromRevid,
       });
       if (!diff) {
-        unreadable.push(`Special:Diff/${ref.revid}`);
+        skipped.push(`Special:Diff/${ref.revid}（修订不存在或不可读取）`);
+        continue;
+      }
+      // 早于生成式 AI 广泛使用的年份（2023）的编辑不可能是 AI 编辑：
+      // 直接跳过，不送模型也不做链接检查。
+      if (isBeforeAiEra(diff.timestamp)) {
+        log.info(
+          { revid: ref.revid, timestamp: diff.timestamp },
+          "aiEdit 3-2 skip diff before AI era",
+        );
+        skipped.push(
+          `Special:Diff/${ref.revid}（编辑时间 ${formatUtcMinute(
+            diff.timestamp!,
+          )} 早于 ${MIN_AI_EDIT_YEAR} 年，不可能为生成式 AI 编辑）`,
+        );
         continue;
       }
       if (
@@ -317,7 +378,9 @@ async function processAiCheckRequest(
           { revid: ref.revid, ns: diff.namespace },
           "aiEdit 3-2 diff in disallowed namespace",
         );
-        unreadable.push(`Special:Diff/${ref.revid}`);
+        skipped.push(
+          `Special:Diff/${ref.revid}（所在页面不在条目或草稿命名空间）`,
+        );
         continue;
       }
 
@@ -343,25 +406,33 @@ async function processAiCheckRequest(
       targets.set(key, target);
     } catch (err) {
       log.warn({ err, revid: ref.revid }, "aiEdit failed to read diff");
-      unreadable.push(`Special:Diff/${ref.revid}`);
+      skipped.push(`Special:Diff/${ref.revid}（读取失败）`);
     }
   }
 
   const resolved = [...targets.values()];
   if (resolved.length === 0) {
+    // 只有「提供的全部 article 与 diff 都无效」时才 not done；单个对象无效只跳过它。
+    const reasons = [...new Set(skipped)];
+    const reasonText =
+      reasons.length > 0
+        ? `${reasons.slice(0, 5).join("；")}${
+            reasons.length > 5 ? `；等共 ${reasons.length} 项` : ""
+          }。`
+        : "";
     await replyAiNotDone(ctx, {
       revid,
       actorId,
       targetSection,
       comment,
-      replyText:
-        "指定的条目或差异不存在、不可读取，或不在受支持的名字空间（条目或草稿），无法分析。~~~~",
-      summary: "疑似 AI 线索请求处理：条目或差异无效",
+      replyText: `指定的条目或差异均无法分析，已全部跳过。${reasonText}请确认后重试。~~~~`,
+      summary: "疑似 AI 线索请求处理：条目或差异全部无效",
     });
     return;
   }
 
-  // 3. 按规则逐条调用 LLM（一个条目一轮只请求一次，携带该条目本次全部差异）。
+  // 3. 先做程序化链接检查，再把结果（deadUrls + stats）与差异一并送 LLM
+  //    （一个条目一轮只请求一次，携带该条目本次全部差异），最后合并程序生成的链接线索。
   const ruleContent = await loadAiRules(ctx);
   const usage = createTokenUsage();
   const results: AiCheckResultItem[] = [];
@@ -398,25 +469,27 @@ async function processAiCheckRequest(
         { title: target.title },
         "aiEdit 3-2 skip target without analyzable content or diff",
       );
-      unreadable.push(target.title);
+      skipped.push(`${target.title}（没有可分析的内容或差异）`);
       continue;
     }
 
     try {
-      const result = await analyzeWikitextClues(ctx, {
+      const outcome = await analyzeWithReferenceLinks(ctx, {
         phase: "3-2",
         title: target.title,
         revid: revidForRequest,
         content,
+        wikitext: target.content,
         diffs: target.diffs,
         ruleContent,
         usageTracker: usage,
       });
+
       results.push({
         title: target.title,
         revid: revidForRequest,
         diffs: target.diffs.map((d) => ({ revid: d.revid, user: d.user })),
-        result,
+        result: outcome.result,
       });
     } catch (err) {
       log.error(
@@ -463,7 +536,7 @@ async function processAiCheckRequest(
     const sectionBody = renderAiCheckSection(
       sectionTitle,
       results,
-      unreadable,
+      skipped,
       marker,
     );
 

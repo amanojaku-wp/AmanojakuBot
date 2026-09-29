@@ -229,6 +229,15 @@ export const configSchema = z.object({
            * 且线索强度 >= 该阈值时，才写入 check 页与 checkuser 页。
            */
           minConfidence: z.number().min(0).max(1).default(0),
+          /**
+           * 参考文献 URL 可达性检查（确定性检查，不依赖 LLM）：
+           * true 时从条目参考文献 / 外部链接中提取 URL 并实际探测，
+           * 访问超时 / 拒绝连接 / 403 / 404 等记为 low 线索，多个异常链接提升为 medium。
+           * 结果缓存在本地 citation_links 表，复用窗口内不重复探测。
+           */
+          linkCheck: z.boolean().default(true),
+          /** 单个链接探测的超时时间（秒） */
+          linkCheckTimeoutSeconds: z.number().int().min(1).max(120).default(15),
           llm: llmConfigSchema.optional(),
         })
         .default({
@@ -238,6 +247,8 @@ export const configSchema = z.object({
           cron: "0 * * * *",
           maxAnalysesPerWindow: 20,
           minConfidence: 0,
+          linkCheck: true,
+          linkCheckTimeoutSeconds: 15,
         }),
       /** 任务四：针对新手的条目发布前评审（AfC评审） */
       afc: z
@@ -288,6 +299,8 @@ export const configSchema = z.object({
         cron: "0 * * * *",
         maxAnalysesPerWindow: 20,
         minConfidence: 0,
+        linkCheck: true,
+        linkCheckTimeoutSeconds: 15,
       },
       afc: {
         enabled: true,

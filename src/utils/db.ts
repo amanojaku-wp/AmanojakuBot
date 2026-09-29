@@ -22,6 +22,7 @@ export type Migration = {
  * - 20260928000000: 新增 ai_edit_reports 任务三按条目聚合的疑似 AI 线索表
  * - 20260929000000: 新增 ai_edit_sends 任务三「完整条目」送检记录表（24 小时内同一目只送差异）
  * - 20260930000000: events 表新增 event_json 字段（认领期持久化原始变更事件，供重启后回收未完成工作）
+ * - 20261001000000: 新增 citation_links 任务三参考文献 URL 可达性检查记录表（复用窗口内不重复探测）
  */
 export const MIGRATIONS: Migration[] = [
   {
@@ -274,6 +275,27 @@ export const MIGRATIONS: Migration[] = [
       if (!columnNames.has("event_json")) {
         db.exec("ALTER TABLE events ADD COLUMN event_json TEXT;");
       }
+    },
+  },
+  {
+    // 任务三（3-1 / 3-2）参考文献 URL 可达性检查的本地记录表。
+    // 每条 URL 一行（url 为主键），保存最近一次探测的状态与时间，供复用窗口内直接复用，
+    // 避免同一 URL（尤其被多个条目共同引用的来源）每轮扫描都重新发起网络请求。
+    // status: ok / dead（403/404/410）/ network_error（超时、拒绝连接、DNS…）/ server_error / rate_limited / client_error
+    version: "20261001000000",
+    name: "create_citation_links_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS citation_links (
+          url TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          http_status INTEGER,
+          error TEXT,
+          checked_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_citation_links_checked_at ON citation_links(checked_at);
+        CREATE INDEX IF NOT EXISTS idx_citation_links_status ON citation_links(status);
+      `);
     },
   },
 ];

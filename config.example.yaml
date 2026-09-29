@@ -66,6 +66,8 @@ tasks:
     debugLog: /data/project/seijabot/AmanojakuBot/ai-edit.log
     #maxAnalysesPerWindow: 20
     minConfidence: 0
+    linkCheck: true # 参考文献 / 外部链接 URL 可达性检查（确定性检查，不依赖 LLM；单个异常为 low，多个为 medium）
+    #linkCheckTimeoutSeconds: 15 # 单个链接探测超时（秒）
     talkPage: User talk:AmanojakuBot/ai
     template: User:AmanojakuBot/template/AICheckRequest
     draftNamespace: [2, 118] # 3-2 请求额外允许的草稿命名空间（3-1 扫描仅处理条目 ns 0）

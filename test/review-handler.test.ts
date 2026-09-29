@@ -191,6 +191,8 @@ describe("Task 2 reviewHandler", () => {
           template: "User:AmanojakuBot/template/AIcheck",
           maxAnalysesPerWindow: 20,
           minConfidence: 0,
+          linkCheck: true,
+          linkCheckTimeoutSeconds: 15,
           models: [],
         },
         afc: {
