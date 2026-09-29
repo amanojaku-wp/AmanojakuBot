@@ -185,7 +185,41 @@ tail -f /data/project/seijabot/AmanojakuBot/stdout.out
 
 ---
 
-## 4. 热更新（重新构建 + 重启）
+## 4. 自动部署与热更新
+
+### 4.1 自动部署（GitHub Actions）
+
+仓库内置 `.github/workflows/deploy-toolforge.yml`：**推送到 `main` 分支**（也可以在 Actions 页面用 `workflow_dispatch` 手动触发）后自动执行：
+
+1. `npm ci` + `npm run check` 静态类型检查（构建镜像时 `tsx` 不做类型检查，这一步用来拦住低级错误）；
+2. SSH 登录 Toolforge 登录节点，切换到工具账号，然后依次执行：
+
+```bash
+ssh seija@dev.toolforge.org
+become seijabot                      # 切换工具账号（会切换当前用户）
+toolforge build start -i amanojakubot https://github.com/amanojaku-wp/AmanojakuBot
+toolforge jobs restart amanojakubot
+```
+
+> 自动部署里用官方推荐的脚本写法 `ssh <开发者账号>@dev.toolforge.org become <工具名> "bash -c '<命令>'"` 达到同样的效果；两条 `toolforge` 命令用 `&&` 串联，**构建失败就不会重启任务**（不会把老进程带下去）。
+
+#### 启用前的一次性配置
+
+1. 本地生成一对**专用**密钥（不要复用日常登录用的私钥）：
+
+   ```bash
+   ssh-keygen -t ed25519 -C "github-actions-toolforge" -f ~/.ssh/amanojakubot_deploy
+   ```
+
+2. 把**公钥**（`~/.ssh/amanojakubot_deploy.pub`）内容粘贴到 <https://toolsadmin.wikimedia.org/profile/settings/ssh-keys/>，加到你自己的**开发者账号**（本例 `seija`）上。该账号同时必须是工具 `seijabot` 的 maintainer，`become seijabot` 才有权限。
+3. 把**私钥**（`~/.ssh/amanojakubot_deploy`）全文添加为仓库 Secret：`Settings → Secrets and variables → Actions → New repository secret`，名字必须是 `TOOLFORGE_SSH_KEY`。
+4. 工作流顶部 `env:` 中的 `TOOLFORGE_TOOL` / `TOOLFORGE_IMAGE` / `TOOLFORGE_REPO` / `TOOLFORGE_JOB` 按需修改（默认已对应本仓库）。
+
+> 工作流用 `ssh-keyscan` 抓取登录节点的主机公钥；如需更严格的凭据固定，可比对 [login.toolforge.org 的指纹](https://wikitech.wikimedia.org/wiki/Help:SSH_Fingerprints/login.toolforge.org)后改用固定的 `known_hosts`。
+>
+> 首次启用建议先在 Actions 页面手动跑一次，确认能构建成功并重启任务。
+
+### 4.2 手工热更新（重新构建 + 重启）
 
 改完代码推送到 GitHub 之后，两步完成更新：
 

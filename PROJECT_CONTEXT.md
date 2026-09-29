@@ -53,7 +53,7 @@
 
 ## 文档
 
-`README.md` 为面向中文读者的使用说明，包含：项目概述、本地安装（`npm i` / `.env` 与 `config.yaml` / `npm run start`）、Toolforge 部署（`toolforge envvars create` / `build start` / `jobs run`）、热更新（`build start` + `jobs restart`）、代码结构，以及各功能概述与代码入口。
+`README.md` 为面向中文读者的使用说明，包含：项目概述、本地安装（`npm i` / `.env` 与 `config.yaml` / `npm run start`）、Toolforge 部署（`toolforge envvars create` / `build start` / `jobs run`）、自动部署与热更新（GitHub Actions 工作流 `.github/workflows/deploy-toolforge.yml`：推送 `main` 后 `npm run check` → `ssh seija@dev.toolforge.org` + `become seijabot` → `toolforge build start -i amanojakubot <repo>` → `toolforge jobs restart amanojakubot`，两条 `toolforge` 命令用 `&&` 串联；密钥走仓库 Secret `TOOLFORGE_SSH_KEY`，其公钥加在开发者账号上，手工兜底流程为 `build start` + `jobs restart`）、代码结构，以及各功能概述与代码入口。
 
 ## 继续开发建议
 

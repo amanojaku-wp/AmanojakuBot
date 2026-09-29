@@ -1,0 +1,89 @@
+# 推送到 main 后自动部署到 Toolforge。
+#
+# 执行内容（等价于手工操作）：
+#   ssh seija@dev.toolforge.org
+#   become seijabot                      # 切换到工具账号
+#   toolforge build start -i amanojakubot https://github.com/amanojaku-wp/AmanojakuBot
+#   toolforge jobs restart amanojakubot
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#   TOOLFORGE_SSH_KEY —— 用于登录 Toolforge 的私钥。
+#     对应公钥必须加在 https://toolsadmin.wikimedia.org/profile/settings/ssh-keys/
+#     （加到 *开发者账号* 上，本例是 seija），且该账号必须是工具 seijabot 的 maintainer，
+#     `become` 才有权限。详见 README §4.1。
+#
+# 若工具名 / 镜像名 / 仓库地址与本仓库不同，改下面的 env 即可。
+
+name: Deploy to Toolforge
+
+on:
+  push:
+    branches: [main]
+  # 允许在 Actions 页面手动触发一次部署
+  workflow_dispatch:
+
+# 部署必须串行：两个并发的 build start 会互相覆盖 :latest 镜像。
+concurrency:
+  group: toolforge-deploy
+  cancel-in-progress: false
+
+env:
+  TOOLFORGE_SSH_USER: amanojaku
+  TOOLFORGE_SSH_HOST: dev.toolforge.org
+  TOOLFORGE_TOOL: seijabot
+  TOOLFORGE_IMAGE: amanojakubot
+  TOOLFORGE_REPO: https://github.com/amanojaku-wp/AmanojakuBot
+  TOOLFORGE_JOB: amanojakubot
+
+jobs:
+  # 构建镜像不会做类型检查（tsx 直接执行），所以先跑一次 npm run check 拦住低级错误。
+  check:
+    name: 静态类型检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  deploy:
+    name: 构建镜像并重启任务
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 准备 SSH 密钥
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TOOLFORGE_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/toolforge_deploy
+          chmod 600 ~/.ssh/toolforge_deploy
+          # 固定登录节点的主机公钥，避免首次连接时交互式确认
+          ssh-keyscan -H "$TOOLFORGE_SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
+
+      # 与官方文档一致：become <工具名> "bash -c '<命令>'" 会把命令放在工具账号上下文里执行。
+      # build start 会在构建出结果后才返回，因此可以用 && 串起 jobs restart。
+      - name: 重新构建镜像并重启常驻任务
+        run: |
+          ssh -i ~/.ssh/toolforge_deploy \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            "${TOOLFORGE_SSH_USER}@${TOOLFORGE_SSH_HOST}" \
+            "become ${TOOLFORGE_TOOL} bash -c 'toolforge build start -i ${TOOLFORGE_IMAGE} ${TOOLFORGE_REPO} && toolforge jobs restart ${TOOLFORGE_JOB}'"
+
+      - name: 查看任务状态
+        if: always()
+        continue-on-error: true
+        run: |
+          ssh -i ~/.ssh/toolforge_deploy \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${TOOLFORGE_SSH_USER}@${TOOLFORGE_SSH_HOST}" \
+            "become ${TOOLFORGE_TOOL} bash -c 'toolforge jobs list'"
