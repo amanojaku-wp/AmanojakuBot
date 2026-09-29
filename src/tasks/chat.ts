@@ -271,6 +271,9 @@ export const chatHandler: TaskHandler = async (
           "\n\n[系统提示] 回复内容过长，已被截断。";
       }
 
+      // 截断本身可能切断 [[、{{ 或 HTML 标签，写入前再兜底确保一次闭合
+      reply = ensureClosedWikitext(reply);
+
       const tokenSuffix = cfg.log.responseTokenOnWiki
         ? ` (${formatTokenUsage(usage)})`
         : "";
@@ -619,33 +622,240 @@ ${persona}
   ].join("\n\n");
 }
 
+/**
+ * 内容型扩展标签：其内部内容按字面处理，不参与 [[ ]]、{{ }} 与其它 HTML 标签的配对检查（特殊规则 2）
+ */
+const LITERAL_TAGS = new Set([
+  "nowiki",
+  "source",
+  "syntaxhighlight",
+  "math",
+  "score",
+  "pre",
+]);
+
+/**
+ * 没有内容、本身就视为已闭合的空元素（特殊规则 3）
+ */
+const VOID_TAGS = new Set([
+  "br",
+  "hr",
+  "wbr",
+  "img",
+  "meta",
+  "link",
+  "input",
+  "area",
+  "base",
+  "col",
+  "embed",
+  "track",
+  "param",
+  "references",
+]);
+
+type WikiOpener = { kind: "link" | "template"; at: number };
+type TagOpener = { name: string; lt: number; gt: number };
+
+const isAlnum = (c: string) => /[A-Za-z0-9]/.test(c);
+const isAlpha = (c: string) => /[A-Za-z]/.test(c);
+
+/**
+ * 确保回复中的维基代码（[[ ]]、{{ }}）与 HTML 标签闭合。
+ *
+ * 回复会直接作为 Wikitext 写入讨论页，未闭合的 `[[`、`{{` 或标签会吞掉其后整段页面内容，
+ * 因此这里把「没有对应闭合符号」的开符号转义成 HTML entity，使其退化为可见的普通文字。
+ *
+ * 特殊规则：
+ * 1. 已闭合的 HTML 注释（<!-- ... -->）整体跳过，不检查其内部；
+ * 2. `<nowiki>`、`<source>`、`<syntaxhighlight>`、`<math>`、`<score>`、`<pre>` 的标签及其内部内容整体跳过；
+ * 3. 已自闭合的标签（`<br/>`）与 HTML 空元素（`<br>`）不处理；
+ * 4. 未闭合的标签与未闭合的 HTML 注释，把其符号转义为 `&lt;`／`&gt;`（维基代码开符转义为 `&#91;`／`&#123;`）。
+ */
+export function ensureClosedWikitext(input: string): string {
+  const len = input.length;
+  /** 原始下标 → 替换成的 HTML entity */
+  const escapes = new Map<number, string>();
+  const tagStack: TagOpener[] = [];
+  const wikiStack: WikiOpener[] = [];
+
+  const mark = (index: number, entity: string) => {
+    escapes.set(index, entity);
+  };
+
+  let i = 0;
+  while (i < len) {
+    const ch = input[i];
+
+    // HTML 注释（规则 1 / 规则 4）
+    if (ch === "<" && input.startsWith("<!--", i)) {
+      const end = input.indexOf("-->", i + 4);
+      if (end === -1) {
+        // 未闭合的注释会把后续内容全部吞掉，转义其起始符号
+        mark(i, "&lt;");
+        i += 1;
+        continue;
+      }
+      // 已闭合的注释整体跳过，不检查其内部内容
+      i = end + 3;
+      continue;
+    }
+
+    // HTML 标签
+    if (ch === "<") {
+      let j = i + 1;
+      const closing = input[j] === "/";
+      if (closing) j += 1;
+      const nameStart = j;
+      while (j < len && isAlnum(input[j])) j += 1;
+      const isTag =
+        j > nameStart &&
+        input[nameStart] !== undefined &&
+        isAlpha(input[nameStart]);
+      if (!isTag) {
+        // 不是标签起始的 "<"，保持原样
+        i += 1;
+        continue;
+      }
+
+      const name = input.slice(nameStart, j).toLowerCase();
+      const gt = input.indexOf(">", j);
+      if (gt === -1) {
+        // 缺少 ">" 的残缺标签，转义 "<"
+        mark(i, "&lt;");
+        i += 1;
+        continue;
+      }
+      const selfClosing = /\/\s*$/.test(input.slice(j, gt));
+
+      // 规则 2：内容型标签整体跳过
+      if (LITERAL_TAGS.has(name)) {
+        if (closing || selfClosing) {
+          i = gt + 1;
+          continue;
+        }
+        const close = new RegExp(`</${name}\\s*>`, "i").exec(
+          input.slice(gt + 1),
+        );
+        if (!close) {
+          // 未闭合的内容型标签，转义 "<" 与 ">"
+          mark(i, "&lt;");
+          mark(gt, "&gt;");
+          i = gt + 1;
+          continue;
+        }
+        i = gt + 1 + close.index + close[0].length;
+        continue;
+      }
+
+      if (closing) {
+        let found = -1;
+        for (let k = tagStack.length - 1; k >= 0; k -= 1) {
+          if (tagStack[k].name === name) {
+            found = k;
+            break;
+          }
+        }
+        if (found === -1) {
+          // 孤立的闭合标签同样转义
+          mark(i, "&lt;");
+          mark(gt, "&gt;");
+        } else {
+          // 跨层未配对的开标签（如 <b><i></b>）一并转义
+          for (let k = tagStack.length - 1; k > found; k -= 1) {
+            mark(tagStack[k].lt, "&lt;");
+            mark(tagStack[k].gt, "&gt;");
+          }
+          tagStack.length = found;
+        }
+        i = gt + 1;
+        continue;
+      }
+
+      // 规则 3：自闭合标签与空元素不入栈
+      if (!selfClosing && !VOID_TAGS.has(name)) {
+        tagStack.push({ name, lt: i, gt });
+      }
+      i = gt + 1;
+      continue;
+    }
+
+    if (ch === "[" && input.startsWith("[[", i)) {
+      wikiStack.push({ kind: "link", at: i });
+      i += 2;
+      continue;
+    }
+    if (ch === "]" && input.startsWith("]]", i)) {
+      if (wikiStack[wikiStack.length - 1]?.kind === "link") wikiStack.pop();
+      i += 2;
+      continue;
+    }
+    if (ch === "{" && input.startsWith("{{", i)) {
+      wikiStack.push({ kind: "template", at: i });
+      i += 2;
+      continue;
+    }
+    if (ch === "}" && input.startsWith("}}", i)) {
+      if (wikiStack[wikiStack.length - 1]?.kind === "template") wikiStack.pop();
+      i += 2;
+      continue;
+    }
+
+    i += 1;
+  }
+
+  // 规则 4：转义所有没有闭合符号的开符号
+  for (const opener of wikiStack) {
+    if (opener.kind === "link") {
+      mark(opener.at, "&#91;");
+      mark(opener.at + 1, "&#91;");
+    } else {
+      mark(opener.at, "&#123;");
+      mark(opener.at + 1, "&#123;");
+    }
+  }
+  for (const opener of tagStack) {
+    mark(opener.lt, "&lt;");
+    mark(opener.gt, "&gt;");
+  }
+
+  if (escapes.size === 0) return input;
+
+  let out = "";
+  for (let k = 0; k < len; k += 1) {
+    out += escapes.get(k) ?? input[k];
+  }
+  return out;
+}
+
 function cleanReply(reply: string): string {
-  return (
-    reply
-      // 移除多余签名
-      .replace(/~~~~/g, "")
-      // 移除多余的空行
-      .replace(/\n{3,}/g, "\n\n")
-      // 移除开头和结尾的空白字符
-      .trim()
-      // 移除其他用户的用户页，防止ping到他人
-      .replace(
-        /\[\[\s*(User|U|用户|用戶|使用者)\s*:\s*([^\]|]*?)\s*\]\]/gi,
-        "$1:$2",
-      )
-      .replace(
-        /\[\[\s*(User|U|用户|用戶|使用者)\s*:\s*[^\]|]*?\s*\|\s*([^\]]*?)\s*\]\]/gi,
-        "$2",
-      )
-      // 禁止所有能ping到用户的模板
-      .replace(
-        /\{\{\s*(ping|noping|at|hidden ping|unping|reply|reply to|ping2)\s*[^}]*?\}\}/gi,
-        "",
-      )
-      // 花式ping只保留模板本身
-      .replace(
-        /\{\{\s*(pia|hug|mua|eat|panic|ldk|谁的错|誰的錯|hugmua|drink|kick|kira)\s*[^}]*?\}\}/gi,
-        "{{$1}}",
-      )
-  );
+  const cleaned = reply
+    // 移除多余签名
+    .replace(/~~~~/g, "")
+    // 移除多余的空行
+    .replace(/\n{3,}/g, "\n\n")
+    // 移除开头和结尾的空白字符
+    .trim()
+    // 移除其他用户的用户页，防止ping到他人
+    .replace(
+      /\[\[\s*(User|U|用户|用戶|使用者)\s*:\s*([^\]|]*?)\s*\]\]/gi,
+      "$1:$2",
+    )
+    .replace(
+      /\[\[\s*(User|U|用户|用戶|使用者)\s*:\s*[^\]|]*?\s*\|\s*([^\]]*?)\s*\]\]/gi,
+      "$2",
+    )
+    // 禁止所有能ping到用户的模板
+    .replace(
+      /\{\{\s*(ping|noping|at|hidden ping|unping|reply|reply to|ping2)\s*[^}]*?\}\}/gi,
+      "",
+    )
+    // 花式ping只保留模板本身
+    .replace(
+      /\{\{\s*(pia|hug|mua|eat|panic|ldk|谁的错|誰的錯|hugmua|drink|kick|kira)\s*[^}]*?\}\}/gi,
+      "{{$1}}",
+    );
+
+  // 确保残留的 [[ ]]、{{ }} 与 HTML 标签闭合（或转义），避免破坏讨论页
+  return ensureClosedWikitext(cleaned);
 }
