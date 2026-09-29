@@ -228,7 +228,7 @@ export const configSchema = z.object({
            * 记录为有效线索的最低线索强度阈值（0-1）：仅当该次分析确实记录了线索、
            * 且线索强度 >= 该阈值时，才写入 check 页与 checkuser 页。
            */
-          minConfidence: z.number().min(0.5).max(1).default(0.85),
+          minConfidence: z.number().min(0).max(1).default(0),
           llm: llmConfigSchema.optional(),
         })
         .default({
@@ -237,7 +237,7 @@ export const configSchema = z.object({
           silent: true,
           cron: "0 * * * *",
           maxAnalysesPerWindow: 20,
-          minConfidence: 0.85,
+          minConfidence: 0,
         }),
       /** 任务四：针对新手的条目发布前评审（AfC评审） */
       afc: z
@@ -287,7 +287,7 @@ export const configSchema = z.object({
         silent: true,
         cron: "0 * * * *",
         maxAnalysesPerWindow: 20,
-        minConfidence: 0.85,
+        minConfidence: 0,
       },
       afc: {
         enabled: true,

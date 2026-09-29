@@ -134,10 +134,6 @@ function renderAiCheckSection(
     if (item.diffs.length > 0) {
       lines.push(`* Diff: ${renderDiffLinks(item.diffs)}`);
     }
-    // 无线索时不展示线索强度，避免读者把「未发现线索」与高分并列误读为「很可能用了 AI」
-    if (item.result.issues.length > 0) {
-      lines.push(`* 线索强度：${item.result.confidence}`);
-    }
     lines.push(`* 结论：${safeWikitext(item.result.summary)}`);
     lines.push("");
 

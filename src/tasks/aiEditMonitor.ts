@@ -59,7 +59,7 @@ const EXCLUDED_CHANGE_TAGS = [
   "mw-undo",
   "mw-blank",
   "mw-manual-revert",
-  "mw-new-redirect"
+  "mw-new-redirect",
 ];
 
 /**
@@ -894,8 +894,6 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
     lines.push(`* {{La|${safeTitle(row.title)}}}`);
     lines.push("");
     if (diffs.length > 0) lines.push(`* Diff: ${renderDiffLinks(diffs)}`);
-    // 无线索时不展示线索强度，避免读者把「未发现线索」与高分并列误读为「很可能用了 AI」
-    if (issues.length > 0) lines.push(`* 线索强度：${row.confidence}`);
     lines.push(
       `* 问题分析：${safeWikitext(row.summary?.trim() || "（未提供结论）")}`,
     );

@@ -190,7 +190,7 @@ describe("Task 2 reviewHandler", () => {
           talkPage: "User talk:AmanojakuBot/ai",
           template: "User:AmanojakuBot/template/AIcheck",
           maxAnalysesPerWindow: 20,
-          minConfidence: 0.85,
+          minConfidence: 0,
           models: [],
         },
         afc: {

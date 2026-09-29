@@ -65,7 +65,7 @@ tasks:
     cron: "0 * * * *" # 3-1 动态扫描的 cron 调度（UTC 时区，默认每小时整点）
     debugLog: /data/project/seijabot/AmanojakuBot/ai-edit.log
     #maxAnalysesPerWindow: 20
-    minConfidence: 0.85
+    minConfidence: 0
     talkPage: User talk:AmanojakuBot/ai
     template: User:AmanojakuBot/template/AICheckRequest
     draftNamespace: [2, 118] # 3-2 请求额外允许的草稿命名空间（3-1 扫描仅处理条目 ns 0）
