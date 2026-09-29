@@ -373,7 +373,7 @@ async function processAiCheckRequest(
     // 24 小时内已送检过完整正文（或正文过长）时只送差异，避免重复整篇送审；
     // 但若本次没有任何差异可送，则仍必须送完整条目，否则该请求没有可判断的内容。
     let content = target.content;
-    let revidForRequest = target.revid;
+    const revidForRequest = target.revid;
     if (content && content.length > MAX_ARTICLE_CHARS) {
       log.info(
         { title: target.title, length: content.length },
