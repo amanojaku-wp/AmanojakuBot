@@ -20,7 +20,6 @@ import {
 import { runInTransaction } from "../utils/db.js";
 import {
   checkLinks,
-  classifyLinkError,
   describeLinkFailure,
   extractAddedReferenceLinks,
   extractReferenceLinks,
@@ -146,14 +145,12 @@ const DEFAULT_AI_EDIT_RULES = `
 * 没有具体、可展示、可解释的线索时，不得记录。
 * 参考文献已提供存档链接（archive-url 参数）或标注 url-status 为 dead / usurped / unfit 时，
   其原链接无法访问属正常情况，不得作为线索。
-* archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）的链接已在检查前被程序排除，
-  不得因为存档链接“看上去可能失效”而记录线索。
-* 程序化检查结果里 unresolvedUrls 是本机器人所在服务器 DNS 解析异常导致「未能检查」的链接：
-  那是机器人侧的环境问题（服务器 IPv6 解析当前不可用），不代表链接失效，不得作为线索，
-  也不得描述为「拒绝连接」。
+* archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）时，该链接可能对自动访问
+  返回 403 或超时，属正常情况，不得因为存档链接“看上去可能失效”而记录线索。
 * 引用 URL 时只写域名与路径，不要写出 http / https 协议头（避免触发维基的滥用过滤器）。
 * **链接无法访问本身不构成线索**：不得单独记录一条以「URL / 链接无法访问」为主题的线索；
   只有在链接失效与其它具体证据（如引用信息与来源不符）同时成立时，才能作为同一条线索里的佐证。
+  本次分析并不会提供任何 URL 可达性检测结果，因此不得凭空推断某个链接是否可访问。
 * 每条线索都必须指出：具体位置、具体词句/格式/URL 等可观察特征、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能解释该现象的合理可能性与建议人工核查方法。
 * 线索强度分为 high（相对直接、指向性强的痕迹）、medium（较有辨识度但仍存在较多其他解释）、
@@ -179,19 +176,14 @@ const AI_EDIT_SYSTEM_PROMPT = `
 * 提供编辑差异时，应优先判断差异中实际新增的内容；不得把既有内容、被引用来源原文或模板产生的文字归因于本次编辑。
 * 未提供完整条目时，只能依据差异判断，不得臆测条目其余部分的内容。
 * 不得把文风流畅、措辞正式、篇幅长、一次新增大量内容等本身作为线索。
-* 程序化链接检查结果（deadUrls、stats）是程序在送检前实测的确定性事实，可以直接作为线索依据：
-  若本次编辑新增的引用中较高比例无法访问（deadRate 偏高、deadNewUrls 较多），应重点核查该批新增引用
-  （例如来源不存在、标题/作者/日期与来源不符）；但单个链接失效也可能只是站点反爬（如对数据中心 IP 返回 403）、
-  临时故障或抄录错误，不得仅因此断言使用了 AI。
+* 本次分析**不提供任何 URL 可达性检测结果**：不得臆测某个链接是否可访问，也不得据此记录线索。
 * **链接无法访问本身不构成线索**：不得单独输出一条以「URL / 链接无法访问」为主题的 issue。
   只有当链接失效与其它可观察证据（如引用信息与来源不符、来源根本不存在等）同时成立时，
   才可以把链接失效作为**同一条 issue 里的佐证**，并在该 issue 中把其它证据一并写清楚。
 * 参考文献已提供存档链接（archive-url）或标注 url-status 为 dead / usurped / unfit 时，
-  其原链接失效属正常情况，不得作为线索（这类原链接已在送检前被程序排除）。
-* 程序化检查结果里 unresolvedUrls 是本机器人所在服务器 DNS 解析异常导致「未能检查」的链接：
-  那是机器人侧的环境问题（服务器 IPv6 解析当前不可用），不代表链接失效，不得作为线索。
-* archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）的链接也已在送检前被程序排除，
-  不得因为存档链接可能不可访问而记录线索。
+  其原链接失效属正常情况，不得作为线索。
+* archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）时，该链接可能对自动访问
+  返回 403 或超时，属正常情况，不得因为存档链接可能不可访问而记录线索。
 * 引用 URL 时只写域名与路径，不要写出 http / https 协议头（避免触发维基的滥用过滤器）。
 * 没有具体、可展示、可解释的线索时，issues 返回空数组，并在 summary 说明未发现达到记录门槛的线索。
 * 每条线索都必须给出：具体位置、最短必要的可观察证据（原文/格式/URL）、为何值得作为线索，
@@ -394,10 +386,11 @@ export async function loadAiRules(ctx: HandlerContext): Promise<string> {
 /**
  * 3-1 / 3-2 共用的单次疑似 AI 线索分析（结构化输出，模型不生成最终 Wikitext）。
  *
- * 送检输入 = 本次编辑差异（可多条，同一条目的差异合并为一次请求）+ 可选的完整条目 Wikitext
- * + 可选的程序化链接检查报告（deadUrls / stats，确定性事实）。
- * 只送差异是刻意的降级模式：该条目在 24 小时内已送检过完整正文（或正文过长）时不再整篇送审，
- * 仍可基于差异发现线索，但模型看不到条目其余部分，结论中应体现这一限制。
+ * 送检输入 = 本次编辑差异（可多条，同一条目的差异合并为一次请求）+ 可选的完整条目 Wikitext。
+ * **程序化的 URL 可达性检查结果不作为模型输入**（2026-09-29）：链接检测只在模型确实发现了
+ * 其它线索时才由程序单独附在结果后面（见 analyzeWithReferenceLinks）——链接无法访问本身不是
+ * 疑似 AI 线索，不应参与模型判断，也不应在模型没发现别的问题时被端出来。
+ * 完整条目只在 3-2「本次没有任何差异可送」时才提供（3-1 一律只送差异）。
  *
  * @param phase 日志标记，用于区分 3-1 定期扫描与 3-2 请求驱动
  */
@@ -411,8 +404,6 @@ export async function analyzeWikitextClues(
     content?: string;
     /** 本次编辑差异（同一目的多条差异合并为一次请求） */
     diffs?: AiDiffInput[];
-    /** 送检前的程序化链接检查结果（确定性事实） */
-    linkReport?: AiLinkReport;
     ruleContent: string;
     /** 跨条目累计的 Token 统计（由调用方持有） */
     usageTracker: TokenUsage;
@@ -446,19 +437,6 @@ export async function analyzeWikitextClues(
   } else {
     sections.push(
       "【完整条目 Wikitext】\n（本次未提供完整条目，请仅依据下列编辑差异判断，不得臆测条目其余部分）",
-    );
-  }
-  if (input.linkReport) {
-    sections.push(
-      `【程序化链接检查结果】（确定性事实，由程序在送检前实测得到，不是模型推断；若对应引用已提供 archive-url 或标注 url-status=dead，其原链接失效属正常情况，已在检查前排除）\n${JSON.stringify(
-        {
-          deadUrls: input.linkReport.deadUrls,
-          unresolvedUrls: input.linkReport.unresolvedUrls,
-          stats: input.linkReport.stats,
-        },
-        null,
-        2,
-      )}\n（unresolvedUrls 是因机器人所在服务器 DNS 解析异常而未能检查的链接：属机器人侧环境问题，不代表链接失效，也不得作为任何线索依据。）`,
     );
   }
   if (diffs.length > 0) {
@@ -510,13 +488,6 @@ export async function analyzeWikitextClues(
         .map((diff) => diff.revid),
       confidence: result.confidence,
       issues: result.issues.length,
-      linkReport: input.linkReport
-        ? {
-            deadUrls: input.linkReport.deadUrls.length,
-            unresolvedUrls: input.linkReport.unresolvedUrls.length,
-            stats: input.linkReport.stats,
-          }
-        : undefined,
       usage,
     },
     `aiEdit ${phase} article analyzed`,
@@ -561,38 +532,11 @@ export function hasOnlyCitationLinkClues(result: AiClueResult): boolean {
 const LINK_CLUE_CONFIDENCE_FLOOR = { low: 0.3, medium: 0.6 } as const;
 
 /**
- * 送检大模型的单条异常链接（确定性事实，由程序实测得到）。
- *
- * `httpError` 为稳定分类：timeout（访问超时）/ reject（拒绝连接、HTTP 403）/ other（其余失败）。
- * DNS 解析失败不会出现在 deadUrls 里（它们属于机器人侧环境问题，见 AiUnresolvedUrl）。
- * `referenceName` 为该链接所属来源的标识（`<ref name>` 或引用模板的 title）。
- */
-export type AiDeadUrl = {
-  url: string;
-  httpStatus: number | null;
-  httpError: "timeout" | "reject" | "other" | "dns";
-  referenceName?: string;
-};
-
-/**
- * 因**机器人所在服务器的 DNS 解析异常**而未能检查的 URL（环境侧问题，不是链接失效）。
- *
- * 服务器当前 IPv6 地址解析不可用，会连带让完全正常的域名解析失败；这些结果：
- * - 不计入 deadUrls / 异常链接统计（不能用它们推断来源是否可用）；
- * - 单独作为确定性事实送模型，并明确说明「这是机器人侧环境问题，不得作为线索」。
- */
-export type AiUnresolvedUrl = {
-  url: string;
-  /** 固定为 dns：本机域名解析失败（ENOTFOUND / EAI_AGAIN） */
-  httpError: "dns";
-  referenceName?: string;
-};
-
-/**
- * 程序化链接检查的统计（同样作为确定性事实送检）。
+ * 程序化链接检查的统计。
  *
  * `newReferences` 为本次编辑新增的链接数，`checkedNewUrls` 为其中实际检查过的数量，
  * `deadNewUrls` 为其中失效的数量，`deadRate` = deadNewUrls / checkedNewUrls（无检查时为 0）。
+ * 这些数字只用于程序生成的链接补充说明（不再作为模型输入）。
  */
 export type AiLinkStats = {
   newReferences: number;
@@ -601,33 +545,32 @@ export type AiLinkStats = {
   deadRate: number;
 };
 
-/** 送检大模型的链接检查报告（deadUrls + unresolvedUrls + stats）。 */
-export type AiLinkReport = {
-  deadUrls: AiDeadUrl[];
-  /** 因本机 DNS 解析异常未能检查的链接（环境侧，不是链接失效） */
-  unresolvedUrls: AiUnresolvedUrl[];
-  stats: AiLinkStats;
-};
-
-/** 一次链接检查的结果（报告 + 明细），供调用方写日志、生成确定性线索。 */
+/**
+ * 一次链接检查的结果（明细 + 统计），供调用方写日志、生成确定性的链接补充说明。
+ *
+ * 结果只用于「模型已经发现其它线索时」附带的补充证据，不送模型。
+ */
 export type ReferenceLinkCheckOutcome = {
-  report: AiLinkReport;
   /** 本次实际检查（含命中本地缓存）的链接数 */
   checked: number;
   /** 判定为疑似异常（确定性失效或网络层不可达，不含本机 DNS 失败）的链接 */
   suspect: LinkCheckResult[];
   /** 因本机 DNS 解析异常未能检查的链接（环境侧问题，不作为线索） */
   unresolved: LinkCheckResult[];
+  /** 新增引用失效统计（用于补充说明文字） */
+  stats: AiLinkStats;
 };
 
 /**
- * 把「参考文献 URL 无法访问」渲染为一条确定性线索，并与模型给出的结果合并。
+ * 把「参考文献 URL 无法访问」渲染为一条程序生成的补充线索，附加在模型给出的线索之后。
  *
- * 规则（与需求一致）：
+ * 使用前提（由 analyzeWithReferenceLinks 保证）：**模型已经发现了其它线索**。
+ * 链接无法访问本身不构成疑似 AI 线索，因此程序不会在「模型没发现任何问题」时单独端出它。
+ *
+ * 规则：
  * - 存在访问超时 / 拒绝连接 / 403 / 404 等异常链接时记为 **low** 线索；
  * - 异常链接有多个（≥ SUSPECT_LINK_ESCALATE_COUNT）时提升为 **medium**；
- * - 该线索由程序生成（`diff` 为 null），并抬升整体线索强度至对应下限，
- *   保证「模型没看到问题」时这条客观线索仍然会被记录与展示。
+ * - 该线索由程序生成（`diff` 为 null），并抬升整体线索强度至对应下限。
  *
  * 注意与误报控制：链接失效也可能只是站点反爬（对数据中心 IP 返回 403）、临时故障或来源抄录有误，
  * 因此线索文本必须写明「其他可能解释」与人工核查方式，且强度只到 low / medium，不据此作任何归因。
@@ -677,12 +620,9 @@ export function mergeCitationLinkClues(
     diff: null,
   };
 
-  // 模型未记录任何线索时，摘要里补一句程序化检查的结论，避免摘要与线索列表相互矛盾。
-  const summary = (
-    result.issues.length === 0
-      ? `${result.summary.trim()} 程序化链接检查另发现 ${suspect.length} 个参考文献 URL 无法访问。`
-      : result.summary
-  ).slice(0, 800);
+  // 摘要保持模型原文：链接检测结果作为**单独一条**线索附在 issues 末尾，
+  // 不再往摘要里追加句子，避免同一件事在两处重复。
+  const summary = result.summary.slice(0, 800);
 
   return {
     confidence: Math.max(
@@ -707,16 +647,16 @@ function wikiHostOf(apiUrl: string | undefined): string[] {
 /**
  * 3-1 / 3-2 共用的确定性检查：提取条目参考文献 / 外部链接中的 URL 并探测可达性。
  *
- * 顺序要求：链接检查在调用模型**之前**完成，并把结果（异常 URL + 新增引用失效统计）
- * 作为确定性事实一并送检，模型据此判断「新增引用集中失效」这类线索；
- * 同时程序自己也会生成一条线索（mergeCitationLinkClues），保证不完全依赖模型输出。
+ * 调用时机：**在模型之后**，且仅当模型已经发现了其它线索时才调用（见 analyzeWithReferenceLinks）——
+ * 模型没发现任何线索时不做这次检查（省掉一次网络探测），因为链接可达性本身不构成疑似 AI 线索。
+ * 检查结果只由程序使用（渲染成单独一份链接补充说明），**不作为模型输入**。
  *
- * 送检正文与本次检查解耦：即使因为 24 小时复用窗口 / 正文过长而没有把完整条目送给模型，
- * 仍然使用完整条目 Wikitext 做链接检查（这是纯程序化检查，不涉及 token 消耗）。
+ * 提取对象与「本次送了多少给模型」解耦：始终使用完整条目 Wikitext 做提取（纯程序化，不消耗 token），
+ * 因此 3-2 只送差异时仍然会检查整篇条目的引用链接。
  *
  * 本机 DNS 解析失败（如服务器当前 IPv6 地址解析不可用）会单独归类为 `unresolved`：
- * 它们与链接本身无关，既不计入 `suspect`（不生成线索、不抬升 confidence），也不写进 deadUrls，
- * 而是作为 `unresolvedUrls` 随报告送检并在提示词里明确说明「机器人侧环境问题，不得作为线索」。
+ * 它们与链接本身无关，既不计入 `suspect`（不生成线索、不抬升 confidence），
+ * 也不计入新增引用失效统计，只在分析文本里注明「未能检查（机器人侧环境问题）」。
  */
 export async function runReferenceLinkCheck(
   ctx: HandlerContext,
@@ -776,9 +716,6 @@ export async function runReferenceLinkCheck(
   }
 
   const byUrl = new Map(results.map((result) => [result.url, result]));
-  const nameOf = new Map(
-    selected.map((link) => [link.url, link.referenceName] as const),
-  );
   const suspect = results.filter(isSuspectCitationLink);
   // 本机 DNS 解析失败（如服务器 IPv6 解析不可用）单独归类：与链接本身无关，
   // 不能当成「来源失效」，也不写成「拒绝连接」（见 linkCheck.isDnsResolutionFailure）。
@@ -793,7 +730,7 @@ export async function runReferenceLinkCheck(
       `aiEdit ${input.phase} reference links could not be checked: local DNS resolution failed (bot-side environment issue)`,
     );
 
-  // 新增引用（上次编辑新加的链接）中实际完成检查 / 失效的数量与比例。
+  // 新增引用（本次编辑新加的链接）中实际完成检查 / 失效的数量与比例。
   const newUrls = new Set(newLinks.map((link) => link.url));
   const checkedNewUrls = [...newUrls].filter((url) => byUrl.has(url)).length;
   const deadNewUrls = [...newUrls].filter(
@@ -809,60 +746,37 @@ export async function runReferenceLinkCheck(
         : Math.round((deadNewUrls / checkedNewUrls) * 100) / 100,
   };
 
-  const deadUrls: AiDeadUrl[] = suspect
-    .slice(0, MAX_LINKS_PER_ARTICLE)
-    .map((result) => {
-      const referenceName = nameOf.get(result.url);
-      return {
-        url: result.url,
-        httpStatus: result.httpStatus ?? null,
-        httpError: classifyLinkError(result),
-        ...(referenceName ? { referenceName } : {}),
-      };
-    });
-
-  const unresolvedUrls: AiUnresolvedUrl[] = unresolved
-    .slice(0, MAX_LINKS_PER_ARTICLE)
-    .map((result) => {
-      const referenceName = nameOf.get(result.url);
-      return {
-        url: result.url,
-        httpError: "dns" as const,
-        ...(referenceName ? { referenceName } : {}),
-      };
-    });
-
   log.info(
     {
       phase: input.phase,
       title: input.title,
       checked: results.length,
       stats,
-      suspect: deadUrls,
-      unresolved: unresolvedUrls,
+      suspect: suspect.map(
+        (result) => `${result.url}（${describeLinkFailure(result)}）`,
+      ),
+      unresolved: unresolved.map((result) => result.url),
     },
     `aiEdit ${input.phase} reference links checked`,
   );
 
-  return {
-    report: { deadUrls, unresolvedUrls, stats },
-    suspect,
-    unresolved,
-    checked: results.length,
-  };
+  return { checked: results.length, suspect, unresolved, stats };
 }
 
 /**
- * 3-1 / 3-2 共用的完整分析入口：先做程序化链接检查，再把结果作为确定性事实送模型，
- * 最后把程序生成的链接线索与模型结果合并。
+ * 3-1 / 3-2 共用的完整分析入口：先送模型（**只看编辑差异**），只有模型确实发现了其它线索时，
+ * 才由程序单独附上一份 URL 可达性检测结果。
  *
- * 顺序是刻意的：模型需要先看到「哪些 URL 实测打不开、新增引用失效比例多少」，
- * 才能把「新增引用集中失效」当作线索判断；同时程序也会自己记一条线索，
- * 避免模型忽略该事实时线索丢失（不完全依赖 LLM）。
+ * 为什么这样排序（2026-09-29 起）：
+ * - **URL 检测结果不作为模型输入**：链接打不开可能只是站点反爬（对数据中心 IP 返回 403）、
+ *   临时故障或来源抄录有误，喂给模型只会诱发「新增引用集中失效」这类噪声线索；
+ * - **模型没发现任何线索时不提供检测结果**：链接无法访问本身不是疑似 AI 线索，
+ *   没有别的问题时连检测都不做（省一次网络探测），本地只记一行「跳过链接检测」；
+ * - **模型发现了其它线索时才单独附一份**：作为补充证据列出实测无法访问的 URL，
+ *   由程序生成（`diff` 为 null），附在模型线索之后；实测全部可达时自然不加。
  *
- * 收尾规则：若最后**只有**「参考文献 URL 无法访问」这一类线索（模型没发现其它问题），
- * 则按「无问题」处理：清空 issues、confidence 归零，因而不会写入维基页面
- * （见 hasOnlyCitationLinkClues 与 publishAiReports 的发布门槛）。
+ * 收尾兜底：若模型自己产出的线索**全部**是「参考文献 URL 无法访问」这一类
+ * （照抄了规则里禁止的标题），仍按「无问题」处理（见 hasOnlyCitationLinkClues）。
  */
 export async function analyzeWithReferenceLinks(
   ctx: HandlerContext,
@@ -879,81 +793,79 @@ export async function analyzeWithReferenceLinks(
     ruleContent: string;
     usageTracker: TokenUsage;
   },
-): Promise<{ result: AiClueResult; linkCheck?: ReferenceLinkCheckOutcome }> {
-  // 1. 程序化链接检查（在模型之前，不消耗 token）
-  const linkCheck = await runReferenceLinkCheck(ctx, {
-    phase: input.phase,
-    title: input.title,
-    wikitext: input.wikitext,
-    diffs: input.diffs,
-  });
-
-  // 2. 送模型分析（携带链接检查的确定性事实）
+): Promise<{
+  result: AiClueResult;
+  linkCheck?: ReferenceLinkCheckOutcome;
+  /** 因「模型没有发现其它线索」而未做 URL 检测（供 debugLog 如实记录） */
+  linkCheckSkipped?: boolean;
+}> {
+  // 1. 送模型分析（只给差异；URL 检测结果不作为输入）
   const analyzed = await analyzeWikitextClues(ctx, {
     phase: input.phase,
     title: input.title,
     revid: input.revid,
     content: input.content,
     diffs: input.diffs,
-    linkReport: linkCheck?.report,
     ruleContent: input.ruleContent,
     usageTracker: input.usageTracker,
   });
 
-  // 3. 合并程序生成的链接线索（模型没记录时也保证这条客观线索不丢失）
-  const result = linkCheck
-    ? mergeCitationLinkClues(
-        analyzed,
-        linkCheck.suspect,
-        linkCheck.report.stats,
-        linkCheck.unresolved.length,
-      )
-    : analyzed;
-
-  // 4. 只有「参考文献 URL 无法访问」这一类问题时视为无问题：
-  //    链接失效本身不是疑似 AI 线索（反爬、临时故障、抄录错误都会造成），
-  //    因此清空 issues、confidence 归零——这样既不计入 checkuser 汇总，
-  //    也不会被 publishAiReports 发布到 check 页（发布门槛要求「确实存在线索」）。
-  //    本地仍保留痕迹：3-1 的 debugLog 会记 `* links: …`，提示词与日志也留有完整 URL。
-  if (hasOnlyCitationLinkClues(result)) {
+  // 2. 模型只给出了「链接无法访问」类线索：按「无问题」处理，也不附检测结果。
+  if (hasOnlyCitationLinkClues(analyzed)) {
     ctx.log.info(
-      {
-        phase: input.phase,
-        title: input.title,
-        deadUrls: linkCheck?.suspect.length ?? 0,
-        unresolved: linkCheck?.unresolved.length ?? 0,
-      },
-      `aiEdit ${input.phase} only citation link failures found, treated as no clue (not published)`,
+      { phase: input.phase, title: input.title },
+      `aiEdit ${input.phase} model reported only citation-link issues, treated as no clue (not published)`,
     );
     return {
       result: {
         confidence: 0,
-        summary: buildLinkOnlySummary(analyzed.summary, linkCheck),
+        summary: buildLinkOnlySummary(analyzed.summary),
         issues: [],
       },
-      linkCheck,
+      linkCheckSkipped: true,
     };
   }
 
-  return { result, linkCheck };
+  // 3. 模型没发现任何线索：不提供 URL 检测结果（连检测都不做）。
+  if (analyzed.issues.length === 0) {
+    ctx.log.info(
+      { phase: input.phase, title: input.title },
+      `aiEdit ${input.phase} no clues found, skipping reference link check`,
+    );
+    return { result: analyzed, linkCheckSkipped: true };
+  }
+
+  // 4. 程序化链接检查（不消耗 token，但在有线索时才做，避免无谓的网络探测）
+  const linkCheck = await runReferenceLinkCheck(ctx, {
+    phase: input.phase,
+    title: input.title,
+    wikitext: input.wikitext,
+    diffs: input.diffs,
+  });
+  if (!linkCheck || linkCheck.suspect.length === 0) {
+    return { result: analyzed, linkCheck };
+  }
+
+  // 5. 单独附一份程序化 URL 检测结果（实测无法访问的链接）
+  return {
+    result: mergeCitationLinkClues(
+      analyzed,
+      linkCheck.suspect,
+      linkCheck.stats,
+      linkCheck.unresolved.length,
+    ),
+    linkCheck,
+  };
 }
 
 /**
- * 「只有链接无法访问」时的结论文本。
+ * 模型只给出「链接无法访问」类线索时的结论文本。
  *
- * 如实写出检查结果与处理方式，避免 3-2 结果页看起来像是链接检查被跳过了。
+ * 如实写出处理方式，避免 3-2 结果页看起来像是链接检查被跳过了。
  */
-function buildLinkOnlySummary(
-  base: string,
-  linkCheck?: ReferenceLinkCheckOutcome,
-): string {
-  const dead = linkCheck?.suspect.length ?? 0;
-  const unresolved = linkCheck?.unresolved.length ?? 0;
-  const note = `程序化链接检查发现 ${dead} 个参考文献 URL 无法访问${
-    unresolved > 0
-      ? `，另有 ${unresolved} 个链接因本机 DNS 解析异常未能检查（机器人侧环境问题）`
-      : ""
-  }；链接失效本身不构成疑似 AI 线索，本次记录为「未发现达到记录门槛的线索」。`;
+function buildLinkOnlySummary(base: string): string {
+  const note =
+    "本次结果只包含「链接无法访问」这类主题、没有其它可观察线索；链接失效本身不构成疑似 AI 线索（反爬、临时故障、抄录错误都会造成），本次记录为「未发现达到记录门槛的线索」。";
   return `${base.trim()} ${note}`.slice(0, 800);
 }
 
@@ -1139,6 +1051,8 @@ function renderDebugEntry(
       unresolved?: number;
       stats?: AiLinkStats;
     };
+    /** 模型未发现任何线索、因而未做 URL 检测（debugLog 如实记录，避免误以为漏检） */
+    linkCheckSkipped?: boolean;
   },
 ): string {
   const lines: string[] = [
@@ -1161,7 +1075,8 @@ function renderDebugEntry(
     );
   if (options.truncatedDiffs)
     lines.push(`* diffs truncated: ${options.truncatedDiffs}`);
-  // 确定性检查（参考文献 URL 可达性）不依赖 LLM，单独记录检查规模，便于人工核对
+  // 确定性检查（参考文献 URL 可达性）不依赖 LLM，单独记录检查规模，便于人工核对；
+  // 它只在模型已经发现其它线索时才执行（见 analyzeWithReferenceLinks）。
   if (options.linkCheck) {
     const stats = options.linkCheck.stats;
     const newRefs = stats
@@ -1175,6 +1090,8 @@ function renderDebugEntry(
       lines.push(
         `* links unresolved (bot-side DNS failure, not a dead link): ${options.linkCheck.unresolved}`,
       );
+  } else if (options.linkCheckSkipped) {
+    lines.push("* links: skipped (no other clues found, no URL probe run)");
   }
 
   // 整条条目被跳过（新增 CJK 不足 / 无可用差异）：只记原因，不写 confidence 与结果
@@ -1186,11 +1103,7 @@ function renderDebugEntry(
 
   lines.push(`* confidence: ${result.confidence}`, `* result:`, "");
   if (result.issues.length === 0) {
-    lines.push(
-      options.linkCheck && options.linkCheck.suspect > 0
-        ? "（仅有链接无法访问，未发现其它线索：按「无问题」处理，不写维基页面）"
-        : "（未发现达到记录门槛的疑似线索）",
-    );
+    lines.push("（未发现达到记录门槛的疑似线索）");
   } else {
     result.issues.forEach((issue, index) => {
       const notes = [
@@ -1218,14 +1131,16 @@ type AiArticleAnalysis = {
   diffBytes: number;
   /** 本次 LLM 调用的 Token 用量（含缓存命中），用于 debugLog 成本核对 */
   usage: TokenUsage;
-  /** 确定性检查（参考文献 URL 可达性）规模：检查数 / 异常数 / 新增引用统计 */
-  linkCheck: {
+  /** 确定性检查（参考文献 URL 可达性）规模：检查数 / 异常数 / 新增引用统计；未做检测时省略 */
+  linkCheck?: {
     checked: number;
     suspect: number;
     /** 因本机 DNS 解析异常未能检查的链接数（环境侧，非链接失效） */
     unresolved?: number;
     stats?: AiLinkStats;
   };
+  /** 模型未发现任何线索，因而本次未做 URL 检测 */
+  linkCheckSkipped?: boolean;
 };
 
 /**
@@ -1482,12 +1397,15 @@ async function analyzeArticle(
       addedCjk: kept.reduce((sum, m) => sum + m.cjkChars, 0),
       diffBytes: kept.reduce((sum, m) => sum + m.diffBytes, 0),
       usage: { ...usageTracker },
-      linkCheck: {
-        checked: outcome.linkCheck?.checked ?? 0,
-        suspect: outcome.linkCheck?.suspect.length ?? 0,
-        unresolved: outcome.linkCheck?.unresolved.length,
-        stats: outcome.linkCheck?.report.stats,
-      },
+      linkCheck: outcome.linkCheck
+        ? {
+            checked: outcome.linkCheck.checked,
+            suspect: outcome.linkCheck.suspect.length,
+            unresolved: outcome.linkCheck.unresolved.length,
+            stats: outcome.linkCheck.stats,
+          }
+        : undefined,
+      linkCheckSkipped: outcome.linkCheckSkipped,
     },
   };
 }
@@ -1506,10 +1424,10 @@ async function analyzeArticle(
  * 5. 对涉及变化的条目，读取其本次全部差异（一个条目一轮只请求一次 LLM）；
  *    **只送编辑差异，不送条目全文**（正文仅供程序化链接检查）；
  *    新增部分 CJK 字符数不足 MIN_ADDED_CJK_CHARS 的差异跳过检查，但逐条记录留痕。
- * 6. 先执行一次不依赖 LLM 的确定性检查（提取条目参考文献 / 外部链接中的 URL 探测可达性；
- *    模板已提供 archive-url 或 url-status=dead 的原链接不算问题；结果缓存在 citation_links 表，
- *    复用窗口内不重复探测）；随后按 rulePage 规则调用 LLM，并把链接检查结果（deadUrls + stats）
- *    一并送检；最后程序自己也记一条「URL 无法访问」线索（单个 low、多个 medium）。
+ * 6. 按 rulePage 规则调用 LLM 分析（**URL 可达性检测结果不作为模型输入**）；只有模型确实
+ *    发现了其它线索时，才再由程序单独附一份程序化链接检测结果（提取条目参考文献 / 外部链接
+ *    中的 URL 实测可达性；模板已提供 archive-url 或 url-status=dead 的原链接不算问题；结果缓存
+ *    在 citation_links 表，复用窗口内不重复探测）。模型没发现任何线索时连检测都不做。
  * 7. 结构化结果写入 ai_edit_reports 表；成本度量写入 ai_scan_stats 表；
  *    两部分（含每条 diff 的字节数、新增 CJK 数与 Token 用量）都由程序拼接文字追加到
  *    tasks.aiEdit.debugLog，供人工核对「跳过规则到底省下了多少」。
@@ -1695,6 +1613,7 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
           skippedDiffs: outcome.skippedDiffs,
           truncatedDiffs: outcome.truncatedDiffs,
           linkCheck: result.linkCheck,
+          linkCheckSkipped: result.linkCheckSkipped,
         }),
       );
     } catch (err) {

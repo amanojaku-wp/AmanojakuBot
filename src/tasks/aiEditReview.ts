@@ -51,11 +51,10 @@ import type { HandlerContext } from "../handle.js";
  *   否则请求没有可判断的内容；
  * - 报告页用 {{La}} 整理条目相关链接（条目、编辑、讨论、历史等），并按送检差异逐条列出 Diff。
  *
- * 线索来源有两类：
- * - 先执行程序化确定性检查（runReferenceLinkCheck，不依赖 LLM）：提取参考文献 / 外部链接的 URL 探测可达性，
- *   并把异常 URL（deadUrls）与新增引用失效统计（stats）作为确定性事实一并送检；
- * - 模型据此输出文风 / 格式 / 内容层面的疑似线索，程序再合并一条「URL 无法访问」的线索
- *   （单个 low、多个 medium），保证不完全依赖模型输出。
+ * 线索来源有两类（**URL 可达性检测不作为模型输入**）：
+ * - 程序化确定性检查（runReferenceLinkCheck，不依赖 LLM）：提取参考文献 / 外部链接的 URL 探测可达性，
+ *   但结果**只在模型已经分析出其它线索时**才作为单独一条补充线索附上（见 analyzeWithReferenceLinks）；
+ * - 模型只看编辑差异输出文风 / 格式 / 内容层面的疑似线索；模型没发现线索时不附任何链接结果。
  *
  * 跳过规则（逐项跳过，不影响其它有效对象；只有全部无效时才回复 not done）：
  * - article / diff 参数无法识别，或对应页面不存在、不可读取、不在条目与 draftNamespace 命名空间内；
@@ -434,8 +433,9 @@ async function processAiCheckRequest(
     return;
   }
 
-  // 3. 先做程序化链接检查，再把结果（deadUrls + stats）与差异一并送 LLM
-  //    （一个条目一轮只请求一次，携带该条目本次全部差异），最后合并程序生成的链接线索。
+  // 3. 逐条送 LLM（一个条目一轮只请求一次，携带该条目本次全部差异）。
+  //    URL 可达性检测不作为模型输入，且只在模型确实发现其它线索时由 analyzeWithReferenceLinks
+  //    单独附一份补充结果，因此这里不需要预先做链接检查。
   const ruleContent = await loadAiRules(ctx);
   const usage = createTokenUsage();
   const results: AiCheckResultItem[] = [];
