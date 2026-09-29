@@ -55,10 +55,11 @@ export const MAX_DIFF_TOTAL_CHARS = 30000;
 const EXCLUDED_CHANGE_TAGS = [
   "awb",
   "twinkle",
-  "回退功能",
-  "rollback",
   "mw-rollback",
   "mw-undo",
+  "mw-blank",
+  "mw-manual-revert",
+  "mw-new-redirect"
 ];
 
 /**
