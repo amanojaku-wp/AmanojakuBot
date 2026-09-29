@@ -1466,10 +1466,10 @@ export function stripUrlSchemes(value: string): string {
 }
 
 /**
- * 写入维基页面的报告文本：先去掉明文 URL 协议头（stripUrlSchemes），再做 Wikitext 转义。
+ * 写入维基页面的报告文本：先做写页面前的过滤器规避替换（stripUrlSchemes），再做 Wikitext 转义。
  *
  * 报告的正文来源既有程序拼接的链接检查证据，也有模型输出的分析文字与条目原文片段，
- * 它们都可能带明文 URL；集中在这里过一道，避免任何一条写页面的路径被滥用过滤器拦下。
+ * 集中在这里过一道，避免任何一条写页面的路径被滥用过滤器拦下。
  */
 export function safeReportText(value: string): string {
   return safeWikitext(stripUrlSchemes(value));

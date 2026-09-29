@@ -94,7 +94,9 @@ const DEFAULT_AI_EDIT_RULES = `
 * 程序化检查结果里 unresolvedUrls 是本机器人所在服务器 DNS 解析异常导致「未能检查」的链接：
   那是机器人侧的环境问题（服务器 IPv6 解析当前不可用），不代表链接失效，不得作为线索，
   也不得描述为「拒绝连接」。
-* 引用 URL 时只写域名与路径，不要写出 http / https 协议头（报告页会去掉协议头）。
+* 引用 URL 时只写域名与路径，不要写出 http / https 协议头（避免触发维基的滥用过滤器）。
+* **链接无法访问本身不构成线索**：不得单独记录一条以「URL / 链接无法访问」为主题的线索；
+  只有在链接失效与其它具体证据（如引用信息与来源不符）同时成立时，才能作为同一条线索里的佐证。
 * 每条线索都必须指出：具体位置、具体词句/格式/URL 等可观察特征、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能解释该现象的合理可能性与建议人工核查方法。
 * 线索强度分为 high（相对直接、指向性强的痕迹）、medium（较有辨识度但仍存在较多其他解释）、
@@ -124,13 +126,16 @@ const AI_EDIT_SYSTEM_PROMPT = `
   若本次编辑新增的引用中较高比例无法访问（deadRate 偏高、deadNewUrls 较多），应重点核查该批新增引用
   （例如来源不存在、标题/作者/日期与来源不符）；但单个链接失效也可能只是站点反爬（如对数据中心 IP 返回 403）、
   临时故障或抄录错误，不得仅因此断言使用了 AI。
+* **链接无法访问本身不构成线索**：不得单独输出一条以「URL / 链接无法访问」为主题的 issue。
+  只有当链接失效与其它可观察证据（如引用信息与来源不符、来源根本不存在等）同时成立时，
+  才可以把链接失效作为**同一条 issue 里的佐证**，并在该 issue 中把其它证据一并写清楚。
 * 参考文献已提供存档链接（archive-url）或标注 url-status 为 dead / usurped / unfit 时，
   其原链接失效属正常情况，不得作为线索（这类原链接已在送检前被程序排除）。
 * 程序化检查结果里 unresolvedUrls 是本机器人所在服务器 DNS 解析异常导致「未能检查」的链接：
   那是机器人侧的环境问题（服务器 IPv6 解析当前不可用），不代表链接失效，不得作为线索。
 * archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）的链接也已在送检前被程序排除，
   不得因为存档链接可能不可访问而记录线索。
-* 引用 URL 时只写域名与路径，不要写出 http / https 协议头（报告页会去掉协议头）。
+* 引用 URL 时只写域名与路径，不要写出 http / https 协议头（避免触发维基的滥用过滤器）。
 * 没有具体、可展示、可解释的线索时，issues 返回空数组，并在 summary 说明未发现达到记录门槛的线索。
 * 每条线索都必须给出：具体位置、最短必要的可观察证据（原文/格式/URL）、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能成立的合理解释与建议人工核查的方法。
@@ -500,6 +505,31 @@ export async function analyzeWikitextClues(
 /** 触发「多条异常链接」升级为 medium 的异常链接数量下限。 */
 export const SUSPECT_LINK_ESCALATE_COUNT = 2;
 
+/**
+ * 程序生成的「参考文献 URL 无法访问」线索的标题前缀。
+ *
+ * 用它识别「单纯的链接可达性问题」：模型照抄同一标题时也会被识别到（见 isCitationLinkIssue）。
+ */
+export const CITATION_LINK_ISSUE_TITLE_PREFIX = "参考文献 URL 无法访问";
+
+/** 该线索是否属于「单纯的链接无法访问」（由程序生成，或模型照抄了同一标题）。 */
+export function isCitationLinkIssue(issue: AiClueIssue): boolean {
+  return issue.title.trim().startsWith(CITATION_LINK_ISSUE_TITLE_PREFIX);
+}
+
+/**
+ * 是否「本次只发现了链接无法访问这一类问题」（没有任何其它线索）。
+ *
+ * 链接失效可能是反爬、临时故障或抄录错误，本身不构成疑似 AI 线索，
+ * 因此这种结果按「无问题」处理（见 analyzeWithReferenceLinks）。
+ */
+export function hasOnlyCitationLinkClues(result: AiClueResult): boolean {
+  return (
+    result.issues.length > 0 &&
+    result.issues.every((issue) => isCitationLinkIssue(issue))
+  );
+}
+
 /** 程序化线索的 confidence 下限（single → low，multiple → medium）。 */
 const LINK_CLUE_CONFIDENCE_FLOOR = { low: 0.3, medium: 0.6 } as const;
 
@@ -609,7 +639,7 @@ export function mergeCitationLinkClues(
 
   const issue: AiClueIssue = {
     strength,
-    title: `参考文献 URL 无法访问（${suspect.length} 个）`,
+    title: `${CITATION_LINK_ISSUE_TITLE_PREFIX}（${suspect.length} 个）`,
     location: null,
     evidence,
     analysis: `'''URL探测结果'''：条目参考文献 / 外部链接中的 ${suspect.length} 个 URL 在本次检查时无法正常访问（访问超时、拒绝连接、403、404 等）。${newRefNote}${unresolvedNote}引用来源不存在、已失效或被删除时会出现该现象，建议人工核实后再判断是否与疑似 AI 生成引用有关。`,
@@ -802,6 +832,10 @@ export async function runReferenceLinkCheck(
  * 顺序是刻意的：模型需要先看到「哪些 URL 实测打不开、新增引用失效比例多少」，
  * 才能把「新增引用集中失效」当作线索判断；同时程序也会自己记一条线索，
  * 避免模型忽略该事实时线索丢失（不完全依赖 LLM）。
+ *
+ * 收尾规则：若最后**只有**「参考文献 URL 无法访问」这一类线索（模型没发现其它问题），
+ * 则按「无问题」处理：清空 issues、confidence 归零，因而不会写入维基页面
+ * （见 hasOnlyCitationLinkClues 与 publishAiReports 的发布门槛）。
  */
 export async function analyzeWithReferenceLinks(
   ctx: HandlerContext,
@@ -849,7 +883,51 @@ export async function analyzeWithReferenceLinks(
       )
     : analyzed;
 
+  // 4. 只有「参考文献 URL 无法访问」这一类问题时视为无问题：
+  //    链接失效本身不是疑似 AI 线索（反爬、临时故障、抄录错误都会造成），
+  //    因此清空 issues、confidence 归零——这样既不计入 checkuser 汇总，
+  //    也不会被 publishAiReports 发布到 check 页（发布门槛要求「确实存在线索」）。
+  //    本地仍保留痕迹：3-1 的 debugLog 会记 `* links: …`，提示词与日志也留有完整 URL。
+  if (hasOnlyCitationLinkClues(result)) {
+    ctx.log.info(
+      {
+        phase: input.phase,
+        title: input.title,
+        deadUrls: linkCheck?.suspect.length ?? 0,
+        unresolved: linkCheck?.unresolved.length ?? 0,
+      },
+      `aiEdit ${input.phase} only citation link failures found, treated as no clue (not published)`,
+    );
+    return {
+      result: {
+        confidence: 0,
+        summary: buildLinkOnlySummary(analyzed.summary, linkCheck),
+        issues: [],
+      },
+      linkCheck,
+    };
+  }
+
   return { result, linkCheck };
+}
+
+/**
+ * 「只有链接无法访问」时的结论文本。
+ *
+ * 如实写出检查结果与处理方式，避免 3-2 结果页看起来像是链接检查被跳过了。
+ */
+function buildLinkOnlySummary(
+  base: string,
+  linkCheck?: ReferenceLinkCheckOutcome,
+): string {
+  const dead = linkCheck?.suspect.length ?? 0;
+  const unresolved = linkCheck?.unresolved.length ?? 0;
+  const note = `程序化链接检查发现 ${dead} 个参考文献 URL 无法访问${
+    unresolved > 0
+      ? `，另有 ${unresolved} 个链接因本机 DNS 解析异常未能检查（机器人侧环境问题）`
+      : ""
+  }；链接失效本身不构成疑似 AI 线索，本次记录为「未发现达到记录门槛的线索」。`;
+  return `${base.trim()} ${note}`.slice(0, 800);
 }
 
 /**
@@ -1048,7 +1126,11 @@ function renderDebugEntry(
   }
   lines.push(`* confidence: ${result.confidence}`, `* result:`, "");
   if (result.issues.length === 0) {
-    lines.push("（未发现达到记录门槛的疑似线索）");
+    lines.push(
+      options.linkCheck && options.linkCheck.suspect > 0
+        ? "（仅有链接无法访问，未发现其它线索：按「无问题」处理，不写维基页面）"
+        : "（未发现达到记录门槛的疑似线索）",
+    );
   } else {
     result.issues.forEach((issue, index) => {
       const notes = [
