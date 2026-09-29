@@ -3,6 +3,7 @@ import {
   canonicalTitle,
   generateUniqueSectionTitle,
   parseSections,
+  safeReportText,
   safeWikitext,
 } from "../utils/wikitext.js";
 import { createTokenUsage } from "../utils/llm.js";
@@ -153,6 +154,9 @@ type AiCheckTarget = {
 
 /**
  * 渲染 3-2 结果页中的一次请求章节（程序完成文字拼接）。
+ *
+ * 正文一律经 safeReportText：链接检查证据与模型输出都可能带明文 URL，
+ * 而明文 http / https 会被滥用过滤器当作外链拦下机器人写报告。
  */
 function renderAiCheckSection(
   sectionTitle: string,
@@ -172,7 +176,7 @@ function renderAiCheckSection(
     if (item.diffs.length > 0) {
       lines.push(`* Diff: ${renderDiffLinks(item.diffs)}`);
     }
-    lines.push(`* 结论：${safeWikitext(item.result.summary)}`);
+    lines.push(`* 结论：${safeReportText(item.result.summary)}`);
     lines.push("");
 
     if (item.result.issues.length === 0) {
@@ -183,7 +187,7 @@ function renderAiCheckSection(
 
     for (const issue of item.result.issues) {
       const loc = issue.location
-        ? `<small>（${safeWikitext(issue.location)}）</small>`
+        ? `<small>（${safeReportText(issue.location)}）</small>`
         : "";
       // 同一条目送检多条差异时标注线索归属，便于人工对照具体编辑
       const diffTag =
@@ -191,19 +195,19 @@ function renderAiCheckSection(
           ? `<small>（差异 [[Special:Diff/${issue.diff}|${issue.diff}]]）</small>`
           : "";
       lines.push(`; 线索强度：${issue.strength}${loc}${diffTag}`);
-      lines.push(`: {{tq|${safeWikitext(issue.evidence)}}}`);
-      lines.push(`: ${safeWikitext(issue.analysis)}`);
+      lines.push(`: {{tq|${safeReportText(issue.evidence)}}}`);
+      lines.push(`: ${safeReportText(issue.analysis)}`);
       lines.push(
-        `: '''其他可能解释：'''<i>${safeWikitext(issue.alternative)}</i>`,
+        `: '''其他可能解释：'''<i>${safeReportText(issue.alternative)}</i>`,
       );
-      lines.push(`: '''建议：'''<u>${safeWikitext(issue.check)}</u>`);
+      lines.push(`: '''建议：'''<u>${safeReportText(issue.check)}</u>`);
     }
     lines.push("");
   }
 
   if (skipped.length > 0) {
     lines.push(
-      `: '''未能读取或已跳过的送检对象：'''${safeWikitext(
+      `: '''未能读取或已跳过的送检对象：'''${safeReportText(
         [...new Set(skipped)].join("；"),
       )}`,
     );

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { safeWikitext } from "../utils/wikitext.js";
+import { safeReportText, safeWikitext } from "../utils/wikitext.js";
 import {
   createTokenUsage,
   formatTokenUsage,
@@ -525,24 +525,26 @@ function formatIssueSection(
         ? ' <small style="color: #777;">[疑似需核实]</small>'
         : "";
 
-    let itemHeader = `; ${idx + startNumber}.<!-- ${cat} -->${safeWikitext(issueTitle)}${suspectedBadge}`;
+    let itemHeader = `; ${idx + startNumber}.<!-- ${cat} -->${safeReportText(issueTitle)}${suspectedBadge}`;
 
     if (issue.location && issue.location.trim()) {
-      itemHeader += `<small>（${safeWikitext(issue.location.trim())}）</small>`;
+      itemHeader += `<small>（${safeReportText(issue.location.trim())}）</small>`;
     }
 
     lines.push(itemHeader);
 
     if (issue.originalText?.trim()) {
-      lines.push(`: {{tq|${safeWikitext(issue.originalText.trim())}}}`);
+      lines.push(`: {{tq|${safeReportText(issue.originalText.trim())}}}`);
     }
 
     if (issue.description?.trim()) {
-      lines.push(`: <small>${safeWikitext(issue.description.trim())}</small>`);
+      lines.push(
+        `: <small>${safeReportText(issue.description.trim())}</small>`,
+      );
     }
 
     if (issue.suggestion?.trim()) {
-      lines.push(`: ➡️ <u>${safeWikitext(issue.suggestion.trim())}</u>`);
+      lines.push(`: ➡️ <u>${safeReportText(issue.suggestion.trim())}</u>`);
     }
   }
 
@@ -592,12 +594,12 @@ export function formatAfcResultWikitext(result: AfcResult): string {
   );
 
   if (result.summary?.trim()) {
-    lines.push(`:${safeWikitext(result.summary.trim())}`);
+    lines.push(`:${safeReportText(result.summary.trim())}`);
   }
 
   if (result.priorityGuidance?.trim()) {
     lines.push(
-      `:➡️ '''下一步优先处理建议：'''${safeWikitext(result.priorityGuidance.trim())}`,
+      `:➡️ '''下一步优先处理建议：'''${safeReportText(result.priorityGuidance.trim())}`,
     );
   }
 
@@ -893,7 +895,7 @@ export async function processAfcRequest(
   // 5.1 非百科全书条目：拒绝并回报
   if (outcome.kind === "not-encyclopedic") {
     const reason = outcome.result.nonEncyclopedicReason;
-    const reasonSuffix = reason ? `（原因：${safeWikitext(reason)}）` : "";
+    const reasonSuffix = reason ? `（原因：${safeReportText(reason)}）` : "";
 
     await rejectArticleRequest(
       ctx,

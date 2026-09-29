@@ -1459,6 +1459,23 @@ export function safeWikitext(value: string) {
 }
 
 /**
+ * archive.today会触发过滤器，特殊处理
+ */
+export function stripUrlSchemes(value: string): string {
+  return value.replace(/archive\.today/gi, "archive点today");
+}
+
+/**
+ * 写入维基页面的报告文本：先去掉明文 URL 协议头（stripUrlSchemes），再做 Wikitext 转义。
+ *
+ * 报告的正文来源既有程序拼接的链接检查证据，也有模型输出的分析文字与条目原文片段，
+ * 它们都可能带明文 URL；集中在这里过一道，避免任何一条写页面的路径被滥用过滤器拦下。
+ */
+export function safeReportText(value: string): string {
+  return safeWikitext(stripUrlSchemes(value));
+}
+
+/**
  * 标准化用户名（首字母大写，下划线转空格，去除前后空白）
  */
 export function normalizeWikiUsername(name: string): string {

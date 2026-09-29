@@ -66,7 +66,7 @@ tasks:
     debugLog: /data/project/seijabot/AmanojakuBot/ai-edit.log
     #maxAnalysesPerWindow: 20
     minConfidence: 0
-    linkCheck: true # 参考文献 / 外部链接 URL 可达性检查（确定性检查，不依赖 LLM；单个异常为 low，多个为 medium）
+    linkCheck: true # 参考文献 / 外部链接 URL 可达性检查（确定性检查，不依赖 LLM；优先 IPv4；已存档的引用与存档站链接不检查；本机 DNS 解析失败仅算「未能检查」，不计为失效）
     #linkCheckTimeoutSeconds: 15 # 单个链接探测超时（秒）
     talkPage: User talk:AmanojakuBot/ai
     template: User:AmanojakuBot/template/AICheckRequest

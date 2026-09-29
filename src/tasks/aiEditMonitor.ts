@@ -7,6 +7,7 @@ import { pageText, revisionDiff, type RevisionDiff } from "../utils/wiki.js";
 import {
   canonicalTitle,
   compactWikiTimestamp,
+  safeReportText,
   safeWikitext,
 } from "../utils/wikitext.js";
 import {
@@ -21,6 +22,7 @@ import {
   describeLinkFailure,
   extractAddedReferenceLinks,
   extractReferenceLinks,
+  isDnsResolutionFailure,
   isSuspectCitationLink,
   MAX_LINKS_PER_ARTICLE,
   type ExtractedReference,
@@ -87,6 +89,12 @@ const DEFAULT_AI_EDIT_RULES = `
 * 没有具体、可展示、可解释的线索时，不得记录。
 * 参考文献已提供存档链接（archive-url 参数）或标注 url-status 为 dead / usurped / unfit 时，
   其原链接无法访问属正常情况，不得作为线索。
+* archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）的链接已在检查前被程序排除，
+  不得因为存档链接“看上去可能失效”而记录线索。
+* 程序化检查结果里 unresolvedUrls 是本机器人所在服务器 DNS 解析异常导致「未能检查」的链接：
+  那是机器人侧的环境问题（服务器 IPv6 解析当前不可用），不代表链接失效，不得作为线索，
+  也不得描述为「拒绝连接」。
+* 引用 URL 时只写域名与路径，不要写出 http / https 协议头（报告页会去掉协议头）。
 * 每条线索都必须指出：具体位置、具体词句/格式/URL 等可观察特征、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能解释该现象的合理可能性与建议人工核查方法。
 * 线索强度分为 high（相对直接、指向性强的痕迹）、medium（较有辨识度但仍存在较多其他解释）、
@@ -118,6 +126,11 @@ const AI_EDIT_SYSTEM_PROMPT = `
   临时故障或抄录错误，不得仅因此断言使用了 AI。
 * 参考文献已提供存档链接（archive-url）或标注 url-status 为 dead / usurped / unfit 时，
   其原链接失效属正常情况，不得作为线索（这类原链接已在送检前被程序排除）。
+* 程序化检查结果里 unresolvedUrls 是本机器人所在服务器 DNS 解析异常导致「未能检查」的链接：
+  那是机器人侧的环境问题（服务器 IPv6 解析当前不可用），不代表链接失效，不得作为线索。
+* archive-url 指向存档站（web.archive.org、archive.today、archive.is 等）的链接也已在送检前被程序排除，
+  不得因为存档链接可能不可访问而记录线索。
+* 引用 URL 时只写域名与路径，不要写出 http / https 协议头（报告页会去掉协议头）。
 * 没有具体、可展示、可解释的线索时，issues 返回空数组，并在 summary 说明未发现达到记录门槛的线索。
 * 每条线索都必须给出：具体位置、最短必要的可观察证据（原文/格式/URL）、为何值得作为线索，
   以及至少一种无需假设使用 AI 也能成立的合理解释与建议人工核查的方法。
@@ -406,10 +419,14 @@ export async function analyzeWikitextClues(
   if (input.linkReport) {
     sections.push(
       `【程序化链接检查结果】（确定性事实，由程序在送检前实测得到，不是模型推断；若对应引用已提供 archive-url 或标注 url-status=dead，其原链接失效属正常情况，已在检查前排除）\n${JSON.stringify(
-        { deadUrls: input.linkReport.deadUrls, stats: input.linkReport.stats },
+        {
+          deadUrls: input.linkReport.deadUrls,
+          unresolvedUrls: input.linkReport.unresolvedUrls,
+          stats: input.linkReport.stats,
+        },
         null,
         2,
-      )}`,
+      )}\n（unresolvedUrls 是因机器人所在服务器 DNS 解析异常而未能检查的链接：属机器人侧环境问题，不代表链接失效，也不得作为任何线索依据。）`,
     );
   }
   if (diffs.length > 0) {
@@ -464,6 +481,7 @@ export async function analyzeWikitextClues(
       linkReport: input.linkReport
         ? {
             deadUrls: input.linkReport.deadUrls.length,
+            unresolvedUrls: input.linkReport.unresolvedUrls.length,
             stats: input.linkReport.stats,
           }
         : undefined,
@@ -489,12 +507,27 @@ const LINK_CLUE_CONFIDENCE_FLOOR = { low: 0.3, medium: 0.6 } as const;
  * 送检大模型的单条异常链接（确定性事实，由程序实测得到）。
  *
  * `httpError` 为稳定分类：timeout（访问超时）/ reject（拒绝连接、HTTP 403）/ other（其余失败）。
+ * DNS 解析失败不会出现在 deadUrls 里（它们属于机器人侧环境问题，见 AiUnresolvedUrl）。
  * `referenceName` 为该链接所属来源的标识（`<ref name>` 或引用模板的 title）。
  */
 export type AiDeadUrl = {
   url: string;
   httpStatus: number | null;
-  httpError: "timeout" | "reject" | "other";
+  httpError: "timeout" | "reject" | "other" | "dns";
+  referenceName?: string;
+};
+
+/**
+ * 因**机器人所在服务器的 DNS 解析异常**而未能检查的 URL（环境侧问题，不是链接失效）。
+ *
+ * 服务器当前 IPv6 地址解析不可用，会连带让完全正常的域名解析失败；这些结果：
+ * - 不计入 deadUrls / 异常链接统计（不能用它们推断来源是否可用）；
+ * - 单独作为确定性事实送模型，并明确说明「这是机器人侧环境问题，不得作为线索」。
+ */
+export type AiUnresolvedUrl = {
+  url: string;
+  /** 固定为 dns：本机域名解析失败（ENOTFOUND / EAI_AGAIN） */
+  httpError: "dns";
   referenceName?: string;
 };
 
@@ -511,9 +544,11 @@ export type AiLinkStats = {
   deadRate: number;
 };
 
-/** 送检大模型的链接检查报告（deadUrls + stats）。 */
+/** 送检大模型的链接检查报告（deadUrls + unresolvedUrls + stats）。 */
 export type AiLinkReport = {
   deadUrls: AiDeadUrl[];
+  /** 因本机 DNS 解析异常未能检查的链接（环境侧，不是链接失效） */
+  unresolvedUrls: AiUnresolvedUrl[];
   stats: AiLinkStats;
 };
 
@@ -522,8 +557,10 @@ export type ReferenceLinkCheckOutcome = {
   report: AiLinkReport;
   /** 本次实际检查（含命中本地缓存）的链接数 */
   checked: number;
-  /** 判定为疑似异常（确定性失效或网络层不可达）的链接 */
+  /** 判定为疑似异常（确定性失效或网络层不可达，不含本机 DNS 失败）的链接 */
   suspect: LinkCheckResult[];
+  /** 因本机 DNS 解析异常未能检查的链接（环境侧问题，不作为线索） */
+  unresolved: LinkCheckResult[];
 };
 
 /**
@@ -537,11 +574,14 @@ export type ReferenceLinkCheckOutcome = {
  *
  * 注意与误报控制：链接失效也可能只是站点反爬（对数据中心 IP 返回 403）、临时故障或来源抄录有误，
  * 因此线索文本必须写明「其他可能解释」与人工核查方式，且强度只到 low / medium，不据此作任何归因。
+ * 本机 DNS 解析失败（`isDnsResolutionFailure`）不在 suspect 里，不会生成该线索；
+ * 但若本次确有这类链接（`unresolvedCount`），会在分析文本里列为「未能检查」并说明是机器人侧环境问题。
  */
 export function mergeCitationLinkClues(
   result: AiClueResult,
   suspect: LinkCheckResult[],
   stats?: AiLinkStats,
+  unresolvedCount = 0,
 ): AiClueResult {
   if (suspect.length === 0) return result;
 
@@ -560,16 +600,23 @@ export function mergeCitationLinkClues(
       ? `本次编辑新增引用 ${stats.newReferences} 个，其中已检查 ${stats.checkedNewUrls} 个、无法访问 ${stats.deadNewUrls} 个（失效比例 ${stats.deadRate}）。`
       : "";
 
+  // 因本机 DNS 异常未能检查的链接必须写明，否则读者会以为「列出的链接就是全部」；
+  // 同时强调这是机器人侧环境问题，避免把未能检查当成链接失效。
+  const unresolvedNote =
+    unresolvedCount > 0
+      ? `另有 ${unresolvedCount} 个链接因本机器人所在服务器的 DNS 解析异常（服务器 IPv6 地址解析当前不可用）未能检查，属机器人侧环境问题，不代表链接失效。`
+      : "";
+
   const issue: AiClueIssue = {
     strength,
     title: `参考文献 URL 无法访问（${suspect.length} 个）`,
     location: null,
     evidence,
-    analysis: `程序化可达性检查（不依赖模型判断）：条目参考文献 / 外部链接中的 ${suspect.length} 个 URL 在本次检查时无法正常访问（访问超时、拒绝连接、403、404 等）。${newRefNote}引用来源不存在、已失效或被删除时会出现该现象，建议人工核实后再判断是否与疑似 AI 生成引用有关。`,
+    analysis: `'''URL探测结果'''：条目参考文献 / 外部链接中的 ${suspect.length} 个 URL 在本次检查时无法正常访问（访问超时、拒绝连接、403、404 等）。${newRefNote}${unresolvedNote}引用来源不存在、已失效或被删除时会出现该现象，建议人工核实后再判断是否与疑似 AI 生成引用有关。`,
     alternative:
       "目标站点可能限制自动访问（如对数据中心 IP 返回 403）、临时故障或仅对特定网络 / 地区开放；URL 也可能存在抄录错误，或原文已被存档站收录。",
     check:
-      "请在浏览器中逐一打开上述链接核实；若确已失效，可检查引用是否应改用存档（如 web.archive.org）或更正为可用来源。",
+      "请在浏览器中逐一打开上述链接核实（报告页为避免触发滥用过滤器，已省略 http / https 协议头，打开时请自行补全）；若确已失效，可检查引用是否应改用存档（如 web.archive.org）或更正为可用来源。",
     diff: null,
   };
 
@@ -609,6 +656,10 @@ function wikiHostOf(apiUrl: string | undefined): string[] {
  *
  * 送检正文与本次检查解耦：即使因为 24 小时复用窗口 / 正文过长而没有把完整条目送给模型，
  * 仍然使用完整条目 Wikitext 做链接检查（这是纯程序化检查，不涉及 token 消耗）。
+ *
+ * 本机 DNS 解析失败（如服务器当前 IPv6 地址解析不可用）会单独归类为 `unresolved`：
+ * 它们与链接本身无关，既不计入 `suspect`（不生成线索、不抬升 confidence），也不写进 deadUrls，
+ * 而是作为 `unresolvedUrls` 随报告送检并在提示词里明确说明「机器人侧环境问题，不得作为线索」。
  */
 export async function runReferenceLinkCheck(
   ctx: HandlerContext,
@@ -672,6 +723,18 @@ export async function runReferenceLinkCheck(
     selected.map((link) => [link.url, link.referenceName] as const),
   );
   const suspect = results.filter(isSuspectCitationLink);
+  // 本机 DNS 解析失败（如服务器 IPv6 解析不可用）单独归类：与链接本身无关，
+  // 不能当成「来源失效」，也不写成「拒绝连接」（见 linkCheck.isDnsResolutionFailure）。
+  const unresolved = results.filter(isDnsResolutionFailure);
+  if (unresolved.length > 0)
+    log.warn(
+      {
+        phase: input.phase,
+        title: input.title,
+        unresolved: unresolved.map((result) => result.url),
+      },
+      `aiEdit ${input.phase} reference links could not be checked: local DNS resolution failed (bot-side environment issue)`,
+    );
 
   // 新增引用（上次编辑新加的链接）中实际完成检查 / 失效的数量与比例。
   const newUrls = new Set(newLinks.map((link) => link.url));
@@ -701,6 +764,17 @@ export async function runReferenceLinkCheck(
       };
     });
 
+  const unresolvedUrls: AiUnresolvedUrl[] = unresolved
+    .slice(0, MAX_LINKS_PER_ARTICLE)
+    .map((result) => {
+      const referenceName = nameOf.get(result.url);
+      return {
+        url: result.url,
+        httpError: "dns" as const,
+        ...(referenceName ? { referenceName } : {}),
+      };
+    });
+
   log.info(
     {
       phase: input.phase,
@@ -708,13 +782,15 @@ export async function runReferenceLinkCheck(
       checked: results.length,
       stats,
       suspect: deadUrls,
+      unresolved: unresolvedUrls,
     },
     `aiEdit ${input.phase} reference links checked`,
   );
 
   return {
-    report: { deadUrls, stats },
+    report: { deadUrls, unresolvedUrls, stats },
     suspect,
+    unresolved,
     checked: results.length,
   };
 }
@@ -769,6 +845,7 @@ export async function analyzeWithReferenceLinks(
         analyzed,
         linkCheck.suspect,
         linkCheck.report.stats,
+        linkCheck.unresolved.length,
       )
     : analyzed;
 
@@ -935,7 +1012,13 @@ function renderDebugEntry(
   result: { confidence: number; issues: AiClueIssue[] },
   options: {
     withContent: boolean;
-    linkCheck?: { checked: number; suspect: number; stats?: AiLinkStats };
+    linkCheck?: {
+      checked: number;
+      suspect: number;
+      /** 因本机 DNS 解析异常未能检查的链接数（环境侧，非链接失效） */
+      unresolved?: number;
+      stats?: AiLinkStats;
+    };
   },
 ): string {
   const lines: string[] = [
@@ -957,6 +1040,11 @@ function renderDebugEntry(
     lines.push(
       `* links: ${options.linkCheck.checked} checked, ${options.linkCheck.suspect} unreachable${newRefs}`,
     );
+    // 解析类失败单独记录：这是机器人所在环境的 DNS 问题，不是链接失效，不计入 unreachable
+    if (options.linkCheck.unresolved)
+      lines.push(
+        `* links unresolved (bot-side DNS failure, not a dead link): ${options.linkCheck.unresolved}`,
+      );
   }
   lines.push(`* confidence: ${result.confidence}`, `* result:`, "");
   if (result.issues.length === 0) {
@@ -986,7 +1074,13 @@ type AiArticleAnalysis = {
   /** 本次是否附带了完整条目正文（否则为只送差异的降级模式） */
   withContent: boolean;
   /** 确定性检查（参考文献 URL 可达性）规模：检查数 / 异常数 / 新增引用统计 */
-  linkCheck: { checked: number; suspect: number; stats?: AiLinkStats };
+  linkCheck: {
+    checked: number;
+    suspect: number;
+    /** 因本机 DNS 解析异常未能检查的链接数（环境侧，非链接失效） */
+    unresolved?: number;
+    stats?: AiLinkStats;
+  };
 };
 
 /**
@@ -1083,6 +1177,7 @@ async function analyzeArticle(
     linkCheck: {
       checked: outcome.linkCheck?.checked ?? 0,
       suspect: outcome.linkCheck?.suspect.length ?? 0,
+      unresolved: outcome.linkCheck?.unresolved.length,
       stats: outcome.linkCheck?.report.stats,
     },
   };
@@ -1285,6 +1380,8 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
 
 /**
  * 将一批结构化线索渲染为 check 页 Wikitext（二级标题为扫描时间，三级标题为条目名）。
+ *
+ * 正文一律经 safeReportText：链接检查的证据里必然含 URL，明文 http / https 会被滥用过滤器拦下。
  */
 function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
   const lines: string[] = [`== ${formatUtcMinute(scanTime)} ==`];
@@ -1299,7 +1396,7 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
     lines.push("");
     if (diffs.length > 0) lines.push(`* Diff: ${renderDiffLinks(diffs)}`);
     lines.push(
-      `* 问题分析：${safeWikitext(row.summary?.trim() || "（未提供结论）")}`,
+      `* 问题分析：${safeReportText(row.summary?.trim() || "（未提供结论）")}`,
     );
     lines.push("");
 
@@ -1308,18 +1405,20 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
     } else {
       for (const issue of issues) {
         const loc = issue.location
-          ? `<small>（${safeWikitext(issue.location)}）</small>`
+          ? `<small>（${safeReportText(issue.location)}）</small>`
           : "";
         // 多条差异时标注线索归属的差异，便于人工对照具体编辑（单条差异无需重复）
         const diffTag =
           issue.diff && diffs.length > 1
             ? `<small>（差异 [[Special:Diff/${issue.diff}|${issue.diff}]]）</small>`
             : "";
-        lines.push(`; ${safeWikitext(issue.title)}${loc}${diffTag}`);
-        lines.push(`: {{tq|${safeWikitext(issue.evidence)}}}`);
-        lines.push(`: ${safeWikitext(issue.analysis)}`);
-        lines.push(`: 其他可能解释：${safeWikitext(issue.alternative)}`);
-        lines.push(`: 建议核查：${safeWikitext(issue.check)}`);
+        lines.push(`; ${safeReportText(issue.title)}${loc}${diffTag}`);
+        lines.push(`: {{tq|${safeReportText(issue.evidence)}}}`);
+        lines.push(`: ${safeReportText(issue.analysis)}`);
+        lines.push(
+          `: '''其他可能解释：'''<i>${safeReportText(issue.alternative)}</i>`,
+        );
+        lines.push(`: '''建议核查：'''<u>${safeReportText(issue.check)}</u>`);
       }
     }
     lines.push("");

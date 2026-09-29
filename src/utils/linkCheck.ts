@@ -1,4 +1,4 @@
-import { request } from "undici";
+import { EnvHttpProxyAgent, request } from "undici";
 import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "pino";
 
@@ -16,6 +16,14 @@ import type { Logger } from "pino";
  * - 结果写入本地 `citation_links` 表并在复用窗口内直接复用，
  *   避免同一条目（以及被多个条目引用的同一 URL）每轮扫描都重新发起网络请求（「以免重复跑测试」）。
  * - 只使用本次探测到的状态码 / 错误类型，不读取、不保存响应正文。
+ * - 已存档的引用（`archive-url` / `url-status=dead`）不检查原链接；
+ *   `archive-url` 指向存档站（web.archive.org、archive.today、archive.is 等）时连存档链接也不检查，
+ *   见 ARCHIVE_HOSTS 与 isArchiveHost。
+ * - 探测一律**优先 IPv4**：服务器能访问 IPv6，但当前 IPv6 地址解析不可用；仅在 IPv4 解析不到地址
+ *   （该来源可能只有 AAAA 记录）时才退回系统默认解析，且只在拿到确定结论时采用（见 probeLink）。
+ * - **本机 DNS 解析失败单列为「环境侧未检查」**（isDnsResolutionFailure）：既不当作链接失效线索，
+ *   也不会写成「拒绝连接」——那很可能是机器人所在网络的问题，不是编者的问题；
+ *   这类结果在本地缓存里只复用很短时间（LINK_CHECK_DNS_REUSE_MS），DNS 环境恢复后会尽快重查。
  */
 
 /** 单个 URL 探测的默认超时时间（毫秒）。 */
@@ -28,10 +36,19 @@ export const LINK_CHECK_TIMEOUT_MS = 15_000;
 export const LINK_CHECK_REUSE_MS = 7 * 24 * 3600 * 1000;
 
 /** 单个条目单次检查的 URL 数量上限（按正文出现顺序取前 N 个）。 */
-export const MAX_LINKS_PER_ARTICLE = 20;
+export const MAX_LINKS_PER_ARTICLE = 100;
 
 /** URL 并发探测数上限（避免把一次扫描变成对目标站点的小规模爬取）。 */
 export const LINK_CHECK_CONCURRENCY = 4;
+
+/**
+ * 解析类失败（本机 DNS 无法解析）结果的缓存复用时长（1 小时）。
+ *
+ * 远短于普通结果的 7 天：这类失败反映的是运行环境（如本机 IPv6 地址解析不可用），
+ * 与目标链接本身无关，DNS 环境一旦恢复就应当尽快重新检查，不应在 7 天窗口内一直沿用
+ * 「未检查成」的结论。
+ */
+export const LINK_CHECK_DNS_REUSE_MS = 3600 * 1000;
 
 /**
  * 探测时使用的 User-Agent。
@@ -49,6 +66,7 @@ const LINK_CHECK_USER_AGENT =
  * - ok：2xx / 3xx，可正常访问
  * - dead：403 / 404 / 410 等「来源本身不可用或拒绝访问」的确定性失败
  * - network_error：超时、拒绝连接、DNS 失败、TLS 错误等网络层失败
+ *   （其中 DNS 解析失败属机器人侧环境问题，由 isDnsResolutionFailure 单独识别，不计为链接失效）
  * - server_error：5xx（目标站点故障，不作为线索）
  * - rate_limited：429（我方请求过快，不作为线索）
  * - client_error：其余 4xx（如 400/401/405，不作为线索）
@@ -76,8 +94,26 @@ export type LinkCheckResult = {
   cached: boolean;
 };
 
-/** 判定为「疑似异常来源」的状态：确定性失效或网络层不可达。 */
+/**
+ * 判断一次探测失败是否属于「本机 DNS 解析异常」。
+ *
+ * 服务器当前 IPv6 地址解析不可用、解析器超时等环境下，**所有**域名（包括完全正常的链接）
+ * 都可能解析失败（ENOTFOUND / EAI_AGAIN）。这类失败与链接本身无关：
+ *
+ * - 不得描述为「拒绝连接」——那是把机器人所在网络的解析 / 路由问题写成目标站点拒绝访问；
+ * - 不得作为「参考文献 URL 无法访问」的线索依据——那很可能是机器人侧问题，不是编者的问题。
+ */
+export function isDnsResolutionFailure(result: LinkCheckResult): boolean {
+  return (
+    result.status === "network_error" &&
+    (result.error === "dns" || result.error === "dns_temp")
+  );
+}
+
+/** 判定为「疑似异常来源」的状态：确定性失效或网络层不可达（不含本机 DNS 解析失败）。 */
 export function isSuspectCitationLink(result: LinkCheckResult): boolean {
+  // 本机 DNS 解析失败属环境侧问题，不计为链接失效（见 isDnsResolutionFailure）
+  if (isDnsResolutionFailure(result)) return false;
   return result.status === "dead" || result.status === "network_error";
 }
 
@@ -101,12 +137,15 @@ export function describeLinkFailure(result: LinkCheckResult): string {
  *
  * - timeout：访问超时（含连接超时、读取超时）
  * - reject：拒绝连接 / 拒绝访问（ECONNREFUSED、HTTP 403）
- * - other：其余失败（DNS 失败、TLS 错误、连接重置、404 / 410 等）
+ * - dns：本机域名解析失败（环境侧问题，不会出现在 deadUrls 里，见 isDnsResolutionFailure）
+ * - other：其余失败（TLS 错误、连接重置、404 / 410 等）
  */
 export function classifyLinkError(
   result: LinkCheckResult,
-): "timeout" | "reject" | "other" {
+): "timeout" | "reject" | "other" | "dns" {
   if (result.status === "network_error") {
+    // 解析类失败单独归类：它反映的是本机 DNS 环境，不得与「拒绝连接」混为一谈
+    if (isDnsResolutionFailure(result)) return "dns";
     if (result.error === "timeout") return "timeout";
     if (result.error === "refused") return "reject";
     return "other";
@@ -132,8 +171,8 @@ const NETWORK_ERROR_LABELS: Record<string, string> = {
   refused: "拒绝连接",
   reset: "连接被重置",
   unreachable: "网络不可达",
-  dns: "域名无法解析",
-  dns_temp: "域名解析暂时失败",
+  dns: "本机 DNS 无法解析该域名（机器人侧问题）",
+  dns_temp: "本机 DNS 解析暂时失败（机器人侧问题）",
   tls: "TLS 证书错误",
   too_many_redirects: "重定向次数过多",
   other: "网络访问失败",
@@ -160,6 +199,51 @@ type Span = { start: number; end: number };
  */
 const ORIGINAL_URL_PARAMS =
   /\|\s*(?:url|chapter-?_?url|contribution-?_?url|section-?_?url|article-?_?url|lay-?_?url|map-?_?url|entry-?_?url)\s*=\s*([^\s|}]+)/gi;
+
+/**
+ * 引用模板中的「存档链接」参数（`archive-url` / `archiveurl`，以及部分模板的 `archive-url2`）。
+ */
+const ARCHIVE_URL_PARAMS = /\|\s*archive-?_?url\d?\s*=\s*([^\s|}]+)/gi;
+
+/**
+ * 常见网页存档站的主机名（条目标题即为其根域，子域一并匹配）。
+ *
+ * 这些站点对来自数据中心 / 自动化的访问经常直接返回 403、429 或超时：
+ * 如果照常探测，同一批规范引用会在每轮扫描里被反复报成「URL 无法访问」的误报噪声，
+ * 而存档链接失效与否本来就不需要机器人判断（人工核对时自然会打开一次）。
+ * 因此 `archive-url` 参数中指向这些站点的链接不参与可达性检查。
+ */
+export const ARCHIVE_HOSTS: readonly string[] = [
+  // Internet Archive（含 web.archive.org / wayback）
+  "archive.org",
+  // archive.today 及其镜像域名
+  "archive.today",
+  "archive.is",
+  "archive.ph",
+  "archive.li",
+  "archive.vn",
+  "archive.md",
+  "archive.fo",
+  "archive.bt",
+  // 其它常见存档站
+  "ghostarchive.org",
+  "webcitation.org",
+  "megalodon.jp",
+  "archive.wikiwix.com",
+  "timetravel.mementoweb.org",
+];
+
+/** 主机名是否属于已知的网页存档站（含其子域）。 */
+export function isArchiveHost(hostname: string): boolean {
+  const host = hostname
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, "");
+  if (!host) return false;
+  return ARCHIVE_HOSTS.some(
+    (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+  );
+}
 
 /**
  * HTML 注释与「示例 / 代码」区块：这些位置里的 URL 不是参考文献，提取前先抹掉。
@@ -266,6 +350,22 @@ function findArchivedUrlSpans(text: string, templates: Span[]): Span[] {
   return ranges;
 }
 
+/**
+ * 收集 `|archive-url=` 参数值的字符区间。
+ *
+ * 与 findArchivedUrlSpans 相反：这里关注的是「存档链接本身」，
+ * 用于跳过指向已知存档站（见 isArchiveHost）的探测请求。
+ */
+function findArchiveUrlSpans(text: string): Span[] {
+  const spans: Span[] = [];
+  for (const match of text.matchAll(ARCHIVE_URL_PARAMS)) {
+    const value = match[1];
+    const start = (match.index ?? 0) + match[0].length - value.length;
+    spans.push({ start, end: start + value.length });
+  }
+  return spans;
+}
+
 /** 判断位置是否落在任一区间内。 */
 function inSpans(position: number, spans: Span[]): boolean {
   return spans.some((span) => position >= span.start && position < span.end);
@@ -321,7 +421,9 @@ function templateTitle(
  *
  * 会先抹掉 HTML 注释与 nowiki / code / pre / syntaxhighlight / math 等「示例或代码」区块，
  * 避免把文档示例里的链接当成参考文献；**模板已提供 archive-url 或 url-status=dead 时，
- * 其原链接（url 参数）不计入**（见 findArchivedUrlSpans）。
+ * 其原链接（url 参数）不计入**（见 findArchivedUrlSpans）；
+ * 此外 **archive-url 参数中指向已知存档站（web.archive.org、archive.today、archive.is 等）的链接
+ * 也不计入**（见 ARCHIVE_HOSTS）：存档站对自动访问常返回 403 / 超时，探测结果不能作为线索。
  * 结果按规范化形式去重并保持出现顺序。
  *
  * @param skipHosts 需要跳过的主机名（如机器人所在维基自身，避免把内部链接当外部来源）
@@ -345,6 +447,7 @@ export function extractReferenceLinks(
   const scrubbed = blankOut(wikitext);
   const templates = findTemplateSpans(scrubbed);
   const archivedSpans = findArchivedUrlSpans(scrubbed, templates);
+  const archiveUrlSpans = findArchiveUrlSpans(scrubbed);
   const refSpans = findRefSpans(scrubbed);
 
   const found: ExtractedReference[] = [];
@@ -366,6 +469,8 @@ export function extractReferenceLinks(
     // 只保留形如 host.tld 的主机名，过滤掉占位符（如 http://example、http://localhost）
     const hostname = parsed.hostname.toLowerCase();
     if (!hostname.includes(".")) continue;
+    // archive-url 指向已知存档站：存档站常拦截自动访问，其探测结果不作为线索
+    if (inSpans(position, archiveUrlSpans) && isArchiveHost(hostname)) continue;
     if (skip.has(hostname.replace(/^www\./, ""))) continue;
     if (raw.length > 2000) continue;
 
@@ -501,14 +606,32 @@ const LINK_CHECK_HEADERS: Record<string, string> = {
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /**
+ * 链接探测专用的 dispatcher：强制使用 IPv4。
+ *
+ * 服务器能访问 IPv6，但当前 IPv6 地址解析不可用：默认的 getaddrinfo 既可能先返回 AAAA
+ * （连不上 / 立刻被拒，最后被误报成「拒绝连接」），也可能因为 AAAA 查询失败而整体解析不成功。
+ * 这里复用与全局 dispatcher 相同的 EnvHttpProxyAgent（保留 Toolforge 所需的 HTTP 代理行为），
+ * 只把 connect 的地址族限定为 IPv4；无代理（no_proxy / 未配置代理）时直接生效。
+ */
+let ipv4Dispatcher: EnvHttpProxyAgent | undefined;
+
+function getIpv4Dispatcher(): EnvHttpProxyAgent {
+  ipv4Dispatcher ??= new EnvHttpProxyAgent({ connect: { family: 4 } });
+  return ipv4Dispatcher;
+}
+
+/**
  * 发起一次 GET 探测并手动跟随重定向（undici 的 request 默认不跟随重定向）。
  *
  * 使用 GET（部分站点对 HEAD 直接返回 403/405，会造成误报），拿到响应头后立刻释放响应体，
  * 不下载正文；全程受同一个 AbortSignal 超时约束。任何异常都转为 `network_error` 结果，不向上抛出。
+ *
+ * @param preferIpv4 是否强制 IPv4 连接（见 getIpv4Dispatcher）；false 时使用进程全局 dispatcher
  */
-export async function probeLink(
+async function probeOnce(
   url: string,
-  timeoutMs = LINK_CHECK_TIMEOUT_MS,
+  timeoutMs: number,
+  preferIpv4: boolean,
 ): Promise<LinkCheckResult> {
   const checkedAt = new Date().toISOString();
   const signal = AbortSignal.timeout(timeoutMs);
@@ -523,6 +646,7 @@ export async function probeLink(
         signal,
         headersTimeout: timeoutMs,
         bodyTimeout: timeoutMs,
+        ...(preferIpv4 ? { dispatcher: getIpv4Dispatcher() } : {}),
       });
       const httpStatus = res.statusCode;
       const location = res.headers?.location;
@@ -588,12 +712,46 @@ export async function probeLink(
   }
 }
 
-/** 读取复用窗口内已保存的检查结果。 */
+/**
+ * 探测单个 URL 的可达性（优先 IPv4）。
+ *
+ * 两步走：
+ * 1. 先用只解析 IPv4 的连接探测（服务器 IPv6 地址解析当前不可用，见 getIpv4Dispatcher）；
+ *    只要不是「本机解析失败」就直接采用该结果。
+ * 2. 若 IPv4 解析不到地址（该来源可能只有 AAAA 记录），退回系统默认解析再试一次；
+ *    但**只在默认解析给出确定结论时才采用**：拿到 HTTP 状态码、或 TLS 证书错误 / 重定向次数过多
+ *    这类与「能否连通」无关的确定性失败。否则说明默认解析又走到了不可用的 IPv6 路径上，
+ *    仍按「本机解析失败」上报——那依旧是机器人环境的问题，不能记成「拒绝连接」让编者背锅。
+ *
+ * 代价：只有 IPv4 解析失败时才会发第二次请求，最坏情况单个 URL 耗时翻倍。
+ */
+export async function probeLink(
+  url: string,
+  timeoutMs = LINK_CHECK_TIMEOUT_MS,
+): Promise<LinkCheckResult> {
+  const ipv4 = await probeOnce(url, timeoutMs, true);
+  if (!isDnsResolutionFailure(ipv4)) return ipv4;
+
+  const fallback = await probeOnce(url, timeoutMs, false);
+  const definitive =
+    fallback.status !== "network_error" ||
+    fallback.error === "tls" ||
+    fallback.error === "too_many_redirects";
+  return definitive ? fallback : ipv4;
+}
+
+/**
+ * 读取复用窗口内已保存的检查结果。
+ *
+ * 解析类失败（本机 DNS 异常）另用更短的窗口（dnsReuseMs）：
+ * 这类结果只反映当时的网络环境，环境恢复后应当尽快重新探测。
+ */
 export function readCachedLinkCheck(
   db: DatabaseSync,
   url: string,
   reuseMs = LINK_CHECK_REUSE_MS,
   now = Date.now(),
+  dnsReuseMs = LINK_CHECK_DNS_REUSE_MS,
 ): LinkCheckResult | undefined {
   try {
     const row = db
@@ -611,9 +769,8 @@ export function readCachedLinkCheck(
       | undefined;
     if (!row) return undefined;
     const checkedAt = Date.parse(row.checked_at);
-    if (!Number.isFinite(checkedAt) || now - checkedAt >= reuseMs)
-      return undefined;
-    return {
+    if (!Number.isFinite(checkedAt)) return undefined;
+    const result: LinkCheckResult = {
       url: row.url,
       status: row.status as LinkCheckStatus,
       httpStatus: row.http_status ?? undefined,
@@ -621,6 +778,9 @@ export function readCachedLinkCheck(
       checkedAt: row.checked_at,
       cached: true,
     };
+    const limit = isDnsResolutionFailure(result) ? dnsReuseMs : reuseMs;
+    if (now - checkedAt >= limit) return undefined;
+    return result;
   } catch {
     // 表不存在（旧库未迁移）时视为无缓存，不影响业务
     return undefined;

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { safeWikitext } from "../utils/wikitext.js";
+import { safeReportText, safeWikitext } from "../utils/wikitext.js";
 import {
   createTokenUsage,
   formatTokenUsage,
@@ -452,25 +452,25 @@ function formatIssueSection(
         .split("\n")[0]
         .trim();
 
-      let title = `; ${idx + startNumber}.<!-- ${cat} -->${safeWikitext(issueTitle)}`;
+      let title = `; ${idx + startNumber}.<!-- ${cat} -->${safeReportText(issueTitle)}`;
       if (issue.location && issue.location.trim()) {
         title =
-          title + `<small>（${safeWikitext(issue.location.trim())}）</small>`;
+          title + `<small>（${safeReportText(issue.location.trim())}）</small>`;
       }
       lines.push(title);
 
       if (issue.originalText?.trim()) {
-        lines.push(`: {{tq|${safeWikitext(issue.originalText.trim())}}}`);
+        lines.push(`: {{tq|${safeReportText(issue.originalText.trim())}}}`);
       }
 
       if (issue.description?.trim()) {
         lines.push(
-          `: <small>${safeWikitext(issue.description.trim())}</small>`,
+          `: <small>${safeReportText(issue.description.trim())}</small>`,
         );
       }
 
       if (issue.suggestion?.trim()) {
-        lines.push(`: ➡️ <u>${safeWikitext(issue.suggestion.trim())}</u>`);
+        lines.push(`: ➡️ <u>${safeReportText(issue.suggestion.trim())}</u>`);
       }
     }
   }
@@ -500,7 +500,7 @@ export function formatReviewResultWikitext(result: ReviewResult): string {
       `${suggestions.length}项改进建议。`,
   );
   if (result.summary?.trim()) {
-    lines.push(`:${safeWikitext(result.summary.trim())}`);
+    lines.push(`:${safeReportText(result.summary.trim())}`);
   }
 
   let n = 1;
@@ -758,7 +758,7 @@ export async function processReviewRequest(
   // 5.1 非百科全书条目：拒绝并回报
   if (outcome.kind === "not-encyclopedic") {
     const reason = outcome.result.nonEncyclopedicReason;
-    const reasonSuffix = reason ? `（原因：${safeWikitext(reason)}）` : "";
+    const reasonSuffix = reason ? `（原因：${safeReportText(reason)}）` : "";
 
     await rejectArticleRequest(
       ctx,
