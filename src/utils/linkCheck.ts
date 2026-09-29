@@ -527,11 +527,19 @@ export async function probeLink(
       const httpStatus = res.statusCode;
       const location = res.headers?.location;
       // 只需要状态码：立即销毁响应流，避免下载整页或大文件
-      try {
-        res.body.destroy();
-      } catch {
-        // 忽略流销毁异常
-      }
+      res.body.once(
+        "error",
+        (err: NodeJS.ErrnoException & { code?: string }) => {
+          if (err.code !== "UND_ERR_ABORTED") {
+            //log.debug(
+            //  { err, url: current },
+            //  "response body emitted error while discarding",
+            //);
+          }
+        },
+      );
+
+      res.body.destroy();
 
       if (REDIRECT_STATUSES.has(httpStatus) && typeof location === "string") {
         let next: string;
