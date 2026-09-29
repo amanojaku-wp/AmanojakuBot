@@ -308,7 +308,7 @@ src/
 #### 3-1 定期动态扫描
 
 - **入口**：`src/tasks/aiEditMonitor.ts` → `scanAiEdits` + `publishAiReports`
-- **触发**：按 `tasks.aiEdit.cron`（UTC，默认每小时整点）定时执行；**首次 tick 只建立基准位点**，不回溯历史编辑
+- **触发**：按 `tasks.aiEdit.cron`（UTC，默认每小时整点）定时执行；**位点丢失时（首次运行 / 重启后换了数据库）从「now − 一个 cron 周期」开始扫描**（最长回溯 24 小时），只损失不多于一个周期，不会因频繁重启而空转
 - **流程**：RecentChanges API 扫描自上次 checkpoint 以来的编辑（周期超过 API 上限时自动分段查询）→ 只保留命名空间 0 的 `edit`/`new` → 忽略机器人/机器用户/匿名 IP 与 AWB、Twinkle、回退功能标签 → 丢弃净增加量 < 100 字节的 diff → **同一条目的全部差异合并为一次请求**（一个条目一轮只送检一次）→ 送检「全部差异 + 完整条目正文」（24 小时内已送过完整正文或正文过长时降级为只送差异）→ LLM 输出结构化线索 → 程序拼接 Markdown 追加到 `tasks.aiEdit.debugLog`（含 `* links: N checked, M unreachable`）。
 - **确定性检查（不依赖 LLM，且在送检之前）**：每次分析前先跑一次纯程序化的**参考文献 URL 可达性检查**（`tasks.aiEdit.linkCheck`，默认开启）——提取条目参考文献 / 外部链接中的 URL 并实际探测一次，检查结果与「本次编辑新增的链接」失效统计（`stats`：`newReferences / checkedNewUrls / deadNewUrls / deadRate`）会作为**确定性事实**写进提示词（`deadUrls` 带 `httpStatus`、`httpError` 分类与 `referenceName`），让模型判断「新增引用集中失效」这类线索；同时程序自己也记一条线索：异常链接 1 个为 low、≥2 个为 medium。**模板已提供 `archive-url`（存档）或标注 `url-status` 为 dead / usurped / unfit 时，其原链接失效属正常情况，不计入异常**（存档链接本身仍检查）。检查结果缓存在本地 `citation_links` 表，复用窗口（7 天）内不重复探测，避免重复跑测试；即使因复用窗口 / 正文过长只送差异，也仍用完整条目正文做这项检查（不消耗 token）。链接失效也可能只是站点反爬、临时故障或来源抄录有误，因此线索强度不高于 medium，且必须写明其他可能解释与人工核查方法。
 - **线索字段**：线索强度 `confidence`（**整体线索强度**，越大越指向疑似 AI 辅助编辑，**不是**「使用 AI 的概率」）、问题概述、位置、具体证据、分析、其他合理解释、建议核查、所属差异修订号。

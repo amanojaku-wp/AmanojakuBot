@@ -31,6 +31,7 @@ import {
   pollingStart,
   type RecentChange,
 } from "../utils/polling.js";
+import { cronPeriodMs } from "../utils/schedule.js";
 import type { HandlerContext } from "../handle.js";
 
 /**
@@ -774,6 +775,39 @@ export async function analyzeWithReferenceLinks(
   return { result, linkCheck };
 }
 
+/**
+ * 失去 checkpoint 时的引导窗口上限（24 小时）。
+ *
+ * 正常情况下引导窗口 = 上一个 cron 周期（见 resolveScanStart）；但周期很长的 cron
+ * （如每周任务）不应该一次回溯过久，故按此上限截断。
+ */
+const MAX_BOOTSTRAP_WINDOW_MS = MAX_SCAN_SEGMENT_MS;
+
+/**
+ * 计算一次 3-1 扫描的起点。
+ *
+ * - 有 checkpoint：从位点开始（叠加 cfg.events.overlapSeconds 的重叠窗口，由调用方处理）。
+ * - 无 checkpoint（首次运行 / 进程重启后换了数据库）：从 **now − 一个 cron 周期**开始，
+ *   而不是直接跳过整轮——否则频繁重启时每次只建基准，扫描会无限期空转。
+ *   注意不能取「上一个触发时刻」：本函数在 cron tick 内调用，那时上一个触发时刻就是刚过去的边界，
+ *   窗口会退化成 0。周期无法估算或超过 MAX_BOOTSTRAP_WINDOW_MS 时按上限截断，不回溯更久远的历史。
+ */
+export function resolveScanStart(
+  previous: string | undefined,
+  cronExpression: string,
+  now: Date,
+): { iso: string; bootstrapped: boolean } {
+  if (previous) return { iso: previous, bootstrapped: false };
+  const periodMs = Math.min(
+    cronPeriodMs(cronExpression, now) ?? MAX_BOOTSTRAP_WINDOW_MS,
+    MAX_BOOTSTRAP_WINDOW_MS,
+  );
+  return {
+    iso: new Date(now.getTime() - periodMs).toISOString(),
+    bootstrapped: true,
+  };
+}
+
 /** 将时间格式化为 `YYYY-MM-DD HH:mm`（UTC）。 */
 export function formatUtcMinute(input: string | Date): string {
   const d = typeof input === "string" ? new Date(input) : input;
@@ -1060,6 +1094,8 @@ async function analyzeArticle(
  * 流程（与需求一一对应）：
  * 1. 使用 MediaWiki RecentChanges API，按 tasks.aiEdit.cron 的调度扫描该周期内的编辑；
  *    若扫描周期超过单次 API 查询的时间跨度上限，则按 MAX_SCAN_SEGMENT_MS 拆分分段查询。
+ *    位点推进：有 checkpoint 就从位点开始；没有（首次运行 / 重启后换了数据库）则回到
+ *    **now − 一个 cron 周期**（最长 MAX_BOOTSTRAP_WINDOW_MS），只损失不多于一个周期，不空转。
  * 2. 仅保留纯条目命名空间（ns 0）的 edit / new 编辑。
  * 3. 忽略机器人 / 机器用户（bot 标志、匿名 IP）编辑，忽略标签为 AWB、Twinkle、回退功能的编辑。
  * 4. 单条 diff 净增加量小于 100 字节的排除；同一条目的多次编辑按条目名称合并。
@@ -1097,20 +1133,22 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
       )
       .run(checkpointKey, null, scanEnd.toISOString(), null);
 
-  // 首次运行只建立基准位点，不回溯历史编辑（与 RecentChanges 轮询模式一致）。
-  if (!previous) {
-    markCheckpoint();
+  // 起点：优先用已保存的位点；没有位点（首次运行 / 重启后换了数据库）时回到**上一个 cron 周期**，
+  // 而不是直接跳过整轮，避免频繁重启时每次只建基准、扫描永远跑不起来。
+  const start = resolveScanStart(previous, ai.cron, scanEnd);
+  if (start.bootstrapped)
     log.info(
-      { checkpointKey },
-      "aiEdit 3-1 scan checkpoint established (first run)",
+      { checkpointKey, cron: ai.cron, start: start.iso },
+      "aiEdit 3-1 scan checkpoint missing, bootstrapping from the previous cron period",
     );
-    return;
-  }
 
-  const startIso = pollingStart(previous, cfg.events.overlapSeconds);
+  const startIso = pollingStart(start.iso, cfg.events.overlapSeconds);
   const startMs = Date.parse(startIso);
   const endMs = scanEnd.getTime();
-  if (!Number.isFinite(startMs) || startMs >= endMs) return;
+  if (!Number.isFinite(startMs) || startMs >= endMs) {
+    markCheckpoint();
+    return;
+  }
 
   const request = (params: Record<string, string | number>) =>
     bot.request(params);

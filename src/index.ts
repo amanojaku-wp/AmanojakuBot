@@ -241,7 +241,7 @@ if (cfg.tasks.afc.enabled) {
 // -------------------------------------------------------------
 // 任务三（3-1）：按 tasks.aiEdit.cron 定期执行动态扫描
 // 扫描完成后立即汇总发布（tasks.aiEdit.silent=true 时仅写本地 debugLog，不写维基）
-// 首次 tick 仅建立基准位点，不回溯历史编辑。
+// 位点推进：有 checkpoint 从位点开始；没有则回到上一个 cron 周期起点（不回溯更久远的历史）。
 // -------------------------------------------------------------
 if (cfg.tasks.aiEdit.enabled) {
   scheduleTask(cfg.tasks.aiEdit.cron, "aiEdit 3-1 scan", async () => {

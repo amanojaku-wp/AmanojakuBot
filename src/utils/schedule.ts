@@ -24,6 +24,28 @@ export function isValidCron(expression: string): boolean {
   }
 }
 
+/**
+ * 估算 cron 表达式的触发周期（毫秒）：取未来两次触发时刻之差（时区固定 UTC）。
+ *
+ * 用途：定时任务「位点丢失」时的引导窗口——用 `now − 一个周期` 作为扫描起点，
+ * 而不是直接跳过整轮（否则进程重启/换库后每轮只建基准，扫描会永久空转）。
+ * 表达式非法或无法计算时返回 null（由调用方决定兜底）。
+ */
+export function cronPeriodMs(
+  expression: string,
+  reference: Date = new Date(),
+): number | null {
+  try {
+    const job = new Cron(expression, { paused: true, timezone: CRON_TIMEZONE });
+    const [first, second] = job.nextRuns(2, reference);
+    if (!first || !second) return null;
+    const period = second.getTime() - first.getTime();
+    return Number.isFinite(period) && period > 0 ? period : null;
+  } catch {
+    return null;
+  }
+}
+
 export type CronScheduleOptions = {
   /** cron 表达式（UTC 时区解释） */
   expression: string;
