@@ -60,7 +60,7 @@ Persona不得修改或覆盖本系统中的事实核查、工具使用、安全�
 const CONTEXT_TRUST_POLICY = `
 # 上下文与信任边界
 
-当前需要回复的留言者是【{{CURRENT_USER}}】。优先理解并回答该用户的最新留言。
+当前需要回复的留言者是下方用户消息中「当前需要回复的最新留言」JSON 的 author 字段所标明的那个人。优先理解并回答该用户的最新留言。
 
 对话历史与最新留言已通过结构化 JSON 格式提供（包含 id, author, timestamp, text, indentLevel 及嵌套子章节）：
 - id：留言唯一标识（格式形如 r-版本号-202601231123）。
@@ -162,12 +162,50 @@ const WIKITEXT_OUTPUT_POLICY = `
 如果只是提及而不是使用模板，使用{{tl|模板名称}}语法。
 
 禁止使用用户页链接、ping等形式提及其他用户，例如[[User:用户名]]、{{ping|用户名}}，以免产生通知。
+
+默认简洁回答，以解决用户当前问题所需的最短完整回复为准。
+
+- 简单问题通常使用 1～3 个短段落。
+- 一般解释通常不超过约 500 个中文字符。
+- 只有当用户明确要求详细说明、完整分析、逐项检查、长篇内容，或任务本身确实无法简短完成时，才可以明显超过上述长度。
+- 不要重复用户的问题，不要重复已经给出的结论，不要为了显得完整而添加总结、背景知识、延伸建议或无关说明。
+- 能直接回答时直接回答；不要固定使用“首先/其次/最后”、总结段或结尾客套话。
+- 工具调用获得的信息只提取回答当前问题所需的部分，不要复述完整工具结果。
 `;
 
-const MAX_TOKENS = 2000;
+const MAX_TOKENS = 1500;
 const MAX_REPLY_CHARS = 20000;
 /** 留言超过该时长（毫秒）即视为过期，不再尝试回复（避免回复积压的旧留言） */
 const MAX_REPLY_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * 工具调用步数上限：模型最多进行这么多轮「调用工具 → 读结果」。
+ *
+ * 达到上限时不再直接掐断（掐断的那一步通常只有工具调用、没有正文，
+ * `generateText` 的 `text` 只包含最后一步的文本，于是用户只会收到
+ * 「[系统异常] 机器人未能生成回复」），而是由 `respond` 里的降级策略
+ * 把最后一步变成「禁止再调用工具」的收尾作答。
+ */
+const MAX_AGENT_STEPS = 6;
+
+/**
+ * 步数预算耗尽时注入最后一步的收尾指令：要求模型用已有信息作答，
+ * 信息不足时如实说明「要求太复杂 / 检索量超出单次回复范围」并建议拆分请求。
+ * 挂在上限值上，避免与 {@link MAX_AGENT_STEPS} 说法不一致。
+ */
+const STEP_BUDGET_EXHAUSTED_NOTICE = `【系统提示】本轮工具调用次数已用尽（最多 ${MAX_AGENT_STEPS} 轮），从现在起你不能再调用任何工具，也不能再输出检索计划。
+
+请立即基于已经取得的信息生成这一段最终回复正文：
+
+- 如果已有信息足以回答，直接给出简洁、准确的回答，并简要说明哪些部分未能核实。
+- 如果已有信息明显不足以回答，如实说明这条请求需要查询的资料过多、超出了你单次回复能完成的检索量，因此无法给出完整答复；简要说明还缺少什么，并建议用户把请求拆成更小、更具体的几条（例如一次只问一个页面、一个版本或一类编辑记录）后再留言。
+- 不得编造未检索到的页面内容、编辑历史或用户行为，也不得把推测描述成工具查询结果。`;
+
+/**
+ * 步数预算耗尽、且模型仍没能产出正文时的兜底降级回复（由程序生成，不依赖模型）。
+ * 用于保证「工具轮次爆了」时用户收到的是明确说明原因与解决方式的答复，而不是系统异常提示。
+ */
+export const STEP_BUDGET_EXHAUSTED_REPLY = `[系统异常] 由于任务过于复杂，系统无法进行完整回复，请考虑简化请求，例如提范围更小、更为具体的问题`;
 
 /**
  * 任务一：讨论页自由对话处理器
@@ -480,7 +518,8 @@ export async function respond(
   sectionTitle?: string,
   revid?: number | string,
 ): Promise<{ reply: string; usage: TokenUsage; model: string }> {
-  const system = buildSystemPrompt(persona, currentUser);
+  // 注意：system 必须按请求字节稳定（见 buildSystemPrompt 注释），不要在这里拼接用户名等信息。
+  const system = buildSystemPrompt(persona);
 
   const contextParts: string[] = [];
 
@@ -525,7 +564,7 @@ ${contextParts.join("\n")}
 
   messages.push({
     role: "user",
-    content: `以下是当前需要回复的最新留言（JSON 格式）：
+    content: `以下是当前需要回复的最新留言（留言者为【${currentUser ?? "未知用户"}】，JSON 格式）：
 \`\`\`json
 ${formattedCurrent}
 \`\`\`
@@ -539,6 +578,8 @@ ${formattedCurrent}
     models,
     async (modelInstance, spec, signal) => {
       const startedAt = Date.now();
+      /** 本次调用是否真的用满了步数预算（最后一步被迫收尾） */
+      let stepBudgetExhausted = false;
 
       const res = await generateText({
         model: modelInstance,
@@ -546,7 +587,25 @@ ${formattedCurrent}
         messages,
 
         tools: createWikiTools(bot),
-        stopWhen: stepCountIs(6),
+        stopWhen: stepCountIs(MAX_AGENT_STEPS),
+
+        // 最后一步（stepNumber 为 0 基）改成「禁止调用工具 + 追加收尾指令」：
+        // 否则这一步只会输出工具调用、没有正文，用户会收到「系统异常 机器人未能生成回复」。
+        // 提前自然结束的轮次不会走到这里，因此正常回复不受影响。
+        prepareStep: ({ stepNumber, messages: stepMessages }) => {
+          if (stepNumber !== MAX_AGENT_STEPS - 1) return {};
+          stepBudgetExhausted = true;
+          return {
+            toolChoice: "none",
+            // 收尾指令追加在 messages 末尾，而不是改写 instructions：
+            // 系统提示词一旦变化，前缀缓存就从该处断开，前面全部内容（尤其是体积最大的
+            // 工具结果）都要按原价重新计费；追加在末尾则只有这条新消息本身不命中缓存。
+            messages: [
+              ...stepMessages,
+              { role: "user", content: STEP_BUDGET_EXHAUSTED_NOTICE },
+            ],
+          };
+        },
 
         maxOutputTokens: MAX_TOKENS,
 
@@ -581,13 +640,29 @@ ${formattedCurrent}
           model: spec.model,
           elapsedMs: Date.now() - startedAt,
           steps: res.steps.length,
+          finishReason: res.finishReason,
           textLength: res.text.length,
+          stepBudgetExhausted,
           usage: res.usage,
         },
         "LLM generateText completed",
       );
 
       const result = cleanReply(res.text.trim());
+      if (!result && stepBudgetExhausted) {
+        // 已经把最后一步改成收尾作答，模型仍然没有输出正文（例如 provider 忽略了
+        // toolChoice=none）：退化为程序生成的降级回复，而不是让上层报「系统异常」。
+        log?.warn(
+          {
+            provider: spec.provider,
+            model: spec.model,
+            steps: res.steps.length,
+            finishReason: res.finishReason,
+          },
+          "chat reply degraded: step budget exhausted without any text, using fallback reply",
+        );
+        return { result: STEP_BUDGET_EXHAUSTED_REPLY, usage: res.usage };
+      }
       return { result, usage: res.usage };
     },
     usageTracker,
@@ -595,12 +670,21 @@ ${formattedCurrent}
   return { reply: result, usage, model };
 }
 
-function buildSystemPrompt(persona: string, currentUser?: string): string {
-  const contextPolicy = CONTEXT_TRUST_POLICY.replace(
-    "{{CURRENT_USER}}",
-    currentUser ?? "未知用户",
-  );
-
+/**
+ * 构造系统提示词。
+ *
+ * **必须保持「按请求字节稳定」**：系统提示词位于整个 prompt 的最前面，而前缀缓存
+ * （OpenAI 自动缓存：prompt ≥1024 token、按 128 token 分块）只对**完全相同的开头**
+ * 生效。只要按请求变化的内容（例如当前留言者用户名）出现在其中，它后面的所有内容
+ * ——包括体积最大的全部工具结果与讨论历史——都会因前缀错位而每次按原价重新计费。
+ *
+ * 因此这里只拼接「人格 + 固定策略」：persona 只在站内 Persona 页被编辑时变化，
+ * 其余策略块都是常量。每次不同的信息（当前留言者、讨论历史、当前留言）一律放进
+ * messages——messages 本身就逐次不同，不会拖累系统提示词的前缀缓存。
+ *
+ * 追加策略块时请一律加在末尾，不要按请求插入动态内容。
+ */
+function buildSystemPrompt(persona: string): string {
   const personaSection = `
 # Persona
 
@@ -615,7 +699,7 @@ ${persona}
   return [
     CORE_AGENT_POLICY,
     personaSection,
-    contextPolicy,
+    CONTEXT_TRUST_POLICY,
     WIKI_TOOL_POLICY,
     GROUNDING_POLICY,
     WIKITEXT_OUTPUT_POLICY,

@@ -528,9 +528,6 @@ export function hasOnlyCitationLinkClues(result: AiClueResult): boolean {
   );
 }
 
-/** 程序化线索的 confidence 下限（single → low，multiple → medium）。 */
-const LINK_CLUE_CONFIDENCE_FLOOR = { low: 0.3, medium: 0.6 } as const;
-
 /**
  * 程序化链接检查的统计。
  *
@@ -625,10 +622,7 @@ export function mergeCitationLinkClues(
   const summary = result.summary.slice(0, 800);
 
   return {
-    confidence: Math.max(
-      result.confidence,
-      LINK_CLUE_CONFIDENCE_FLOOR[strength],
-    ),
+    confidence: result.confidence,
     summary,
     issues: [...result.issues, issue],
   };
