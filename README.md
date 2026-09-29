@@ -1,112 +1,311 @@
-# MediaWiki agent — manual-testing build
+# AmanojakuBot
 
-Node.js / TypeScript daemon. Task 1: discussion chat; task 2: requested article/draft review; task 3: conservative AI-edit triage on two bot-owned user subpages. This build has **not** been exercised against a real wiki. Do not describe it as production-ready.
+中文维基百科常驻机器人（Node.js + TypeScript）。本仓库目前处于**人工测试阶段**：只在机器人自己的用户页/讨论页上验证，**尚未在真实维基上做过完整端到端验证**，请不要当作生产可用系统来使用。
 
-## Configuration and credentials
+---
 
-1. Run `npm install`, copy `config.example.yaml` to `config.yaml`, set the MediaWiki API URL, actual bot account (`wiki.username`), its talk/persona/control pages, and a wiki-specific `storage.dbPath`. If the login name uses a BotPassword suffix, set `wiki.loginUsername` separately; `wiki.username` remains the on-wiki username.
-2. Supply `WIKI_BOT_PASSWORD` and either `OPENAI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY` in your process environment (not in YAML or Git). The project does **not** auto-load `.env`.
-3. On the bot-owned control page put `enabled: true` and `emergencyStop: false`. Create the persona page. `writeEnabled: false` is the default; this is a genuine dry run: proposed replies/reports are logged and no wiki edit or review quota is committed. Set `writeEnabled: true` after examining the preview to allow authenticated edits. At each attempted write the control page is read again.
-4. `npm run check` performs only static TypeScript validation; `npm start` runs the daemon. Automated tests are not required for the manual workflow.
+## 1. 概述
 
-The bot's only write destinations are the configured bot talk page and, if task 3 is enabled, its two configured bot-owned user subpages. Model output cannot choose a destination.
+### 这是什么
 
-## Event source
+一个 7×24 常驻的维基百科守护进程，通过 MediaWiki API 监听编辑事件、调用大模型（LLM）处理，并把结果写回**机器人自己的页面**。
 
-`wiki.apiUrl` on `zh.wikipedia.org` defaults to EventStreams; other hosts default to RecentChanges polling. Override with `events.mode`. For non-zhwiki EventStreams, explicitly supply `wiki.wikiId` and `events.streamUrl`. Polling the discussion page is limited with `rctitle`. Task 3 (3-1) always scans namespace 0 recent changes on its own cron schedule (`tasks.aiEdit.cron`, interpreted in UTC; both EventStreams and polling sites), so it consumes extra API calls; task 3 is disabled by default. The first scan/checkpoint only establishes its baseline instead of processing historical edits. The review/AfC backlog sweep runs once at startup and then on `tasks.review.cleanupCron` / `tasks.afc.cleanupCron` (UTC). Keep a separate SQLite file per wiki.
+### 能做什么（共四项任务）
 
-## Manual acceptance path
+| 任务 | 功能 | 说明 |
+| --- | --- | --- |
+| 任务一 讨论页聊天 | 在机器人讨论页自由对话 | 识别留言者、时间戳、缩进与章节，结构化后交给 LLM，就地追加回复 |
+| 任务二 条目校对 | 按请求评审条目/草稿 | 用户用模板提交请求，机器人按规则页输出校对结果页并回写状态 |
+| 任务三 疑似 AI 编辑 | 3-1 定期动态扫描 + 3-2 模板请求式分析 | 生成「人工复核线索」，只描述客观疑点，不作人格判断或确定性归因 |
+| 任务四 AfC | 新手条目发布前评审 | 与任务二共用评审流水线，只是讨论页不同 |
 
-1. Leave `writeEnabled: false`; add a signed, appended message to the bot talk page. Check the proposed chat reply in logs. A format-only change should not respond. Polling's first run only establishes its checkpoint, so add the message afterward.
-2. Request `评审 [[条目标题]]` or `评审 https://<current-wiki>/wiki/条目标题` in a signed new message. Check the preview includes invalid/missing pages and quota logic. Requests accept existing namespace 0 or configured draft namespace targets, following redirects; non-owner quota is 10 first reviews per UTC day, with one recheck within 30 days. For the manual dry run no quota is consumed.
-3. Only when ready, set `writeEnabled: true`, provide the bot credentials in the process environment, and start a fresh process. Post a **new** message and inspect the resulting bot talk page edit. Source revision markers avoid duplicate replies. A previously previewed revision will not be replayed automatically if its event checkpoint moved; post a new test request.
-4. For task 3 (3-1), first enable `tasks.aiEdit.enabled` with `rulePage`, `debugLog`, and (for live writes) bot-owned `reportPagePrefix`/`usersPage`. Keep `silent: true` to only append local Markdown to `debugLog`; set `silent: false` to also publish. Scanning runs on the `tasks.aiEdit.cron` schedule; the first run only sets a baseline. Create/expand a namespace-0 **article** (drafts are not scanned by 3-1), wait for a scan, then inspect `debugLog` for the per-article `diff`/`user`/`confidence`/result entries (net additions under 100 bytes, bot/anonymous editors and AWB/Twinkle/rollback tags are skipped). At most `maxAnalysesPerWindow` articles are sent to the LLM per scan (default 20). Check specific evidence and false positives manually. With live writes, check entries are grouped by scan time under `reportPagePrefix/YYYY-MM`; `usersPage` lists only accounts with evidence in three distinct titles at or above `minConfidence`.
-5. For task 3 (3-2), post a signed request using template `tasks.aiEdit.template` on `tasks.aiEdit.talkPage` with `article1`, `article2`, … parameters. With `writeEnabled: false` inspect the preview in logs; with live writes check the result page under the talk page (`…/YYYYMMDD-<user>`) and the template status reply.
-6. Change the control page to `emergencyStop: true`; verify new write attempts stop. Then restore the desired state yourself. Use different credentials, pages, and DB files for local wiki/Miraheze vs zhwiki.
+### 技术栈
 
-## Known gaps / cautions
+- **运行时**：Node.js（使用原生 `node:sqlite` 的 `DatabaseSync`，建议 Node.js 22.5+，本机在 v26 上开发）
+- **语言**：TypeScript（ESM，`tsx` 直跑，`npm run check` 静态检查）
+- **维基交互**：`mwn`（MediaWiki API 客户端）
+- **大模型**：Vercel AI SDK（`ai`），provider 可选 OpenAI / Google
+- **存储**：原生 `node:sqlite` + 裸 SQL，无 ORM，自己维护 `schema_migrations` 增量迁移
+- **配置**：YAML + Zod 严格校验（含 cron 表达式校验）
+- **日志**：Pino（error 级同时写入 `error_logs` 表）
+- **定时**：`croner`（全部按 UTC 时区）
 
-- Discussion parsing only recognizes append-at-end, signed comments. New section insertions, unsigned comments, deleted/reordered text and nonstandard discussion systems can be missed. RC `bot` flags are not a complete bot-account lookup.
-- Task 2 checks up to 50 supplied links, reviews only the first eligible pages within quota, and truncates large article text to 12,000 characters per page. Quota reservations occur before model generation in live mode; a failed generation can leave a reservation that retries under the same source revision. Review reports are provisional, not verified fact-checks.
-- Task 3 (3-1) intentionally scans only namespace 0, caps analyses per scan, skips short net additions and large pages, and only analyzes the article's *current* version (not the diff text); it is **sampling/triage, not exhaustive detection**. Tag-based exclusions (AWB/Twinkle/rollback) depend on RecentChanges tags being returned. A model's confidence is not evidence of authorship. No cross-scan budget/cost accounting or independent human approval UI exists. 3-2 results are AI-generated provisional leads and are explicitly framed as not confirming or denying AI use.
-- Task 3 publication: with `silent: false`, check/user pages are appended idempotently via HTML-comment markers; an interrupted write is retried on the next cycle. Records below `minConfidence` are never published (and are marked handled). `usersPage` merging assumes the `== YYYY-MM ==` section and `* {{user|name}}：` line format.
-- If an SSE checkpoint is too old for upstream retention, there is no automatic Action API catch-up. Polling uses overlap and de-duplication, but RecentChanges retention can still expire during a long outage. This implementation has no authenticated live-wiki verification yet.
+### 三条重要设计原则
 
-## 任务三工作流
+1. **默认 dry-run**：`wiki.writeEnabled` 默认为 `false`，只打印预览、不真正编辑、不消耗额度。
+2. **模型不能决定写入位置**：写入目标、命名空间、额度与紧急停止全部由确定性代码检查；LLM 输出永远不能直接获得编辑权限。
+3. **链上总开关**：每次写入前都重新读取机器人控制页，`enabled: true` 且 `emergencyStop: false` 才允许写入。
 
-### 3-1 动态扫描
+---
 
-1. 使用mediawiki api，每隔tasks.aiEdit.intervalSeconds扫描一下该周期内的编辑（如果周期超过mediawiki api限制则将时间拆开分段查询），只保留纯条目命名空间编辑。同一条目的多次编辑要按条目名称合并判断。忽略机器人、机器用户编辑，忽略标签为AWB、Twinkle、回退功能的编辑。
-2. 对每个diff进行判断，净增加量小于100字节的，排除掉这些diff。
-3. 2步骤形成了涉及近期条目变化清单。按照清单里的条目，对每个条目的当前版本内容进行检查，检查规则参照tasks.aiEdit.rulePage提及页面进行。 AI分析应输出结构化数据格式，形成结构化分析结果。由程序来完成文字拼接。
-4. 输出到日志文件，tasks.aiEdit.debugLog，格式：
+## 2. 如何本地安装运行
 
-```markdown
-# 2026-09-28 17:09
+### 2.0 前置要求
 
-## 条目名称
+- Node.js 22.5 以上（需要 `node:sqlite`），推荐使用当前 LTS 或更新版本
+- 一个可用的 MediaWiki 账号（机器人账号 / BotPassword）
+- 至少一个 LLM 的 API Key（OpenAI 或 Google）
 
-* diff: 12341234, 12341235, 12341236
-* user: AAA, BBB, CCC （与diff一一对应）
-* confidence: 0.2
-* result:
+### 2.1 安装依赖
 
-1. 问题概述（位置）
-分析：xxxx
-2. ……
-
-## 条目名称
-
-* diff: 12341234, 12341235, 12341236
-* user: AAA, BBB, CCC
-* confidence: 0.5
-* result:
-
-1. 问题概述（位置）
-分析：xxxx
-2. ……
-
+```bash
+npm i
 ```
 
-1. 如tasks.aiEdit.silent = false则按下面格式在User:AmanojakuBot/task/U3/check/2026-09 （具体到当前月份）写内容
+### 2.2 配置环境变量
 
-```
-== 2026-09-01 12:23 ==
-=== 条目名称 ===
-{{anchor|202609011223条目名称}}
-{{main|条目名称}}
+先复制模板：
 
-* Diff: [[Special:Diff/12341234|12341234]]<sup>[[User:用户1|用户1]]</sup>, [[Special:Diff/12341234|12341234]]<sup>[[User:用户2|用户2]]</sup>
-* Confidence: 0.5
-* 问题分析：【分析结论】
-
-; 问题概述<small>（位置）</small>
-: 分析：xxxx
-; 问题概述<small>（位置）</small>
-: 分析：xxxx
+```bash
+cp .env.example .env.zhwp     # 名字随意，见下
 ```
 
-1. 如tasks.aiEdit.silent = false，且某个用户在三个不同的、confidence大于0.5的条目中，则在User:AmanojakuBot/task/U3/checkuser 记录该用户，格式（有重复标题时要合并、追加，而不是另外创建重复标题）：
+需要填写的变量：
 
+```dotenv
+WIKI_BOT_PASSWORD=            # 机器人账号（或 BotPassword）密码
+OPENAI_API_KEY=               # 使用 openai provider 时填写
+GOOGLE_GENERATIVE_AI_API_KEY= # 使用 google provider 时填写
 ```
-== 2026-09 ==
-* {{user|用户名}}：[[User:AmanojakuBot/task/U3/check/2026-09#202609011223条目名称|条目名称]]、[[User:AmanojakuBot/task/U3/check/2026-09#202609011223条目名称2|条目名称2]]、[[User:AmanojakuBot/task/U3/check/2026-09#202609011223条目名称3|条目名称3]]
-* {{user|用户名}}：[[User:AmanojakuBot/task/U3/check/2026-09#202609011223条目名称|条目名称]]、[[User:AmanojakuBot/task/U3/check/2026-09#202609011223条目名称2|条目名称2]]、[[User:AmanojakuBot/task/U3/check/2026-09#202609011223条目名称3|条目名称3]]
+
+> ⚠️ **本项目不会自动加载 `.env`**（代码里没有 dotenv）。密钥只放环境变量，不要写进 YAML，也不要提交进 Git。
+>
+> 加载方式有两种：
+>
+> - 用 npm 脚本内置的 `--env-file`（推荐）：`npm run start:zhwp` 读取 `.env.zhwp`，`npm run start:testwiki` 读取 `.env.testwiki`；
+> - 或者先在 shell 里 `export`，再执行 `npm run start`。
+
+### 2.3 配置 `config.yaml`
+
+```bash
+cp config.example.yaml config.yaml
 ```
 
-### 3-2 疑似AI分析
+重点需要改的字段：
 
-工作流程类似afc.ts（监视tasks.aiEdit.talkPage，模板使用tasks.aiEdit.template），但是根据User:AmanojakuBot/task/U3/rule来判断条目内的疑似ai线索。
+| 字段 | 说明 |
+| --- | --- |
+| `wiki.apiUrl` | 目标站点的 `api.php` 地址 |
+| `wiki.wikiId` | 非 zhwiki 且强制定向 EventStreams 时必须提供 |
+| `wiki.username` | 维基上的机器人用户名 |
+| `wiki.loginUsername` | 使用 BotPassword 后缀（如 `Bot@bot`）时单独填写 |
+| `wiki.ownerUserId` | 机器人拥有者的 user id（额度归属用） |
+| `wiki.controlPage` | 控制页，**必须**是 `User:xxx/...` 形式 |
+| `wiki.writeEnabled` | 保持 `false` 做 dry-run；确认无误后再改 `true` |
+| `storage.dbPath` | SQLite 文件路径，**每个 wiki 用不同文件** |
+| `events.mode` | `eventstream`（SSE）或 `polling`（轮询）；不填则 zhwiki 默认 SSE、其他站默认轮询 |
+| `llm.provider` / `llm.model` | 全局默认模型；各任务下还可覆盖 |
+| `tasks.*` | 各任务的开关、讨论页、规则页、模板与 cron |
 
-支持article1、article2……article20参数，按任务（日期+提交人用户名）将结果汇总到一个页面中。
+### 2.4 准备维基上的页面
 
-页面展示可疑之处，作为发起AI调查的初步分析线索。该页面信息不代表确认或否认此人滥用AI。
+1. **控制页**（`wiki.controlPage`）写入：
 
-### 3-3 疑问
+   ```yaml
+   enabled: true
+   emergencyStop: false
+   ```
 
-如何制定客观的疑似滥用AI标准？
+2. **人格页**（`tasks.chat.personaPage`）：创建它，用于定义聊天语气与角色。
+3. **规则页**（各任务的 `rulePage`）：校对规则 / 疑似 AI 判定规则由这些页面提供。
+4. 确认所有可写页面都属于机器人用户名下（配置校验会检查）。
 
-## TODO
+### 2.5 启动
 
-识别跨语言链接
-ai检查
+```bash
+npm run start          # 读取 config.yaml 与系统环境变量
+npm run start:zhwp     # 读取 .env.zhwp + config.yaml
+npm run start:testwiki # 读取 .env.testwiki + config.yaml
+```
+
+也可以用 `CONFIG_PATH` 指定别的配置文件：`CONFIG_PATH=config.zhwp.yaml npm start`。
+
+### 2.6 其他命令
+
+```bash
+npm run check   # TypeScript 静态类型检查（提交前建议跑）
+npm test        # Vitest 单元测试
+npm run lint    # ESLint
+```
+
+### 2.7 本地验收建议
+
+1. 保持 `writeEnabled: false`，在机器人讨论页追加一条**已签名**的新留言，看日志里的回复预览；纯格式修改不应触发回复。
+2. 提交一条校对请求，检查日志预览里的无效页面/额度逻辑。
+3. 确认无误后，把 `writeEnabled: true`（并提供密码）、重新启动进程，再发一条**新**留言，检查真实编辑结果。
+4. 把控制页改成 `emergencyStop: true`，确认新的写入被拦截。
+
+---
+
+## 3. 如何在 Toolforge 运行
+
+以下命令在 Toolforge 的登录节点（`toolforge login`）执行，`seijabot` 为工具账号名，按需替换。
+
+### 3.1 配置环境变量
+
+```bash
+toolforge envvars create WIKI_BOT_PASSWORD '<机器人密码>'
+toolforge envvars create OPENAI_API_KEY '<你的 API Key>'
+# 使用 Google provider 时：
+toolforge envvars create GOOGLE_GENERATIVE_AI_API_KEY '<你的 API Key>'
+```
+
+> 运行时的配置通过环境变量传入：`*.env` 文件不会自动加载，所以 Toolforge 上用 `envvars` 注入密钥；`config.yaml` 需要预先放在 `/data/project/seijabot/AmanojakuBot/`（注意改为你自己的tool）下，并通过 `CONFIG_PATH` 指过去。
+
+### 3.2 构建镜像
+
+```bash
+toolforge build start -i amanojakubot https://github.com/amanojaku-wp/AmanojakuBot
+```
+
+`-i` 指定镜像名，仓库地址指向 GitHub 上的本仓库；构建完成后镜像为 `tool-seijabot/amanojakubot:latest`。
+
+### 3.3 以常驻任务（continuous job）运行
+
+```bash
+toolforge jobs run --image tool-seijabot/amanojakubot:latest \
+  --command "startbot" --continuous --mount=all amanojakubot \
+  -o /data/project/seijabot/AmanojakuBot/stdout.out \
+  -e /data/project/seijabot/AmanojakuBot/stderr.out
+```
+
+说明：
+
+- `--command "startbot"`：对应仓库根目录 `Procfile` 中的 `startbot: npm start`；
+- `--continuous`：常驻守护进程，不自动退出；
+- `--mount=all`：挂载 `/data/project/seijabot`，使 SQLite 数据库与 `debugLog` 等文件持久化；
+- `-o` / `-e`：标准输出 / 错误的落盘路径。
+
+### 3.4 查看状态与日志
+
+```bash
+toolforge jobs list
+tail -f /data/project/seijabot/AmanojakuBot/stdout.out
+```
+
+---
+
+## 4. 热更新（重新构建 + 重启）
+
+改完代码推送到 GitHub 之后，两步完成更新：
+
+```bash
+# 1. 重新构建镜像
+toolforge build start -i amanojakubot https://github.com/amanojaku-wp/AmanojakuBot
+
+# 2. 重启常驻任务，使其使用新镜像
+toolforge jobs restart amanojakubot
+```
+
+> 每次重新构建都会产生新的 `:latest`，`jobs restart` 会拉取该镜像重新启动进程；如果只是改了 `config.yaml`，同样需要 `toolforge jobs restart amanojakubot`（或者把配置放环境变量后用 `envvars` 更新）。
+
+---
+
+## 5. 代码结构
+
+```text
+src/
+├── index.ts                  # 守护进程入口：加载配置、打开 DB、登录维基、串行队列、注册 change feed 与 cron
+├── handle.ts                 # 变更事件主路由（责任链流水线，可拦截）
+├── config/
+│   └── index.ts              # YAML + Zod 配置契约与加载器
+├── tasks/                    # 各业务任务，一个任务一个文件，导出 TaskHandler
+│   ├── chat.ts               # 任务一：讨论页聊天
+│   ├── review.ts             # 任务二：按请求条目/草稿校对
+│   ├── aiEditMonitor.ts      # 任务三 3-1：定期动态扫描 + 线索判定契约（被 3-2 复用）
+│   ├── aiEditReview.ts       # 任务三 3-2：模板请求式疑似 AI 分析
+│   └── afc.ts                # 任务四：新手条目发布前评审
+└── utils/                    # 通用基础设施
+    ├── db.ts                 # SQLite 打开、迁移、预编译语句、请求/额度记录、错误日志
+    ├── wiki.ts               # MediaWiki 客户端：建号、读页面、读修订、读差异（revisionDiff）
+    ├── wikitext.ts           # 维基文本与讨论页解析（签名/时间戳/缩进/章节/模板/回复插入）
+    ├── llm.ts                # LLM 调用与多模型降级（executeWithFallback）、token 统计
+    ├── llm-wiki-tools.ts     # 提供给模型的维基工具（供聊天任务使用）
+    ├── requestWorkflow.ts    # 模板请求工作流：章节定位、请求提取、互斥锁、状态回报、积压兜底扫描
+    ├── articleReview.ts      # 条目审核流水线：快照校验、规则页解析、两阶段审核引擎、结果页写入
+    ├── changeFeed.ts         # 变更事件统一入口（按 mode 分发）
+    ├── eventstream.ts        # EventStreams(SSE) 驱动（含 checkpoint、断线重连与补偿）
+    ├── polling.ts            # RecentChanges 轮询驱动（窗口增量、分页、重叠去重）
+    └── schedule.ts           # cron 定时调度（UTC、跳过重叠 tick）
+```
+
+**运行主链路**：`index.ts` 打开配置与数据库 → `startChangeFeed(...)` 按 `events.mode` 选择 SSE 或轮询 → 每个事件交给 `handle.ts` 的流水线 `[chatHandler, reviewHandler, aiEditHandler, afcHandler]` 依次处理。
+
+**并发模型**：所有事件消费与定时任务都排进同一条串行 `enqueue` 队列，避免 SQLite 写冲突与编辑冲突；单次任务失败只影响该次调用。
+
+---
+
+## 6. 各功能概述与代码入口
+
+### 任务一：讨论页聊天
+
+- **入口**：`src/tasks/chat.ts` → `chatHandler`（核心逻辑 `respond` / `prepareChatReply`）
+- **触发**：监听 `tasks.chat.talkPage` 上的新留言事件
+- **流程**：从修订记录取**实际编辑者 user_id**（签名只是文本，不用于认证）→ 排除机器人自己与机器人账户 → 通过差异分析 + 时间戳区分「新留言」与「格式整理/历史文本修改」→ 解析二级标题章节与多人会话（谁、何时、缩进、去签名噪声的正文）→ 结构化 XML 交给 LLM → **就地**在该章节安全追加回复。
+- **要点**：
+  - 留言修订时间戳超过 30 分钟（`MAX_REPLY_AGE_MS`）直接跳过，避免断线补偿时回复陈旧留言；
+  - 读取机器人用户页的 persona/control 设置，按 `user_id` 保存近期对话记忆；
+  - 回复后记录来源与回复 revision、模型使用情况，避免重复回复；
+  - 控制页 `emergencyStop` 在编辑层生效。
+
+### 任务二：条目辅助校对（Review）
+
+- **入口**：`src/tasks/review.ts` → `processReviewRequest` / `reviewHandler`；流水线与交互分别复用 `src/utils/articleReview.ts`、`src/utils/requestWorkflow.ts`
+- **触发**：`tasks.review.talkPage` 上使用 `tasks.review.template`（`User:AmanojakuBot/template/ReviewRequest`）的二级标题章节，每个章节有且仅有一个请求
+- **流程**：请求者身份由「触发 revision 的编辑者 + 签名用户」双重校验 → 校验目标页面（命名空间 0 或 `draftNamespace`，跟随重定向）→ 检查空/非条目内容并标记 `status = not done` 说明原因 → 按 UTC 自然日额度 `userDailyLimit` 限制 → 绑定固定 revision ID → 读取 `rulePage` 规则 → LLM 结构化输出（Zod schema）→ 写入结果页 `<talkPage>/<name>`（唯一日期章节 + 警告文案）→ 回写模板 `status = done`、`resultpage`、`section` 并 ping 用户。
+- **要点**：
+  - 审核采用「全文全局检查 + 导言/二级/三级标题分块局部扫描 + 确定性/语义去重合并」流水线（`runArticleReviewEngine`，`chunkEnabled` 可关）；
+  - 请求互斥锁按 `talkPage#sectionTitle` + `revid` 加锁，防多路并发重复校对；
+  - 兜底：启动时先扫一次，之后按 `tasks.review.cleanupCron`（UTC，默认每小时整点）补处理积压请求；只处理 `status` 为空的章节；
+  - 写入前会回到「当前页面」复核模板是否已被处理，防止位点回放或并发实例重复发送。
+
+### 任务三：疑似 AI 编辑线索
+
+#### 3-1 定期动态扫描
+
+- **入口**：`src/tasks/aiEditMonitor.ts` → `scanAiEdits` + `publishAiReports`
+- **触发**：按 `tasks.aiEdit.cron`（UTC，默认每小时整点）定时执行；**首次 tick 只建立基准位点**，不回溯历史编辑
+- **流程**：RecentChanges API 扫描自上次 checkpoint 以来的编辑（周期超过 API 上限时自动分段查询）→ 只保留命名空间 0 的 `edit`/`new` → 忽略机器人/机器用户/匿名 IP 与 AWB、Twinkle、回退功能标签 → 丢弃净增加量 < 100 字节的 diff → **同一条目的全部差异合并为一次请求**（一个条目一轮只送检一次）→ 送检「全部差异 + 完整条目正文」（24 小时内已送过完整正文或正文过长时降级为只送差异）→ LLM 输出结构化线索 → 程序拼接 Markdown 追加到 `tasks.aiEdit.debugLog`。
+- **线索字段**：线索强度 `confidence`（**整体线索强度**，越大越指向疑似 AI 辅助编辑，**不是**「使用 AI 的概率」）、问题概述、位置、具体证据、分析、其他合理解释、建议核查、所属差异修订号。
+- **发布（可选）**：`silent = false` 时才写维基 —— `reportPagePrefix/YYYY-MM`（按扫描时间设二级标题、条目设三级标题、`{{anchor|紧凑时间+条目名}}` 锚点、`{{La}}` 整理链接、逐条 Diff）与 `usersPage`（同一编者在 ≥3 个不同规范化条目中出现达标线索时，在 `== YYYY-MM ==` 下合并/追加编者行）。
+- **`silent` 默认 `true`**（仅写本地日志）；发布与 checkuser 汇总都额外要求「记录中确实存在线索」，无线索记录绝不公开。
+
+#### 3-2 模板请求式疑似 AI 分析
+
+- **入口**：`src/tasks/aiEditReview.ts` → `aiEditHandler`（参数解析 `parseDiffParam`，主流程 `processAiCheckRequest`）
+- **触发**：`tasks.aiEdit.talkPage` 上使用 `tasks.aiEdit.template` 的请求章节
+- **参数**：`article1` … `article20`（条目名，允许命名空间 0 与 `tasks.aiEdit.draftNamespace`），以及 `diff1` … `diff20`（裸修订号、`[[Special:Diff/修订号]]`、`[[Special:Diff/A/B]]` 以 B 为目标）；不带编号的 `article` / `diff` 也支持
+- **流程**：先按规范化条目名把 article 与 diff 参数合并 → **同一条目只分析一次，全部差异合并为一次送检** → 命名空间校验、24 小时完整正文复用与降级规则同 3-1（共用 `ai_edit_sends` 表；若本次没有任何差异可送，则仍送完整条目）→ 按任务（日期 + 提交人用户名）汇总到同一结果页。
+- **结果页**：用 `{{La}}` 整理条目相关链接，按送检差异逐条列出 Diff；无法识别的参数、不存在/不可读取的修订或命名空间不受支持的页面会如实列入结果页与日志。
+- **定位说明**：页面展示的是**人工复核线索**，作为发起 AI 调查的初步分析，**不代表确认或否认**该编者滥用 AI。
+
+### 任务四：AfC（新手条目发布前评审）
+
+- **入口**：`src/tasks/afc.ts` → `processAfcRequest` / `afcHandler`；审核流水线复用 `src/utils/articleReview.ts`，交互流程复用 `src/utils/requestWorkflow.ts`
+- **触发**：`tasks.afc.talkPage` 上的请求章节（模板同为 `ReviewRequest`，靠讨论页区分任务）
+- **要点**：与任务二同构，输出「发布就绪度」（`not_ready` / `needs_work` / `appears_ready`）而非校对问题列表；规则页声明「局部扫描未启用」时只做全局评审；兜底扫描由 `tasks.afc.cleanupCron` 调度。
+
+### 共用基础设施入口
+
+| 模块 | 入口 | 作用 |
+| --- | --- | --- |
+| 事件路由 | `src/handle.ts` → `handle`、`handlers` | 责任链流水线，`intercepted` 可中断后续处理器 |
+| 变更源统一入口 | `src/utils/changeFeed.ts` → `startChangeFeed` | 按 `events.mode` 分发到 SSE 或轮询 |
+| SSE 驱动 | `src/utils/eventstream.ts` → `startEventStreamFeed` | checkpoint（含 `lastEventId`/`last_revid`）、10/30/60/120/300 秒递增重连、`recentchanges` 遗漏补偿 |
+| 轮询驱动 | `src/utils/polling.ts` → `startPollingFeed` / `fetchRecentChanges` | 时间窗口增量、分页、重叠去重；窗口上界固定在 tick 开始时刻 |
+| 数据库 | `src/utils/db.ts` → `openDb` / `runMigrations` / `countDailyCompletedReviews` / `recordError` | 迁移、额度统计、错误持久化 |
+| 定时调度 | `src/utils/schedule.ts` → `scheduleCron` / `isValidCron` | UTC cron，跳过重叠 tick |
+| 配置 | `src/config/index.ts` → `loadConfig` | YAML + Zod 校验，含安全约束（可写页面必须属于机器人） |
+| LLM | `src/utils/llm.ts` → `executeWithFallback` | 多模型依次降级，`generateObject` + Zod 结构化输出 |
+| 差异读取 | `src/utils/wiki.ts` → `revisionDiff` | 读取目标/基准修订元数据与 `+`/`-` 差异文本（有长度上限） |
+
+---
+
+## 7. 已知限制与注意事项
+
+- 讨论页解析只识别「追加在末尾且已签名」的留言；新章节插入、无签名留言、删除/重排文本与非标准讨论系统可能漏判。RecentChanges 的 `bot` 标记并不等于完整的机器人账号查询。
+- 任务二最多检查 50 个链接、只评审额度内靠前的合格页面，单页正文截断到 12,000 字符；额度预留在生成之前，生成失败可能留下同源修订重试的预留。校对报告是**初步结论，不是已核实的事实核查**。
+- 任务三 3-1 刻意只扫描命名空间 0、限制每轮分析数量并跳过短增量，它是**抽样/线索筛查，不是穷尽检测**；降级为只送差异时模型可能缺少上下文；标签过滤依赖 API 返回标签；**模型给出的置信度不是作者归属证据**。3-2 结果是 AI 生成的初步线索，明确不代表确认或否认滥用 AI。
+- 若 SSE checkpoint 早于上游保留期限，没有自动 Action API 补洞；轮询虽有重叠与去重，长时间中断仍可能遗漏。
+- 所有输出只写机器人讨论页或指定的机器人用户子页；模型不能选择写入目标。
+- 不要把本项目描述为生产可用；切换到真实写入前请先做人工端到端核查（API 响应形状、机器人账号过滤、断线恢复、幂等、额度与误报）。
