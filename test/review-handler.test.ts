@@ -186,6 +186,7 @@ describe("Task 2 reviewHandler", () => {
           draftNamespaces: [2, 118],
           silent: true,
           cron: "0 * * * *",
+          summaryCron: "0 20 * * *",
           rulePage: "User:AmanojakuBot/task/U3/rule",
           talkPage: "User talk:AmanojakuBot/ai",
           template: "User:AmanojakuBot/template/AIcheck",

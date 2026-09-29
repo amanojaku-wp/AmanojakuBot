@@ -27,11 +27,9 @@ import {
   analyzeWithReferenceLinks,
   formatUtcMinute,
   loadAiRules,
-  markFullArticleSent,
   MAX_ARTICLE_CHARS,
   renderDiffLinks,
   safeTitle,
-  shouldSendFullArticle,
   toDiffInput,
   type AiClueResult,
   type AiDiffInput,
@@ -49,7 +47,8 @@ import type { HandlerContext } from "../handle.js";
  *
  * 送检规则（与 3-1 一致）：
  * - 先按「规范化条目名」把 article 与 diff 参数合并：同一条目只送检一次，其全部差异合并为同一次请求；
- * - 送检内容 = 全部差异 + 完整条目正文；但该条目 24 小时内已送检过完整正文（或正文过长）时只送差异；
+ * - **只送编辑差异，不送条目全文**（避免烧 token）；仅当本次没有任何差异可送时才附完整条目，
+ *   否则请求没有可判断的内容；
  * - 报告页用 {{La}} 整理条目相关链接（条目、编辑、讨论、历史等），并按送检差异逐条列出 Diff。
  *
  * 线索来源有两类：
@@ -260,7 +259,7 @@ async function processAiCheckRequest(
   ctx: HandlerContext,
   request: IncomingRequest,
 ): Promise<void> {
-  const { db, bot, cfg, log } = ctx;
+  const { bot, cfg, log } = ctx;
   const ai = cfg.tasks.aiEdit;
   const talkPage = ai.talkPage!;
   const templateName = ai.template!;
@@ -442,9 +441,10 @@ async function processAiCheckRequest(
   const results: AiCheckResultItem[] = [];
 
   for (const target of resolved) {
-    // 24 小时内已送检过完整正文（或正文过长）时只送差异，避免重复整篇送审；
-    // 但若本次没有任何差异可送，则仍必须送完整条目，否则该请求没有可判断的内容。
-    let content = target.content;
+    // 只送编辑差异（与 3-1 一致）：条目全文不送模型，避免烧 token。
+    // 唯一例外是本次没有任何差异可送（请求只给了 article 参数）——那时若不附正文，
+    // 整个请求就没有可判断的内容，只能如实回报「没有可分析的内容或差异」。
+    let content = target.diffs.length === 0 ? target.content : undefined;
     const revidForRequest = target.revid;
     if (content && content.length > MAX_ARTICLE_CHARS) {
       log.info(
@@ -452,20 +452,7 @@ async function processAiCheckRequest(
         "aiEdit 3-2 oversized article, sending diff only",
       );
       content = undefined;
-    } else if (
-      content &&
-      target.diffs.length > 0 &&
-      !shouldSendFullArticle(db, target.canonical)
-    ) {
-      log.info(
-        { title: target.title },
-        "aiEdit 3-2 article sent within reuse window, sending diff only",
-      );
-      content = undefined;
     }
-
-    // 送检前记录完整条目的发送时间，供后续 24 小时窗口复用判断。
-    if (content) markFullArticleSent(db, target.canonical, target.title);
 
     // 既无完整条目也没有可送检差异时无法分析（如仅供条目名但正文过长），如实回报。
     if (!content && target.diffs.length === 0) {

@@ -14,7 +14,11 @@ import { createWorkQueue } from "./utils/workQueue.js";
 import { configureLlmRuntime, llmRuntimeStats } from "./utils/llm.js";
 import { cleanupBacklogReviews } from "./tasks/review.js";
 import { cleanupBacklogAfcs } from "./tasks/afc.js";
-import { publishAiReports, scanAiEdits } from "./tasks/aiEditMonitor.js";
+import {
+  publishAiReports,
+  scanAiEdits,
+  writeAiScanDailySummary,
+} from "./tasks/aiEditMonitor.js";
 import {
   handle,
   recoverUnfinishedEvents,
@@ -248,6 +252,12 @@ if (cfg.tasks.aiEdit.enabled) {
     await scanAiEdits(handlerContext);
     await publishAiReports(handlerContext);
   });
+
+  // 每日扫描成本汇总（tasks.aiEdit.summaryCron，默认每天 20:00 UTC）：
+  // 把最近 24 小时的扫描统计与 Token 用量（含缓存命中）追加到 debugLog，便于核对「跳过规则」省下了多少额度。
+  scheduleTask(cfg.tasks.aiEdit.summaryCron, "aiEdit 3-1 daily summary", () =>
+    writeAiScanDailySummary(handlerContext),
+  );
 }
 
 log.info(

@@ -63,6 +63,7 @@ tasks:
     rulePage: User:AmanojakuBot/task/U3/rule
     silent: true
     cron: "0 * * * *" # 3-1 动态扫描的 cron 调度（UTC 时区，默认每小时整点）
+    summaryCron: "0 20 * * *" # 3-1 扫描成本每日汇总写入 debugLog 的 cron 调度（UTC 时区，默认每天 20:00）
     debugLog: /data/project/seijabot/AmanojakuBot/ai-edit.log
     #maxAnalysesPerWindow: 20
     minConfidence: 0

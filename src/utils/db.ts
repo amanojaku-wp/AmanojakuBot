@@ -298,6 +298,48 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    // 任务三（3-1）扫描成本统计表：每条「实际读取到差异的编辑」一行。
+    //
+    // 用途有两个：
+    // 1. 记录被「新增 CJK 字符不足」规则跳过的 diff（需求要求跳过也要留痕），
+    //    供事后核对哪些小额编辑没有送检 LLM；
+    // 2. 支撑 debugLog 的每日汇总表（按 cjk 分桶统计 edits / analyzed / clues）。
+    //
+    // 字段说明：
+    // - cjk_chars / added_bytes：diff 中新增（`+ `）部分的 CJK 字符数与 UTF-8 字节数；
+    // - diff_bytes：该 diff 文本自身的 UTF-8 字节数（含删除行）；
+    // - analyzed：1 = 已送检 LLM；0 = 跳过（skip_reason 说明原因）；
+    // - clues / tokens：该条目本次分析得到的线索数与 Token 用量，**只记在该条目第一条已送检的
+    //   diff 行上**（其余为 0），这样按桶 SUM(...) 即为该桶总数，不会因一个条目有多条 diff 而重复计数。
+    version: "20261002000000",
+    name: "create_ai_scan_stats_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ai_scan_stats (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scan_time TEXT NOT NULL,
+          revid INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          canonical_title TEXT NOT NULL,
+          cjk_chars INTEGER NOT NULL,
+          added_bytes INTEGER NOT NULL,
+          diff_bytes INTEGER NOT NULL,
+          bucket TEXT NOT NULL,
+          analyzed INTEGER NOT NULL,
+          skip_reason TEXT,
+          clues INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_scan_stats_scan_time ON ai_scan_stats(scan_time);
+        CREATE INDEX IF NOT EXISTS idx_ai_scan_stats_bucket ON ai_scan_stats(bucket);
+      `);
+    },
+  },
 ];
 let savepointCounter = 0;
 
@@ -821,7 +863,8 @@ export function getAfcRequest(
  * 10. `error_logs`: 系统运行异常与错误日志记录表。
  * 11. `schema_migrations`: 数据库版本迁移追踪表。
  * 12. `ai_edit_reports`: 任务三（3-1 动态扫描）按条目聚合的疑似 AI 线索记录，包含合并后的 diff/user 列表、置信度与结构化分析结果，以及发布幂等状态。
- * 13. `ai_edit_sends`: 任务三（3-1 / 3-2）按规范化条目名记录「完整条目」最近一次送检时间，用于 24 小时内只送编辑差异、不重复送完整正文。
+ * 13. `ai_edit_sends`: 任务三按规范化条目名记录「完整条目」最近一次送检时间（**自 2026-09-29 起 3-1 不再送完整正文，本表保留但已不再写入**，仅为历史数据与迁移兼容保留）。
+ * 14. `ai_scan_stats`: 任务三（3-1）扫描成本统计，每条实际读取到差异的编辑一行（新增 CJK 字符数、字节数、是否送检、线索数与 Token 用量），支撑「新增 CJK 不足即跳过」的可追溯性与 debugLog 每日汇总表。
  */
 export function openDb(path = "bot.sqlite"): DatabaseSync {
   const db = new DatabaseSync(path);

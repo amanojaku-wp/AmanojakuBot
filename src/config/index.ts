@@ -213,6 +213,13 @@ export const configSchema = z.object({
           silent: z.boolean().default(true),
           /** 3-1 动态扫描的 cron 表达式（UTC 时区），默认每小时整点 */
           cron: cronExpressionSchema.default("0 * * * *"),
+          /**
+           * 3-1 扫描统计每日汇总的 cron 表达式（UTC 时区），默认每天 20:00（UTC）。
+           *
+           * 汇总内容为最近 24 小时的扫描成本（按新增 CJK 分桶的 edits / analyzed / clues 表）
+           * 与 Token 用量（含缓存命中），追加写入 `debugLog`；未配置 debugLog 时不生效。
+           */
+          summaryCron: cronExpressionSchema.default("0 20 * * *"),
           /** 3-1 结构化分析结果的本地 Markdown 调试日志文件路径 */
           debugLog: z.string().min(1).optional(),
           /** 3-2 请求监听所在机器人讨论页（模板请求） */
@@ -245,6 +252,7 @@ export const configSchema = z.object({
           draftNamespace: [2, 118],
           silent: true,
           cron: "0 * * * *",
+          summaryCron: "0 20 * * *",
           maxAnalysesPerWindow: 20,
           minConfidence: 0,
           linkCheck: true,
@@ -297,6 +305,7 @@ export const configSchema = z.object({
         draftNamespace: [2, 118],
         silent: true,
         cron: "0 * * * *",
+        summaryCron: "0 20 * * *",
         maxAnalysesPerWindow: 20,
         minConfidence: 0,
         linkCheck: true,

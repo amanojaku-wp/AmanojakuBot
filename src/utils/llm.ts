@@ -23,6 +23,13 @@ export type TokenUsage = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /**
+   * 命中 prompt 缓存的输入 token（cached input tokens）。
+   *
+   * 缓存命中的部分通常按更低单价计费（OpenAI 约 1/4、Google 约 1/4），
+   * 单独统计它与总用量分开核对，才能判断「省钱改造」是否真的生效。
+   */
+  cachedInputTokens: number;
 };
 
 export type PartialTokenUsage = {
@@ -31,10 +38,33 @@ export type PartialTokenUsage = {
   totalTokens?: number;
   promptTokens?: number;
   completionTokens?: number;
+  /** 部分 provider / 旧版 SDK 直接在 usage 顶层给出缓存命中 token */
+  cachedInputTokens?: number;
+  /**
+   * AI SDK v5+ 的 usage 形状：缓存命中 token 位于 `inputTokenDetails.cacheReadTokens`，
+   * 实际 provider 可能把字段置为 undefined（无缓存或不支持）。
+   */
+  inputTokenDetails?: {
+    noCacheTokens?: number | null;
+    cacheReadTokens?: number | null;
+    cacheWriteTokens?: number | null;
+  };
 };
 
 export function createTokenUsage(): TokenUsage {
-  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cachedInputTokens: 0,
+  };
+}
+
+/** 从 provider 的 usage 里取出缓存命中的输入 token（兼容两种字段位置）。 */
+export function cachedInputTokensOf(added: PartialTokenUsage): number {
+  return (
+    added.cachedInputTokens ?? added.inputTokenDetails?.cacheReadTokens ?? 0
+  );
 }
 
 export function addTokenUsage(
@@ -48,11 +78,22 @@ export function addTokenUsage(
   target.inputTokens += input;
   target.outputTokens += output;
   target.totalTokens += total;
+  target.cachedInputTokens += cachedInputTokensOf(added);
   return target;
 }
 
+/** 紧凑格式：I输入/O输出/T合计（不含缓存明细，保持既有日志与测试稳定）。 */
 export function formatTokenUsage(usage: TokenUsage): string {
   return `I${usage.inputTokens}/O${usage.outputTokens}/T${usage.totalTokens}`;
+}
+
+/**
+ * 含缓存命中的详细格式：I输入/O输出/T合计/C缓存命中输入。
+ *
+ * 用于任务三 debugLog 的成本核对（T 包含 C，C 为其中按缓存价计费的部分）。
+ */
+export function formatTokenUsageDetailed(usage: TokenUsage): string {
+  return `${formatTokenUsage(usage)}/C${usage.cachedInputTokens}`;
 }
 
 export type FallbackRunnerResult<T> =

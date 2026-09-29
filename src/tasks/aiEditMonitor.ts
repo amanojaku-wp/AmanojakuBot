@@ -1,4 +1,5 @@
 import { appendFileSync } from "node:fs";
+import { Buffer } from "node:buffer";
 import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "pino";
 import { generateObject } from "ai";
@@ -13,6 +14,7 @@ import {
 import {
   createTokenUsage,
   executeWithFallback,
+  formatTokenUsageDetailed,
   type TokenUsage,
 } from "../utils/llm.js";
 import { runInTransaction } from "../utils/db.js";
@@ -37,30 +39,85 @@ import { cronPeriodMs } from "../utils/schedule.js";
 import type { HandlerContext } from "../handle.js";
 
 /**
- * 任务三（3-1 动态扫描）单条 diff 的净增量下限（字节）。
+ * 任务三（3-1）单条 diff 的净增量下限（字节）。
  * 净增加量小于该值的 diff 视为小修补或格式化，直接排除。
  */
 const MIN_DIFF_GROWTH_BYTES = 100;
 
+/**
+ * 任务三（3-1）单条 diff「新增部分」的 CJK 字符数下限。
+ *
+ * 新增部分（差异中以 `+ ` 开头的行）的汉字字符数不超过该值的 diff 不送检 LLM（跳过检查）：
+ * 几十个汉字撑不起任何可复核的文风 / 格式线索，送进模型只是白烧 token。
+ * 跳过不是静默丢弃：debugLog 会记录跳过的修订号，ai_scan_stats 表里也逐条留痕。
+ *
+ * 注意：该阈值判断需要读取差异全文（RecentChanges 只能提供新旧字节数），
+ * 因此它在差异读取之后、LLM 调用之前生效——省的是模型 token，不是 API 请求（烧 API 请求又不花钱，无所谓）。
+ */
+export const MIN_ADDED_CJK_CHARS = 50;
+
 /** 单次 MediaWiki RecentChanges 查询的最大时间跨度；超过则该周期拆分为多段查询。 */
 const MAX_SCAN_SEGMENT_MS = 24 * 3600 * 1000;
 
-/** 送审 LLM 的条目正文长度上限，超过则不附完整条目、仅送差异（3-1 / 3-2 共用）。 */
+/**
+ * 送审 LLM 的条目正文长度上限（仅 3-2 的「无差异时附完整条目」路径使用）。
+ *
+ * 3-1 定期扫描自 2026-09-29 起**一律只送编辑差异**，不再把条目全文送模型（见 analyzeArticle）。
+ */
 export const MAX_ARTICLE_CHARS = 60000;
 
 /** 每次扫描送审 LLM 的条目数兜底上限（配置缺失时使用）。 */
 const DEFAULT_MAX_ANALYSES = 20;
 
-/**
- * 「完整条目」送检复用窗口（24 小时）。
- *
- * 同一规范化条目在该窗口内已经送检过完整正文时，再次送检不再附带完整条目，只送本次编辑差异，
- * 避免对同一条目重复消耗大量 token（3-1 与 3-2 共用同一张 `ai_edit_sends` 记录表）。
- */
-export const ARTICLE_CONTEXT_REUSE_MS = 24 * 3600 * 1000;
-
 /** 单个条目一次送检的差异文本总量上限（字符）；超出部分按差异顺序截断。 */
 export const MAX_DIFF_TOTAL_CHARS = 30000;
+
+// ---------------------------------------------------------------------------
+// 扫描成本度量：新增 CJK 字符数 / 差异字节数 / 分桶
+// ---------------------------------------------------------------------------
+
+/** CJK 汉字（含扩展 A 与兼容区）匹配：只管汉字，不含标点、假名与拉丁字母。 */
+const CJK_CHAR_PATTERN = /\p{Script=Han}/gu;
+
+/** 统计文本中的 CJK 汉字字符数（衡量「这次编辑到底写了多少中文内容」）。 */
+export function countCjkChars(text: string): number {
+  return text.match(CJK_CHAR_PATTERN)?.length ?? 0;
+}
+
+/**
+ * 统计差异文本中**新增部分**（以 `+ ` 开头的行）的体量。
+ *
+ * diffText 的格式由 utils/wiki.revisionDiff 生成（`+ `/`- ` 前缀），因此这里只需按前缀筛选。
+ * 删除行与上下文不计入：线索判断只关心本次新增了什么。
+ * 差异被截断时（truncated）统计值会偏小，调用方已在 debugLog / 统计表里标出截断状态。
+ */
+export function addedDiffStats(diffText: string): {
+  cjkChars: number;
+  bytes: number;
+} {
+  let cjkChars = 0;
+  let bytes = 0;
+  for (const line of diffText.split("\n")) {
+    if (!line.startsWith("+ ")) continue;
+    const added = line.slice(2);
+    cjkChars += countCjkChars(added);
+    bytes += Buffer.byteLength(added, "utf8");
+  }
+  return { cjkChars, bytes };
+}
+
+/** 每日汇总表的 CJK 分桶标签（顺序即表格行顺序）。 */
+export const CJK_BUCKETS = ["<100", "100–300", "300–1000", ">1000"] as const;
+
+export type CjkBucket = (typeof CJK_BUCKETS)[number];
+
+/** 把新增 CJK 字符数归入每日汇总表的桶（区间为左闭右开：100–300 含 100、不含 300）。 */
+export function cjkBucket(cjkChars: number): CjkBucket {
+  if (cjkChars < 100) return "<100";
+  if (cjkChars < 300) return "100–300";
+  if (cjkChars <= 1000) return "300–1000";
+  return ">1000";
+}
 
 /**
  * 排除的编辑标签（大小写不敏感）：AWB（自动维基浏览器）、Twinkle、回退功能 / rollback。
@@ -243,8 +300,6 @@ export type AiDiffInput = {
   /** 差异文本是否因过长被截断 */
   truncated?: boolean;
 };
-
-/** 把 revisionDiff 的读取结果转换为送检输入。 */
 export function toDiffInput(diff: RevisionDiff): AiDiffInput {
   return {
     revid: diff.revid,
@@ -257,37 +312,9 @@ export function toDiffInput(diff: RevisionDiff): AiDiffInput {
   };
 }
 
-/**
- * 该规范化条目现在是否可以连同完整正文一起送检。
- *
- * 24 小时内已经送检过完整正文的条目返回 false：此时只送本次编辑差异，
- * 避免同一条目被反复整篇送审而大量消耗 token。
- */
-export function shouldSendFullArticle(
-  db: DatabaseSync,
-  canonical: string,
-  now = Date.now(),
-): boolean {
-  const row = db
-    .prepare("SELECT sent_at FROM ai_edit_sends WHERE canonical_title=?")
-    .get(canonical) as { sent_at?: string } | undefined;
-  if (!row?.sent_at) return true;
-  const sentAt = Date.parse(row.sent_at);
-  return !Number.isFinite(sentAt) || now - sentAt >= ARTICLE_CONTEXT_REUSE_MS;
-}
-
-/** 记录该条目刚刚连同完整正文一起送检（供后续 24 小时窗口复用判断）。 */
-export function markFullArticleSent(
-  db: DatabaseSync,
-  canonical: string,
-  title: string,
-  now = new Date(),
-): void {
-  db.prepare(
-    `INSERT INTO ai_edit_sends(canonical_title,title,sent_at) VALUES(?,?,?)
-     ON CONFLICT(canonical_title) DO UPDATE SET title=excluded.title, sent_at=excluded.sent_at`,
-  ).run(canonical, title, now.toISOString());
-}
+// 注：原先还有 shouldSendFullArticle / markFullArticleSent（24 小时「完整正文只送一次」节流）。
+// 3-1 自 2026-09-29 起一律只送差异、不再送条目全文，节流机制失去意义，已整段删除；
+// 历史数据表 ai_edit_sends 保留（迁移是 append-only），但已无代码写入。
 
 /** 按总量预算截断多条差异文本（保持差异顺序，超限部分标记为已截断）。 */
 export function limitDiffTexts(
@@ -1076,20 +1103,35 @@ function appendDebugLog(
  * ## 条目名称
  * * diff: 1, 2
  * * user: A, B
- * * content: full / diff-only
+ * * diff bytes: 8421 / added cjk: 1200
+ * * tokens: I1234/O567/T1801/C400
  * * links: 12 checked, 2 unreachable
  * * confidence: 0.5
  * * result:
  *
  * 1. 问题概述（位置；差异 123）
  * 分析：……
+ *
+ * 若本次没有任何差异达到送检门槛（新增 CJK ≤ MIN_ADDED_CJK_CHARS），改用渲染跳过说明的
+ * `skipReason` 分支：只记规模与原因，不写 confidence / result（跳过的条目没有分析结论）。
  */
 function renderDebugEntry(
   title: string,
   edits: AiDiffRef[],
-  result: { confidence: number; issues: AiClueIssue[] },
+  result: { confidence: number; issues: AiClueIssue[] } | null,
   options: {
-    withContent: boolean;
+    /** 本次实际送检差异的新增部分统计 */
+    addedCjk: number;
+    /** 本次实际送检差异文本的 UTF-8 字节数合计 */
+    diffBytes: number;
+    /** 本次 LLM 调用的 Token 用量（含缓存命中）；未调用模型时省略 */
+    usage?: TokenUsage;
+    /** 因新增 CJK 不足而被跳过、未送检的差异 */
+    skippedDiffs?: AiDiffRef[];
+    /** 送检差异中因过长被截断的条数（截断会使 CJK 计数偏小） */
+    truncatedDiffs?: number;
+    /** 整条条目都被跳过时的原因（此时 result 为 null） */
+    skipReason?: string;
     linkCheck?: {
       checked: number;
       suspect: number;
@@ -1107,8 +1149,18 @@ function renderDebugEntry(
       .map((e) => e.user)
       .filter(Boolean)
       .join(", ")}`,
-    `* content: ${options.withContent ? "full" : "diff-only"}`,
+    `* diff bytes: ${options.diffBytes} / added cjk: ${options.addedCjk}`,
   ];
+  if (options.usage)
+    lines.push(`* tokens: ${formatTokenUsageDetailed(options.usage)}`);
+  if (options.skippedDiffs?.length)
+    lines.push(
+      `* skipped diffs (added cjk ≤ ${MIN_ADDED_CJK_CHARS}): ${options.skippedDiffs
+        .map((e) => e.revid)
+        .join(", ")}`,
+    );
+  if (options.truncatedDiffs)
+    lines.push(`* diffs truncated: ${options.truncatedDiffs}`);
   // 确定性检查（参考文献 URL 可达性）不依赖 LLM，单独记录检查规模，便于人工核对
   if (options.linkCheck) {
     const stats = options.linkCheck.stats;
@@ -1124,6 +1176,14 @@ function renderDebugEntry(
         `* links unresolved (bot-side DNS failure, not a dead link): ${options.linkCheck.unresolved}`,
       );
   }
+
+  // 整条条目被跳过（新增 CJK 不足 / 无可用差异）：只记原因，不写 confidence 与结果
+  if (!result) {
+    lines.push(`* skipped: ${options.skipReason ?? "未送检"}`);
+    lines.push("");
+    return lines.join("\n");
+  }
+
   lines.push(`* confidence: ${result.confidence}`, `* result:`, "");
   if (result.issues.length === 0) {
     lines.push(
@@ -1153,8 +1213,11 @@ type AiArticleAnalysis = {
   issues: AiClueIssue[];
   /** 实际读取成功并参与送检的差异（用于报告页与 checkuser 汇总） */
   diffs: AiDiffRef[];
-  /** 本次是否附带了完整条目正文（否则为只送差异的降级模式） */
-  withContent: boolean;
+  /** 本次实际送检差异的新增部分统计（CJK 字符数 / UTF-8 字节数） */
+  addedCjk: number;
+  diffBytes: number;
+  /** 本次 LLM 调用的 Token 用量（含缓存命中），用于 debugLog 成本核对 */
+  usage: TokenUsage;
   /** 确定性检查（参考文献 URL 可达性）规模：检查数 / 异常数 / 新增引用统计 */
   linkCheck: {
     checked: number;
@@ -1166,21 +1229,118 @@ type AiArticleAnalysis = {
 };
 
 /**
- * 任务三（3-1）单条目分析：读取该条目本次扫描合并的全部差异（一个条目只请求一次 LLM），
- * 并按 24 小时复用窗口决定是否附带条目当前版本正文。
+ * analyzeArticle 的三种结局。
  *
- * 差异读取失败的单条编辑会被跳过；全部差异都无法读取时返回 null（不消耗模型配额）。
+ * 区分它们是为了让调用方正确处理「幂等标记」：
+ * - analyzed：已送检 LLM，全部 revid 记为已分析；
+ * - skipped-cjk：全部差异的新增 CJK 都不足门槛，按规则永久跳过，同样记为已分析（否则
+ *   轮询重叠窗口会把同一批小额编辑反复读一遍差异、白跑 API）；
+ * - no-diff：没有任何可读差异（可能是 API 抖动），**不标记**已分析，留给后续扫描重试。
+ */
+type AiArticleOutcome =
+  | {
+      status: "analyzed";
+      analysis: AiArticleAnalysis;
+      /** 被新增 CJK 门槛跳过、未送检的差异 */
+      skippedDiffs: AiDiffRef[];
+      /** 送检差异中因过长被截断的条数（截断会使 CJK 计数偏小） */
+      truncatedDiffs: number;
+    }
+  | {
+      status: "skipped-cjk";
+      skippedDiffs: AiDiffRef[];
+      /** 被跳过差异的新增 CJK 字符数合计（供 debugLog 展示真实体量） */
+      addedCjk: number;
+      /** 被跳过差异的文本字节数合计 */
+      diffBytes: number;
+    }
+  | { status: "no-diff" };
+
+/** 单条 diff 读取完成后的度量信息（用于统计表与 debugLog）。 */
+type DiffMeasurement = {
+  ref: AiDiffRef;
+  /** 送检输入（含差异文本）；发送时仍会按总量预算截断 */
+  input: AiDiffInput;
+  cjkChars: number;
+  addedBytes: number;
+  diffBytes: number;
+  truncated: boolean;
+};
+
+/**
+ * 记录一批 3-1 扫描统计行（写入 ai_scan_stats）。
+ *
+ * `clues` 与 Token 用量只记在该条目第一条已送检的 diff 行上（见 db.ts 迁移注释），
+ * 因此按桶 `SUM(...)` 即为该桶总数，不会因一个条目含多条 diff 而重复计数。
+ */
+function recordScanStats(
+  ctx: HandlerContext,
+  rows: {
+    scanTime: string;
+    revid: number;
+    title: string;
+    measurement: DiffMeasurement;
+    analyzed: boolean;
+    skipReason?: string;
+    clues?: number;
+    tokens?: TokenUsage;
+  }[],
+): void {
+  if (rows.length === 0) return;
+  const { db } = ctx;
+  const insert = db.prepare(
+    `INSERT INTO ai_scan_stats(
+       scan_time, revid, title, canonical_title, cjk_chars, added_bytes, diff_bytes,
+       bucket, analyzed, skip_reason, clues,
+       input_tokens, output_tokens, total_tokens, cached_input_tokens, created_at
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  );
+  const createdAt = new Date().toISOString();
+  runInTransaction(db, () => {
+    for (const row of rows) {
+      insert.run(
+        row.scanTime,
+        row.revid,
+        row.title,
+        canonicalTitle(row.title),
+        row.measurement.cjkChars,
+        row.measurement.addedBytes,
+        row.measurement.diffBytes,
+        cjkBucket(row.measurement.cjkChars),
+        row.analyzed ? 1 : 0,
+        row.skipReason ?? null,
+        row.clues ?? 0,
+        row.tokens?.inputTokens ?? 0,
+        row.tokens?.outputTokens ?? 0,
+        row.tokens?.totalTokens ?? 0,
+        row.tokens?.cachedInputTokens ?? 0,
+        createdAt,
+      );
+    }
+  });
+}
+
+/**
+ * 任务三（3-1）单条目分析：读取该条目本次扫描合并的全部差异（一个条目只请求一次 LLM）。
+ *
+ * 两条与成本直接相关的规则：
+ * 1. **只送编辑差异，不送条目全文**——正文仅用于程序化的参考文献链接检查（不消耗 token）；
+ * 2. **新增部分 CJK 字符不足的差异不送检**（MIN_ADDED_CJK_CHARS）——但会记入 ai_scan_stats
+ *    并在 debugLog 中留痕；若一个条目的差异全部不足门槛，该条目整体跳过（同样留痕）。
+ *
+ * 差异读取失败的单条编辑会被跳过；全部差异都无法读取时返回 no-diff（不消耗模型配额）。
  */
 async function analyzeArticle(
   ctx: HandlerContext,
   agg: ArticleAgg,
   ruleContent: string,
-): Promise<AiArticleAnalysis | null> {
-  const { db, bot, log } = ctx;
+  scanTime: string,
+): Promise<AiArticleOutcome> {
+  const { bot, log } = ctx;
 
-  // 1. 读取该条目本次扫描涉及的全部差异（同一目多条差异合并为一次送检）。
-  const diffInputs: AiDiffInput[] = [];
-  const diffs: AiDiffRef[] = [];
+  // 1. 读取该条目本次扫描涉及的全部差异，并统计每条差异的体量（读取失败的单条编辑跳过）。
+  const measurements: DiffMeasurement[] = [];
+  const unreadable: number[] = [];
   for (const edit of agg.edits) {
     try {
       const diff = await revisionDiff(bot, edit.revid);
@@ -1189,78 +1349,145 @@ async function analyzeArticle(
           { title: agg.title, revid: edit.revid },
           "aiEdit 3-1 skip unreadable diff",
         );
+        unreadable.push(edit.revid);
         continue;
       }
-      diffInputs.push(toDiffInput(diff));
-      // 以修订本身的编者为准（RC 上报的编者仅作兜底），避免报告链接到错误的贡献页
-      diffs.push({ revid: edit.revid, user: diff.user ?? edit.user });
+      const added = addedDiffStats(diff.diffText);
+      measurements.push({
+        // 以修订本身的编者为准（RC 上报的编者仅作兜底），避免报告链接到错误的贡献页
+        ref: { revid: edit.revid, user: diff.user ?? edit.user },
+        input: toDiffInput(diff),
+        cjkChars: added.cjkChars,
+        addedBytes: added.bytes,
+        diffBytes: Buffer.byteLength(diff.diffText, "utf8"),
+        truncated: !!diff.truncated,
+      });
     } catch (err) {
       log.warn(
         { err, title: agg.title, revid: edit.revid },
         "aiEdit 3-1 failed to read diff",
       );
+      unreadable.push(edit.revid);
     }
   }
-  if (diffInputs.length === 0) {
+  if (measurements.length === 0) {
     log.info(
       { title: agg.title, revids: agg.edits.map((e) => e.revid) },
       "aiEdit 3-1 skip article without any readable diff",
     );
-    return null;
+    // 全部差异都读不到（可能是 API 抖动）：不写统计、不标记已分析，留给下一轮重试
+    return { status: "no-diff" };
   }
 
-  // 2. 读取条目当前版本正文（跟随重定向），并按窗口/长度决定是否附带送检。
-  //    fullText 保留完整正文：除了（可选地）送检模型，还用于程序化的参考文献链接检查
-  //    （链接检查不消耗 token，因此与「本次是否把完整正文送给模型」无关）。
-  const canonical = canonicalTitle(agg.title);
+  // 2. 新增 CJK 不足门槛的差异不送检 LLM（跳过检查），但逐条记录留痕。
+  const kept = measurements.filter((m) => m.cjkChars > MIN_ADDED_CJK_CHARS);
+  const dropped = measurements.filter((m) => m.cjkChars <= MIN_ADDED_CJK_CHARS);
+  const unreadableRows = unreadable.map((revid) => ({
+    scanTime,
+    revid,
+    title: agg.title,
+    measurement: {
+      ref: { revid },
+      input: { revid, diffText: "" },
+      cjkChars: 0,
+      addedBytes: 0,
+      diffBytes: 0,
+      truncated: false,
+    },
+    analyzed: false,
+    skipReason: "diff-unreadable",
+  }));
+
+  if (kept.length === 0) {
+    log.info(
+      {
+        title: agg.title,
+        revids: dropped.map((m) => m.ref.revid),
+        minAddedCjk: MIN_ADDED_CJK_CHARS,
+      },
+      "aiEdit 3-1 skip article: added CJK below threshold",
+    );
+    recordScanStats(ctx, [
+      ...dropped.map((m) => ({
+        scanTime,
+        revid: m.ref.revid,
+        title: agg.title,
+        measurement: m,
+        analyzed: false,
+        skipReason: "added-cjk-below-threshold",
+      })),
+      ...unreadableRows,
+    ]);
+    return {
+      status: "skipped-cjk",
+      skippedDiffs: dropped.map((m) => m.ref),
+      // 供 debugLog 如实展示被跳过差异的体量（很小，但记录下来才可核对门槛是否合理）
+      addedCjk: dropped.reduce((sum, m) => sum + m.cjkChars, 0),
+      diffBytes: dropped.reduce((sum, m) => sum + m.diffBytes, 0),
+    };
+  }
+
+  // 3. 读取条目当前版本正文：**只用于程序化链接检查**（不消耗 token），
+  //    不再随请求送给模型——这是本次成本优化的第一项（只送差异）。
   const page = await bot.read(agg.title, { redirects: true });
   const fullText: string | undefined =
     page?.revisions?.[0]?.content ?? undefined;
-  let content: string | undefined = fullText;
   const revid = page?.revisions?.[0]?.revid;
 
-  if (!content || content.trim().length === 0) {
-    content = undefined;
-  } else if (content.length > MAX_ARTICLE_CHARS) {
-    log.info(
-      { title: agg.title, length: content.length },
-      "aiEdit 3-1 oversized article, sending diff only",
-    );
-    content = undefined;
-  } else if (!shouldSendFullArticle(db, canonical)) {
-    log.info(
-      { title: agg.title },
-      "aiEdit 3-1 article sent within reuse window, sending diff only",
-    );
-    content = undefined;
-  }
-
-  // 3. 送检前记录「完整条目」发送时间，供后续 24 小时窗口复用判断。
-  if (content) markFullArticleSent(db, canonical, agg.title);
-
+  const usageTracker = createTokenUsage();
   const outcome = await analyzeWithReferenceLinks(ctx, {
     phase: "3-1",
     title: agg.title,
     revid,
-    content,
+    // 刻意不传 content：条目全文不送模型
     wikitext: fullText,
-    diffs: diffInputs,
+    diffs: kept.map((m) => m.input),
     ruleContent,
-    usageTracker: createTokenUsage(),
+    usageTracker,
   });
   const result = outcome.result;
 
+  // 4. 逐条记录统计：被门槛跳过的与已送检的分开标记；线索数只记在首条已送检差异上。
+  recordScanStats(ctx, [
+    ...dropped.map((m) => ({
+      scanTime,
+      revid: m.ref.revid,
+      title: agg.title,
+      measurement: m,
+      analyzed: false,
+      skipReason: "added-cjk-below-threshold",
+    })),
+    ...kept.map((m, index) => ({
+      scanTime,
+      revid: m.ref.revid,
+      title: agg.title,
+      measurement: m,
+      analyzed: true,
+      // 线索数与 Token 只记在首条已送检差异上（一次 LLM 调用的结果归属该条目）
+      clues: index === 0 ? result.issues.length : 0,
+      tokens: index === 0 ? { ...usageTracker } : undefined,
+    })),
+    ...unreadableRows,
+  ]);
+
   return {
-    confidence: result.confidence,
-    summary: result.summary,
-    issues: result.issues,
-    diffs,
-    withContent: !!content,
-    linkCheck: {
-      checked: outcome.linkCheck?.checked ?? 0,
-      suspect: outcome.linkCheck?.suspect.length ?? 0,
-      unresolved: outcome.linkCheck?.unresolved.length,
-      stats: outcome.linkCheck?.report.stats,
+    status: "analyzed",
+    skippedDiffs: dropped.map((m) => m.ref),
+    truncatedDiffs: kept.filter((m) => m.truncated).length,
+    analysis: {
+      confidence: result.confidence,
+      summary: result.summary,
+      issues: result.issues,
+      diffs: kept.map((m) => m.ref),
+      addedCjk: kept.reduce((sum, m) => sum + m.cjkChars, 0),
+      diffBytes: kept.reduce((sum, m) => sum + m.diffBytes, 0),
+      usage: { ...usageTracker },
+      linkCheck: {
+        checked: outcome.linkCheck?.checked ?? 0,
+        suspect: outcome.linkCheck?.suspect.length ?? 0,
+        unresolved: outcome.linkCheck?.unresolved.length,
+        stats: outcome.linkCheck?.report.stats,
+      },
     },
   };
 }
@@ -1276,18 +1503,20 @@ async function analyzeArticle(
  * 2. 仅保留纯条目命名空间（ns 0）的 edit / new 编辑。
  * 3. 忽略机器人 / 机器用户（bot 标志、匿名 IP）编辑，忽略标签为 AWB、Twinkle、回退功能的编辑。
  * 4. 单条 diff 净增加量小于 100 字节的排除；同一条目的多次编辑按条目名称合并。
- * 5. 对涉及变化的条目，读取其本次全部差异并合并为一次送检（一个条目一轮只请求一次 LLM）；
- *    条目当前版本正文仅在 24 小时复用窗口之外（且长度未超限）时附带，否则只送差异。
+ * 5. 对涉及变化的条目，读取其本次全部差异（一个条目一轮只请求一次 LLM）；
+ *    **只送编辑差异，不送条目全文**（正文仅供程序化链接检查）；
+ *    新增部分 CJK 字符数不足 MIN_ADDED_CJK_CHARS 的差异跳过检查，但逐条记录留痕。
  * 6. 先执行一次不依赖 LLM 的确定性检查（提取条目参考文献 / 外部链接中的 URL 探测可达性；
  *    模板已提供 archive-url 或 url-status=dead 的原链接不算问题；结果缓存在 citation_links 表，
  *    复用窗口内不重复探测）；随后按 rulePage 规则调用 LLM，并把链接检查结果（deadUrls + stats）
  *    一并送检；最后程序自己也记一条「URL 无法访问」线索（单个 low、多个 medium）。
- * 7. 结构化结果写入 ai_edit_reports 表，并由程序拼接文字追加到 tasks.aiEdit.debugLog。
+ * 7. 结构化结果写入 ai_edit_reports 表；成本度量写入 ai_scan_stats 表；
+ *    两部分（含每条 diff 的字节数、新增 CJK 数与 Token 用量）都由程序拼接文字追加到
+ *    tasks.aiEdit.debugLog，供人工核对「跳过规则到底省下了多少」。
  *
  * 幂等与预算：
- * - 每个已送审 revid 记入 ai_analyzed，跨扫描不重复消耗模型配额。
+ * - 每个已处理 revid 记入 ai_analyzed，跨扫描（含轮询重叠窗口）不重复读取差异 / 消耗配额。
  * - 每次扫描最多送审 maxAnalysesPerWindow 个条目，优先处理较新的修订，防止预算失控。
- * - 同一条目 24 小时内只整篇送审一次（ai_edit_sends），其后仅送编辑差异。
  * - 扫描完成后推进 checkpoint；单个条目失败不阻塞整体扫描（失败条目同样标记已分析）。
  */
 export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
@@ -1409,17 +1638,40 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
   const ruleContent = await loadAiRules(ctx);
   const scanIso = scanEnd.toISOString();
   const debugParts: string[] = [`# ${formatUtcMinute(scanEnd)}`, ""];
+  let skippedByCjk = 0;
 
   for (const agg of toAnalyze) {
     try {
-      const result = await analyzeArticle(ctx, agg, ruleContent);
-      if (!result) continue;
+      const outcome = await analyzeArticle(ctx, agg, ruleContent, scanIso);
 
+      // 全部差异都读不到（可能只是 API 抖动）：本次不动幂等标记，留给下一轮重试。
+      if (outcome.status === "no-diff") continue;
+
+      // 已作出决定（送检或按规则跳过）：把本条目的全部 revid 记为已分析，
+      // 避免轮询重叠窗口把同一批小额编辑反复读一遍差异。
       runInTransaction(db, () => {
         for (const edit of agg.edits)
           db.prepare(
             "INSERT OR IGNORE INTO ai_analyzed(revid,window_start) VALUES(?,?)",
           ).run(edit.revid, scanIso);
+      });
+
+      if (outcome.status === "skipped-cjk") {
+        skippedByCjk += outcome.skippedDiffs.length;
+        debugParts.push(
+          renderDebugEntry(agg.title, outcome.skippedDiffs, null, {
+            addedCjk: outcome.addedCjk,
+            diffBytes: outcome.diffBytes,
+            skipReason: `新增 CJK ≤ ${MIN_ADDED_CJK_CHARS}，未送检 LLM（已记入 ai_scan_stats）`,
+          }),
+        );
+        continue;
+      }
+
+      const result = outcome.analysis;
+      skippedByCjk += outcome.skippedDiffs.length;
+
+      runInTransaction(db, () => {
         db.prepare(
           `INSERT INTO ai_edit_reports(title,canonical_title,scan_time,diffs,confidence,summary,issues,created_at)
            VALUES(?,?,?,?,?,?,?,?)`,
@@ -1437,7 +1689,11 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
 
       debugParts.push(
         renderDebugEntry(agg.title, result.diffs, result, {
-          withContent: result.withContent,
+          addedCjk: result.addedCjk,
+          diffBytes: result.diffBytes,
+          usage: result.usage,
+          skippedDiffs: outcome.skippedDiffs,
+          truncatedDiffs: outcome.truncatedDiffs,
           linkCheck: result.linkCheck,
         }),
       );
@@ -1456,8 +1712,82 @@ export async function scanAiEdits(ctx: HandlerContext): Promise<void> {
     }
   }
 
+  // 本次扫描的成本汇总（数据源与每日汇总表相同：ai_scan_stats）。
+  debugParts.push(
+    renderScanTotals(db, scanIso, {
+      fetched: unique.length,
+      shortDiffs,
+      candidates: toAnalyze.length,
+      skippedByCjk,
+    }),
+  );
+
   appendDebugLog(ai.debugLog, `${debugParts.join("\n")}\n`, log);
   markCheckpoint();
+}
+
+/** 本次扫描的汇总数据（写入 debugLog，供人工核对扫描规模与成本）。 */
+type ScanTotals = {
+  /** RecentChanges 返回的变更总数 */
+  fetched: number;
+  /** 因净增量不足 100 字节而排除的编辑数 */
+  shortDiffs: number;
+  /** 本次实际进入分析的候选条目数 */
+  candidates: number;
+  /** 因新增 CJK 不足门槛而跳过送检的差异数 */
+  skippedByCjk: number;
+};
+
+/**
+ * 渲染一次扫描的成本汇总块（追加在本次扫描的条目明细之后）。
+ *
+ * edits / analyzed / clues / tokens 直接来自 ai_scan_stats，与每日汇总表口径一致。
+ */
+function renderScanTotals(
+  db: DatabaseSync,
+  scanIso: string,
+  totals: ScanTotals,
+): string {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS edits,
+              COALESCE(SUM(analyzed), 0) AS analyzed,
+              COALESCE(SUM(clues), 0) AS clues,
+              COALESCE(SUM(input_tokens), 0) AS inputTokens,
+              COALESCE(SUM(output_tokens), 0) AS outputTokens,
+              COALESCE(SUM(total_tokens), 0) AS totalTokens,
+              COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens
+       FROM ai_scan_stats WHERE scan_time = ?`,
+    )
+    .get(scanIso) as
+    | {
+        edits: number;
+        analyzed: number;
+        clues: number;
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        cachedInputTokens: number;
+      }
+    | undefined;
+  const edits = row?.edits ?? 0;
+  const analyzed = row?.analyzed ?? 0;
+  const clues = row?.clues ?? 0;
+
+  return [
+    "## 本次扫描汇总",
+    "",
+    `* 变更: ${totals.fetched}；净增量不足 ${MIN_DIFF_GROWTH_BYTES} 字节排除: ${totals.shortDiffs}；候选条目: ${totals.candidates}`,
+    `* 差异: 读取 ${edits} 条，送检 ${analyzed} 条，跳过 ${edits - analyzed} 条（其中新增 CJK ≤ ${MIN_ADDED_CJK_CHARS}: ${totals.skippedByCjk}）`,
+    `* 线索: ${clues}`,
+    `* tokens: ${formatTokenUsageDetailed({
+      inputTokens: row?.inputTokens ?? 0,
+      outputTokens: row?.outputTokens ?? 0,
+      totalTokens: row?.totalTokens ?? 0,
+      cachedInputTokens: row?.cachedInputTokens ?? 0,
+    })}`,
+    "",
+  ].join("\n");
 }
 
 /**
@@ -1747,4 +2077,174 @@ export async function publishAiReports(ctx: HandlerContext): Promise<void> {
   }
 
   await updateCheckuserPage(ctx, usersPage, ai.minConfidence);
+}
+
+// ---------------------------------------------------------------------------
+// 3-1 扫描成本每日汇总（写入 tasks.aiEdit.debugLog）
+// ---------------------------------------------------------------------------
+
+/** 每日汇总的位点键前缀：记录最近一次汇总时刻，避免重复汇总同一批数据。 */
+const SUMMARY_CHECKPOINT_PREFIX = "ai-scan-summary:";
+
+/** 两次汇总之间的最小间隔（20 小时）：频繁发版重启 / 重复登记时不会把同一批数据反复汇总。 */
+const MIN_SUMMARY_INTERVAL_MS = 20 * 3600 * 1000;
+
+/** 首次运行（没有汇总位点）时的回看窗口：最近 24 小时。 */
+const DEFAULT_SUMMARY_WINDOW_MS = 24 * 3600 * 1000;
+
+/** 单个 CJK 分桶的聚合结果。 */
+type ScanBucketRow = {
+  bucket: string;
+  edits: number;
+  analyzed: number;
+  clues: number;
+};
+
+/**
+ * 把分桶统计渲染为定宽表格（标签左对齐、数字右对齐），与需求示例一致：
+ *
+ * ```
+ * cjk        edits   analyzed   clues
+ * <100        1842       1842       0
+ * 100–300      721        721       2
+ * ```
+ *
+ * 四个桶固定按 CJK_BUCKETS 顺序输出（缺失的桶补 0），便于逐日纵向比对。
+ */
+export function renderScanStatsTable(rows: ScanBucketRow[]): string {
+  const byBucket = new Map(rows.map((row) => [row.bucket, row]));
+  const body = CJK_BUCKETS.map((label) => {
+    const row = byBucket.get(label);
+    return [
+      label,
+      String(row?.edits ?? 0),
+      String(row?.analyzed ?? 0),
+      String(row?.clues ?? 0),
+    ];
+  });
+  const headers = ["cjk", "edits", "analyzed", "clues"];
+  const widths = headers.map((header, index) =>
+    Math.max(header.length, ...body.map((line) => line[index].length)),
+  );
+  const format = (cells: string[]) =>
+    cells
+      .map((value, index) =>
+        index === 0
+          ? value.padEnd(widths[index])
+          : value.padStart(widths[index]),
+      )
+      .join("   ");
+  return [format(headers), ...body.map(format)].join("\n");
+}
+
+/**
+ * 任务三（3-1）扫描成本的每日汇总：把最近一段时间的扫描统计（按新增 CJK 分桶的
+ * edits / analyzed / clues）追加到 tasks.aiEdit.debugLog。
+ *
+ * 数据源是 ai_scan_stats 表（scanAiEdits 每次扫描写入），因此汇总口径与「跳过规则」完全一致：
+ * `edits` 为实际读取到差异的编辑数，`analyzed` 为其中真正送检 LLM 的数量，
+ * 两者之差即被跳过（新增 CJK ≤ MIN_ADDED_CJK_CHARS，或差异不可读取）的数量。
+ *
+ * 幂等：以 checkpoint 记录最近一次汇总时刻，20 小时内重复触发直接跳过，
+ * 避免频繁重启 / 重复登记定时任务时把同一批数据反复写进日志。
+ * 未配置 debugLog 时不生效（没有汇总目标）。
+ */
+export async function writeAiScanDailySummary(
+  ctx: HandlerContext,
+  now = new Date(),
+): Promise<void> {
+  const { db, cfg, log } = ctx;
+  const ai = cfg.tasks.aiEdit;
+  if (!ai.enabled || !ai.debugLog) return;
+
+  const key = `${SUMMARY_CHECKPOINT_PREFIX}${cfg.wiki.apiUrl}:${cfg.wiki.wikiId ?? "default"}`;
+  const previous = (
+    db.prepare("SELECT timestamp FROM checkpoint WHERE name=?").get(key) as
+      { timestamp?: string } | undefined
+  )?.timestamp;
+  const previousMs = previous ? Date.parse(previous) : Number.NaN;
+
+  if (
+    Number.isFinite(previousMs) &&
+    now.getTime() - previousMs < MIN_SUMMARY_INTERVAL_MS
+  ) {
+    log.info(
+      { key, previous, now: now.toISOString() },
+      "aiEdit 3-1 daily summary skipped: previous summary is too recent",
+    );
+    return;
+  }
+
+  const sinceMs = Number.isFinite(previousMs)
+    ? previousMs
+    : now.getTime() - DEFAULT_SUMMARY_WINDOW_MS;
+  const sinceIso = new Date(sinceMs).toISOString();
+
+  // scan_time 为 ISO 8601 UTC 字符串，字典序即时间序，可直接比较。
+  const rows = db
+    .prepare(
+      `SELECT bucket,
+              COUNT(*) AS edits,
+              COALESCE(SUM(analyzed), 0) AS analyzed,
+              COALESCE(SUM(clues), 0) AS clues,
+              COALESCE(SUM(input_tokens), 0) AS inputTokens,
+              COALESCE(SUM(output_tokens), 0) AS outputTokens,
+              COALESCE(SUM(total_tokens), 0) AS totalTokens,
+              COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens
+       FROM ai_scan_stats
+       WHERE scan_time > ? AND scan_time <= ?
+       GROUP BY bucket`,
+    )
+    .all(sinceIso, now.toISOString()) as (ScanBucketRow & {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    cachedInputTokens: number;
+  })[];
+
+  const total = rows.reduce(
+    (sum, row) => ({
+      edits: sum.edits + row.edits,
+      analyzed: sum.analyzed + row.analyzed,
+      clues: sum.clues + row.clues,
+      inputTokens: sum.inputTokens + row.inputTokens,
+      outputTokens: sum.outputTokens + row.outputTokens,
+      totalTokens: sum.totalTokens + row.totalTokens,
+      cachedInputTokens: sum.cachedInputTokens + row.cachedInputTokens,
+    }),
+    {
+      edits: 0,
+      analyzed: 0,
+      clues: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cachedInputTokens: 0,
+    },
+  );
+
+  const text = [
+    `## 3-1 每日统计（${formatUtcMinute(new Date(sinceMs))} → ${formatUtcMinute(now)} UTC）`,
+    "",
+    renderScanStatsTable(rows),
+    "",
+    `* 合计: edits ${total.edits} / analyzed ${total.analyzed} / skipped ${total.edits - total.analyzed} / clues ${total.clues}`,
+    `* tokens: ${formatTokenUsageDetailed({
+      inputTokens: total.inputTokens,
+      outputTokens: total.outputTokens,
+      totalTokens: total.totalTokens,
+      cachedInputTokens: total.cachedInputTokens,
+    })}`,
+    "",
+  ].join("\n");
+
+  appendDebugLog(ai.debugLog, `${text}\n`, log);
+  db.prepare(
+    "INSERT OR REPLACE INTO checkpoint(name,event_id,timestamp,last_revid) VALUES(?,?,?,?)",
+  ).run(key, null, now.toISOString(), null);
+
+  log.info(
+    { key, since: sinceIso, until: now.toISOString(), rows, total },
+    "aiEdit 3-1 daily scan summary written",
+  );
 }
