@@ -15,6 +15,7 @@ import {
   type TokenUsage,
 } from "./llm.js";
 import { replyNotDone, type RequestSectionRef } from "./requestWorkflow.js";
+import { withWikiPageLock } from "./pageWriteLock.js";
 import type { HandlerContext } from "../handle.js";
 
 /**
@@ -390,12 +391,13 @@ ${candidates.map((candidate) => formatCandidateForMerge(candidate, mergeFields))
   try {
     const mergePassOutput = await executeWithFallback(
       models,
-      async (modelInstance) => {
+      async (modelInstance, _spec, signal) => {
         const res = await generateObject({
           model: modelInstance,
           schema: mergeDecisionSchema,
           system: systemPrompt,
           prompt: mergePrompt,
+          abortSignal: signal,
         });
         return { result: res.object, usage: res.usage };
       },
@@ -443,13 +445,14 @@ export async function inferIntendedArticleName(
   try {
     const { result } = await executeWithFallback(
       models,
-      async (modelInstance) => {
+      async (modelInstance, _spec, signal) => {
         const res = await generateObject({
           model: modelInstance,
           schema: intendedNameSchema,
           system:
             "你是一个维基百科条目标题推断助手。根据用户草稿页面标题、导言区和正文内容，判断该草稿预期对应的正式维基百科条目名称（无需命名空间前缀）。如果无法确定，请将 confidence 设为 low，并将 name 设为空字符串。",
           prompt: `草稿页面：${article}\n正文片段：\n${sampleContent}`,
+          abortSignal: signal,
         });
         return { result: res.object, usage: res.usage };
       },
@@ -759,12 +762,13 @@ export async function runArticleReviewEngine<
   const globalPrompt = buildGlobalPrompt();
   const globalPassOutput = await executeWithFallback(
     models,
-    async (modelInstance) => {
+    async (modelInstance, _spec, signal) => {
       const res = await generateObject({
         model: modelInstance,
         schema: resultSchema,
         system: globalSystemPrompt,
         prompt: globalPrompt,
+        abortSignal: signal,
       });
       return { result: res.object, usage: res.usage };
     },
@@ -818,12 +822,13 @@ export async function runArticleReviewEngine<
         const chunkPrompt = buildChunkPrompt(chunk);
         const chunkPassOutput = await executeWithFallback(
           models,
-          async (modelInstance) => {
+          async (modelInstance, _spec, signal) => {
             const res = await generateObject({
               model: modelInstance,
               schema: chunkSchema,
               system: chunkSystemPrompt,
               prompt: chunkPrompt,
+              abortSignal: signal,
             });
             return { result: res.object, usage: res.usage };
           },
@@ -892,6 +897,24 @@ export async function runArticleReviewEngine<
 // ---------------------------------------------------------------------------
 // 5. 结果页写入与请求回报
 // ---------------------------------------------------------------------------
+
+/**
+ * 结果页写入临界区。
+ *
+ * 「读取结果页现有章节 → 生成唯一日期章节标题 → 全量写回」必须原子完成：
+ * 同一提交人的多笔请求会汇总到同一结果页（如 `<talkPage>/YYYYMMDD-<user>`），
+ * 并发执行时两边读到的都是同一份旧内容，生成出同样的章节标题，后写的一方会覆盖前一方。
+ *
+ * 与 requestWorkflow 的章节回报共用同一把页面互斥锁；调用方请遵守
+ * 「先结果页、后讨论页」的加锁顺序，避免嵌套死锁。
+ */
+export function withResultPageLock<T>(
+  ctx: HandlerContext,
+  resultPageTitle: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  return withWikiPageLock(ctx.log, resultPageTitle, "result page", task);
+}
 
 /**
  * 计算结果页应使用的唯一日期章节标题（读取现有结果页后生成）。

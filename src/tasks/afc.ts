@@ -32,6 +32,7 @@ import {
   publishReviewResult,
   rejectArticleRequest,
   runArticleReviewEngine,
+  withResultPageLock,
   type ArticleRequestBase,
   type ArticleReviewOutcome,
 } from "../utils/articleReview.js";
@@ -953,73 +954,81 @@ export async function processAfcRequest(
   const resultPageTitle = `${task.talkPage}/${resultName}`;
   const now = new Date();
   const baseDateTitle = `${now.getUTCFullYear()}年${now.getUTCMonth() + 1}月${now.getUTCDate()}日`;
-  const actualSectionTitle = await planResultSectionTitle(
-    ctx,
-    resultPageTitle,
-    baseDateTitle,
-  );
   const formattedIssuesWikitext = formatAfcResultWikitext(afcResult);
 
-  if (!cfg.writeEnabled) {
-    log.info(
-      {
-        revid,
-        fixedArticleTitle,
-        fixedRevid,
-        resultPageTitle,
-        actualSectionTitle,
-        afcResult,
-        usage: usageTracker,
-        model: modelUsed,
-      },
-      "dry run (afc review completed)",
-    );
+  // 结果页「读取现有章节 → 生成唯一章节标题 → 全量写回」必须原子完成（同提交人的多笔请求共用同一结果页）
+  let actualSectionTitle = "";
+  let resultRevid: number | null = null;
+  let resultWritten = false;
 
-    return;
-  }
-
-  if (!(await canWrite())) {
-    log.info({ revid }, "afc review write cancelled by control page");
-    return;
-  }
-
-  let resultRevid: number | null;
-
-  try {
-    resultRevid = await publishReviewResult(ctx, {
+  await withResultPageLock(ctx, resultPageTitle, async () => {
+    actualSectionTitle = await planResultSectionTitle(
+      ctx,
       resultPageTitle,
-      sectionTitle: actualSectionTitle,
-      fixedRevid,
-      body: formattedIssuesWikitext,
-      summary: `条目发布前评审报告：[[Special:Permalink/${fixedRevid}|${fixedArticleTitle}]] (${actualSectionTitle})`,
-    });
-
-    log.info(
-      { resultPageTitle, resultRevid },
-      "afc result page written successfully",
+      baseDateTitle,
     );
-  } catch (err) {
-    log.error({ err, resultPageTitle }, "failed to write to afc result page");
 
-    recordError(db, {
-      message: "failed to write to afc result page",
-      error: err,
-      context: { revid, resultPageTitle },
-    });
+    if (!cfg.writeEnabled) {
+      log.info(
+        {
+          revid,
+          fixedArticleTitle,
+          fixedRevid,
+          resultPageTitle,
+          actualSectionTitle,
+          afcResult,
+          usage: usageTracker,
+          model: modelUsed,
+        },
+        "dry run (afc review completed)",
+      );
 
-    saveAfcRequest(db, {
-      source_revid: revid,
-      actor_id: actorId,
-      username: actor,
-      article: fixedArticleTitle,
-      article_revid: fixedRevid,
-      status: "failed",
-      utc_day: today,
-      error: "failed_writing_result_page",
-    });
+      return;
+    }
 
-    return;
-  }
+    if (!(await canWrite())) {
+      log.info({ revid }, "afc review write cancelled by control page");
+      return;
+    }
+
+    try {
+      resultRevid = await publishReviewResult(ctx, {
+        resultPageTitle,
+        sectionTitle: actualSectionTitle,
+        fixedRevid,
+        body: formattedIssuesWikitext,
+        summary: `条目发布前评审报告：[[Special:Permalink/${fixedRevid}|${fixedArticleTitle}]] (${actualSectionTitle})`,
+      });
+      resultWritten = true;
+
+      log.info(
+        { resultPageTitle, resultRevid },
+        "afc result page written successfully",
+      );
+    } catch (err) {
+      log.error({ err, resultPageTitle }, "failed to write to afc result page");
+
+      recordError(db, {
+        message: "failed to write to afc result page",
+        error: err,
+        context: { revid, resultPageTitle },
+      });
+
+      saveAfcRequest(db, {
+        source_revid: revid,
+        actor_id: actorId,
+        username: actor,
+        article: fixedArticleTitle,
+        article_revid: fixedRevid,
+        status: "failed",
+        utc_day: today,
+        error: "failed_writing_result_page",
+      });
+    }
+  });
+
+  // dry-run / 控制页熔断 / 写入失败：不继续回报请求章节，交由兜底扫描重试
+  if (!resultWritten) return;
 
   // 8. 完成请求：更新原请求章节模板并回复用户
   const tokenSuffix = cfg.log.responseTokenOnWiki

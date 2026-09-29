@@ -1,8 +1,15 @@
 import type { Logger } from "pino";
 import type { ChangeEvent, HandlerContext, TaskHandler } from "../handle.js";
 import type { AppConfig } from "../config/index.js";
-import { EVENT_SAVE_SQL, EVENT_SEEN_SQL } from "./db.js";
+import {
+  EVENT_CLAIM_SQL,
+  EVENT_SAVE_SQL,
+  isEventDone,
+  readEventState,
+} from "./db.js";
 import { pageText, revision } from "./wiki.js";
+import { withWikiPageLock } from "./pageWriteLock.js";
+import { runWork } from "./workDispatch.js";
 import {
   extractCommentDetails,
   extractSignatures,
@@ -27,6 +34,13 @@ import {
  * 4. 处理结果就地写回请求章节（更新模板 status/结果参数并追加回复），并记录幂等状态。
  *
  * 本模块把上述共性逻辑收敛到一处，各任务只保留自己的业务判定与结果渲染，避免三条链路的行为漂移。
+ *
+ * 两阶段执行（B 档并发架构）：
+ * 1. **认领阶段**：归属判定 → 幂等校验 → 修订与章节定位 → 模板解析 → 身份校验 → 控制页熔断，
+ *    全程只读，并在最后把修订记作 `claimed`。此阶段必须保持轻量。
+ * 2. **工作阶段**：幂等复核（recheckRequestStillPending）→ 请求互斥锁 → 业务处理。
+ *    经 utils/workQueue 按「请求键」调度：同章节串行、异章节/异页面并行，
+ *    因此一笔耗时评审不再阻塞后续请求的认领与执行。
  */
 
 // ---------------------------------------------------------------------------
@@ -72,6 +86,46 @@ function sectionLockKey(talkPage: string, sectionTitle: string): string {
 
 function revidLockKey(revid: number): string {
   return `revid:${revid}`;
+}
+
+/**
+ * 请求级并发键：`<label>:<讨论页>#<章节标题>`。
+ *
+ * 供 utils/workQueue 的键控队列使用：同一请求（同一讨论页同一章节）严格串行，
+ * 不同请求（不同页面或不同章节）可以并行。实时事件路径与兜底扫描路径共用同一键，
+ * 因此两条路径天然互斥，不再依赖旧的「撞锁即跳过」语义。
+ */
+export function requestWorkKey(
+  label: string,
+  talkPage: string,
+  sectionTitle: string,
+): string {
+  return `${label}:${sectionLockKey(talkPage, sectionTitle)}`;
+}
+
+/**
+ * 认领一条变更事件：把修订状态写为 `claimed`，并保存原始事件载荷。
+ *
+ * 这是认领阶段唯一的写库动作。把重活交给并发队列后，事件位点的推进不再等待工作完成，
+ * 因此必须靠这次落库保证「至少一次」语义：重启时由 handle.recoverUnfinishedEvents
+ * 读回这些行并重新派发（工作阶段会回到当前页面复核，故重复派发幂等）。
+ */
+export function claimEvent(
+  ctx: HandlerContext,
+  event: ChangeEvent,
+  revid: number,
+  actorId?: number,
+): void {
+  try {
+    const claim = ctx.claimStatement ?? ctx.db.prepare(EVENT_CLAIM_SQL);
+    claim.run(revid, actorId ?? null, JSON.stringify(event));
+  } catch (error) {
+    // 认领落库失败不应阻断处理：退化为旧行为（仅损失崩溃恢复能力）
+    ctx.log.warn(
+      { err: error, revid },
+      "failed to persist event claim; crash recovery may miss this event",
+    );
+  }
 }
 
 /**
@@ -377,25 +431,37 @@ export async function replyToRequest(
     return null;
   }
 
-  const editResult = await bot.edit(talkPage, ({ content }) => {
-    const currentSections = parseSections(content);
-    const currentSec = findMatchingSection(
-      currentSections,
-      targetSection,
-      comment,
-      templateName,
-    );
-    if (!currentSec) throw new Error("Target section not found");
-    const updatedTemplate = templateUpdates
-      ? updateWikiTemplate(currentSec.content, templateName, templateUpdates)
-      : currentSec.content;
-    const updatedSec = `${updatedTemplate.trimEnd()}${reply ?? ""}\n`;
-    return {
-      text: `${content.slice(0, currentSec.startIndex)}${updatedSec}${content.slice(currentSec.endIndex)}`,
-      summary,
-      bot: true,
-    };
-  });
+  // 同一讨论页可能同时有多笔请求在各自章节回报（不同章节属于不同的并发键）。
+  // 这里按页面串行化「读当前页面 → 就地改写章节」的整个编辑回调，避免丢更新与编辑冲突。
+  const editResult = await withWikiPageLock(
+    log,
+    talkPage,
+    "request reply",
+    () =>
+      bot.edit(talkPage, ({ content }) => {
+        const currentSections = parseSections(content);
+        const currentSec = findMatchingSection(
+          currentSections,
+          targetSection,
+          comment,
+          templateName,
+        );
+        if (!currentSec) throw new Error("Target section not found");
+        const updatedTemplate = templateUpdates
+          ? updateWikiTemplate(
+              currentSec.content,
+              templateName,
+              templateUpdates,
+            )
+          : currentSec.content;
+        const updatedSec = `${updatedTemplate.trimEnd()}${reply ?? ""}\n`;
+        return {
+          text: `${content.slice(0, currentSec.startIndex)}${updatedSec}${content.slice(currentSec.endIndex)}`,
+          summary,
+          bot: true,
+        };
+      }),
+  );
 
   const newrevid = editResult.newrevid ?? null;
   if (event && event.revid > 0) {
@@ -470,8 +536,17 @@ export type IncomingRequestOutcome =
   | { kind: "not-relevant" }
   /** 属于本任务，但已处理/校验失败，无需继续 */
   | { kind: "ignored" }
-  /** 已就地提示「请使用标准模板」（或 dry-run 下仅记录日志） */
-  | { kind: "missing-template" }
+  /**
+   * 缺少标准模板，需要就地去提示正确用法（dry-run 下仅记录日志）。
+   * 提示是一次维基写入，交由工作阶段执行，因此在此携带必要的上下文。
+   */
+  | {
+      kind: "missing-template";
+      revid: number;
+      actorId: number;
+      comment: string;
+      targetSection: SectionInfo;
+    }
   /** 请求有效，交由业务处理 */
   | { kind: "ready"; request: IncomingRequest };
 
@@ -521,8 +596,7 @@ export async function resolveIncomingRequest(
   }
 
   const revid = event.revision!.new!;
-  const seen = ctx.seenStatement ?? db.prepare(EVENT_SEEN_SQL);
-  if ((seen.get(revid) as { state: string } | undefined)?.state === "done") {
+  if (isEventDone(readEventState(db, revid, ctx.seenStatement))) {
     return { kind: "ignored" };
   }
 
@@ -553,29 +627,22 @@ export async function resolveIncomingRequest(
 
   const state = readRequestTemplate(targetSection, templateName);
 
-  // 缺少标准模板：仅在签名与触发修订的编辑者一致时提示正确用法
+  // 缺少标准模板：仅在签名与触发修订的编辑者一致时提示正确用法。
+  // 提示本身就是一次维基写入（重活），因此不在认领阶段执行。
   if (state.count === 0) {
     const signedUsers = extractSignatures(extraction.comment);
     if (!isSignatureMatchingActor(signedUsers, rev.actor)) {
       return { kind: "ignored" };
     }
 
-    if (!cfg.writeEnabled) {
-      log.info({ revid }, `[dry-run] ${label} missing-template reply`);
-      return { kind: "missing-template" };
-    }
-    if (!(await ctx.canWrite())) return { kind: "ignored" };
-
-    await replyToRequest(ctx, {
-      talkPage,
-      templateName,
-      targetSection,
+    claimEvent(ctx, event, revid, rev.actorId);
+    return {
+      kind: "missing-template",
+      revid,
+      actorId: rev.actorId,
       comment: extraction.comment,
-      reply: missingTemplateReply,
-      summary: missingTemplateSummary,
-      event: { revid, actorId: rev.actorId },
-    });
-    return { kind: "missing-template" };
+      targetSection,
+    };
   }
 
   // 同一章节不得同时提交多个请求模板
@@ -607,38 +674,11 @@ export async function resolveIncomingRequest(
     return { kind: "ignored" };
   }
 
-  // 幂等复核（尽力而为）：上面的判定基于触发修订当时的页面内容，但事件可能是位点回放
-  // （进程重启、曾在其它实例上处理过），也可能已被并发实例处理。这里回到「当前页面」确认该请求
-  // 模板是否已处理完成：只有当当前页面确实还在且状态已终结时才跳过，避免重复送去评测
-  // （浪费大量 token）并把回复写进错误章节。页面读取失败或定位不到章节时保持原有行为。
-  try {
-    const currentSection = findMatchingSection(
-      parseSections(await pageText(bot, talkPage)),
-      targetSection,
-      extraction.comment,
-      templateName,
-    );
-    if (currentSection) {
-      const currentState = readRequestTemplate(currentSection, templateName);
-      if (currentState.count !== 1 || currentState.handled) {
-        log.info(
-          {
-            revid,
-            section: targetSection.title,
-            count: currentState.count,
-            status: currentState.status,
-          },
-          `${label} request is already handled or no longer present on the current page, skipping`,
-        );
-        return { kind: "ignored" };
-      }
-    }
-  } catch (err) {
-    log.warn(
-      { err, revid },
-      `${label} failed to re-read talk page for idempotency check`,
-    );
-  }
+  // 幂等复核已移到工作阶段（recheckRequestStillPending）：它必须与实际处理同处一把
+  // 「同键串行锁」内，才能真正关闭「认领 → 执行」之间被另一路抢先完成的时间窗。
+
+  // 认领：位点推进与工作完成解耦后，靠这次落库保证重启后仍能回收未完成的工作。
+  claimEvent(ctx, event, revid, rev.actorId);
 
   return {
     kind: "ready",
@@ -652,6 +692,64 @@ export async function resolveIncomingRequest(
       status: state.status,
     },
   };
+}
+
+/**
+ * 工作阶段的幂等复核（尽力而为）。
+ *
+ * 认领阶段的判定基于触发修订当时的页面内容，但事件可能是位点回放（进程重启、曾在其它实例
+ * 上处理过），也可能在认领后被另一路（兜底扫描 / 上一次运行）处理完毕。执行前回到「当前页面」
+ * 确认该请求模板仍未处理：只有当当前页面确实还在且状态已终结时才跳过，避免重复送去评测
+ * （浪费大量 token）并把回复写进错误章节。页面读取失败或定位不到章节时保持原有行为。
+ */
+export async function recheckRequestStillPending(
+  ctx: HandlerContext,
+  options: {
+    label: string;
+    talkPage: string;
+    templateName: string;
+    revid: number;
+    targetSection: RequestSectionRef;
+    comment: string;
+    /** 判定「仍未处理」的谓词；默认 status 为 done / not done 即视为已处理 */
+    isStillPending?: (status: string) => boolean;
+  },
+): Promise<boolean> {
+  const { bot, log } = ctx;
+  const { label, talkPage, templateName, revid, targetSection, comment } =
+    options;
+  const isStillPending = options.isStillPending ?? ((s) => !isHandledStatus(s));
+
+  try {
+    const currentSection = findMatchingSection(
+      parseSections(await pageText(bot, talkPage)),
+      targetSection,
+      comment,
+      templateName,
+    );
+    if (currentSection) {
+      const currentState = readRequestTemplate(currentSection, templateName);
+      if (currentState.count !== 1 || !isStillPending(currentState.status)) {
+        log.info(
+          {
+            revid,
+            section: targetSection.title,
+            count: currentState.count,
+            status: currentState.status,
+          },
+          `${label} request is already handled or no longer present on the current page, skipping`,
+        );
+        return false;
+      }
+    }
+  } catch (err) {
+    log.warn(
+      { err, revid },
+      `${label} failed to re-read talk page for idempotency check`,
+    );
+  }
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -821,33 +919,59 @@ export async function sweepBacklogRequests(
       continue;
     }
 
-    await runWithRequestLock(
-      lock,
+    // 与实时事件路径共用「请求键」：同一章节恒串行、不同章节可并行，
+    // 因此兜底扫描不会阻塞实时请求，也不会与它们重复处理同一章节。
+    await runWork(
+      ctx,
       {
-        talkPage,
-        sectionTitle: sec.title,
-        revid: requester.revid > 0 ? requester.revid : undefined,
-        note: state.template!.params.article,
+        key: requestWorkKey(label, talkPage, sec.title),
+        label: `${label} backlog`,
       },
-      log,
-      label,
       async () => {
-        try {
-          await process({
-            revid: requester.revid,
-            actor: requester.actor,
-            actorId: requester.actorId,
-            comment: sec.content,
-            targetSection: sec,
-            reqTemplate: state.template!,
-            status: state.status,
-          });
-        } catch (err) {
-          log.error(
-            { err, section: sec.title },
-            `error processing backlogged ${label} request`,
-          );
-        }
+        await runWithRequestLock(
+          lock,
+          {
+            talkPage,
+            sectionTitle: sec.title,
+            revid: requester.revid > 0 ? requester.revid : undefined,
+            note: state.template!.params.article,
+          },
+          log,
+          label,
+          async () => {
+            // 排队期间实时路径可能已处理完该章节（积压扫描判定更保守：任何非空 status 即视为已处理）
+            if (
+              !(await recheckRequestStillPending(ctx, {
+                label,
+                talkPage,
+                templateName,
+                revid: requester.revid,
+                targetSection: sec,
+                comment: sec.content,
+                isStillPending: isBacklogPendingStatus,
+              }))
+            ) {
+              return;
+            }
+
+            try {
+              await process({
+                revid: requester.revid,
+                actor: requester.actor,
+                actorId: requester.actorId,
+                comment: sec.content,
+                targetSection: sec,
+                reqTemplate: state.template!,
+                status: state.status,
+              });
+            } catch (err) {
+              log.error(
+                { err, section: sec.title },
+                `error processing backlogged ${label} request`,
+              );
+            }
+          },
+        );
       },
     );
   }
@@ -879,9 +1003,14 @@ export type TemplateRequestHandlerOptions = {
 };
 
 /**
- * 生成一个「模板请求」任务处理器：公共前置流程（幂等 → 修订 → 留言 → 章节 → 模板 →
- * 身份 → 控制页）→ 请求互斥锁 → 业务处理，并在必要时拦截事件流水线。
+ * 生成一个「模板请求」任务处理器。
  *
+ * 两阶段执行：
+ * - 认领阶段（`await resolveIncomingRequest`）：只读 + 一次认领落库，毫秒~百毫秒级，
+ *   完成即返回 `{ intercepted: true }`，不再把后续事件挡在门外；
+ * - 工作阶段（`runWork` 提交）：幂等复核 → 请求互斥锁 → 业务处理，在键控并发队列中执行。
+ *
+ * 未注入工作队列（ctx.schedule 为空）时 runWork 退化为内联 await，保持旧语义。
  * 任务二、任务三 3-2、任务四的处理器由此统一生成，避免三条链路的入口行为漂移。
  */
 export function createTemplateRequestHandler(
@@ -924,24 +1053,79 @@ export function createTemplateRequestHandler(
     if (outcome.kind === "not-relevant") {
       return { intercepted: false };
     }
-    if (outcome.kind !== "ready") {
+    if (outcome.kind === "ignored") {
+      return { intercepted: true };
+    }
+
+    // 「缺少标准模板」的提示是一次维基写入：同样属于工作阶段
+    if (outcome.kind === "missing-template") {
+      const { revid, actorId, comment, targetSection } = outcome;
+      await runWork(
+        ctx,
+        {
+          key: requestWorkKey(label, page, targetSection.title),
+          label: `${label} missing-template`,
+          revid,
+        },
+        async () => {
+          if (!cfg.writeEnabled) {
+            log.info({ revid }, `[dry-run] ${label} missing-template reply`);
+            return;
+          }
+          if (!(await ctx.canWrite())) return;
+
+          await replyToRequest(ctx, {
+            talkPage: page,
+            templateName: template,
+            targetSection,
+            comment,
+            reply: missingTemplateReply,
+            summary: missingTemplateSummary,
+            event: { revid, actorId },
+          });
+        },
+      );
       return { intercepted: true };
     }
 
     const request = outcome.request;
 
-    await runWithRequestLock(
-      lock,
+    await runWork(
+      ctx,
       {
-        talkPage: page,
-        sectionTitle: request.targetSection.title,
+        key: requestWorkKey(label, page, request.targetSection.title),
+        label: `${label} request`,
         revid: request.revid,
-        note: note?.(request),
       },
-      log,
-      label,
       async () => {
-        await process(ctx, request);
+        await runWithRequestLock(
+          lock,
+          {
+            talkPage: page,
+            sectionTitle: request.targetSection.title,
+            revid: request.revid,
+            note: note?.(request),
+          },
+          log,
+          label,
+          async () => {
+            // 复核与实际处理同处一把锁内，关闭「认领 → 执行」之间的 TOCTOU 窗口
+            if (
+              !(await recheckRequestStillPending(ctx, {
+                label,
+                talkPage: page,
+                templateName: template,
+                revid: request.revid,
+                targetSection: request.targetSection,
+                comment: request.comment,
+              }))
+            ) {
+              return;
+            }
+
+            await process(ctx, request);
+          },
+        );
       },
     );
 

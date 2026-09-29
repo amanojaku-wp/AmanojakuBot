@@ -8,7 +8,8 @@
 
 ## 已决定的技术方案
 
-- MediaWiki：`mwn`；事件模式可配置，中文维基百科默认 Wikimedia EventStreams，其他 API 地址默认通过 `list=recentchanges` 定期轮询机器人讨论页，也可以手工覆盖。轮询按时间窗口增量读取、分页、保留重叠并用修订记录去重（每个 tick 的处理任务经串行队列排队，因此轮询窗口上界固定为 *本次 tick 开始时刻*，避免队列积压期间新增的编辑被永久跳过）；EventStreams 保留 SSE checkpoint（同时记录 lastEventId 与 last_revid），并在 SSE 发生断线/错误时支持按 10/30/60/120/300 秒递增超时的自动重连与 `recentchanges` 遗漏编辑补偿机制（过滤 bot 编辑，向上游提供与 SSE 相同的 ChangeEvent 数据结构）。跨站点使用不同 SQLite 文件。
+- MediaWiki：`mwn`；事件模式可配置，中文维基百科默认 Wikimedia EventStreams，其他 API 地址默认通过 `list=recentchanges` 定期轮询机器人讨论页，也可以手工覆盖。轮询按时间窗口增量读取、分页、保留重叠并用修订记录去重（每个 tick 的处理任务经串行队列排队，因此轮询窗口上界固定为 _本次 tick 开始时刻_，避免队列积压期间新增的编辑被永久跳过）；EventStreams 保留 SSE checkpoint（同时记录 lastEventId 与 last_revid），并在 SSE 发生断线/错误时支持按 10/30/60/120/300 秒递增超时的自动重连与 `recentchanges` 遗漏编辑补偿机制（过滤 bot 编辑，向上游提供与 SSE 相同的 ChangeEvent 数据结构）。跨站点使用不同 SQLite 文件。
+- 并发模型（认领 / 执行分离）：驱动层保留一条**极短的串行认领队列**，只负责「归属判定 + 幂等校验 + 事件位点推进 + 认领落库（`events.state = claimed` + 原始事件载荷）」；LLM 调用与维基写入等重活交给**键控有界并发工作队列**（`utils/workQueue`）：同一讨论页同一章节严格串行（保证页面读-改-写不互相覆盖），不同页面/章节按 `runtime.workConcurrency` 并行。并发已满时任务**排队等待而非丢弃**；认领即落库使「位点推进」与「工作完成」解耦后仍可恢复，进程重启时由 `handle.recoverUnfinishedEvents` 重派（dry-run 下无持久副作用，直接跳过）。同一维基页面的写入（请求章节回报、结果页「读现有章节 → 生成唯一标题 → 全量写回」）经 `utils/pageWriteLock` 串行化，避免丢更新与编辑冲突。LLM 侧另有全局闸门：`runtime.llmMaxConcurrent` 限并发、`runtime.llmTimeoutSeconds` 限单次调用时长。
 - LLM：Vercel AI SDK，provider 配置选择 OpenAI 或 Google；不自建 provider 框架。
 - SQLite + Node 原生 `node:sqlite` (`DatabaseSync`) + 裸 SQL，不使用 ORM。基于 `schema_migrations` 表实现增量 migration 模式管理 schema 版本（支持 timestamp 格式版本号）；`events` 表维护输入/输出 token 与模型记录；`error_logs` 表统一持久化异常日志。YAML + Zod 配置，Pino 日志，Vitest 测试。密钥放环境变量，不写进 Git。
 - 优先现成库；仅在维基语义、业务规则、任务路由处写定制逻辑。
@@ -35,12 +36,14 @@
 
 当前代码已接入三项任务：讨论页聊天（支持插话识别、签名时间戳匹配、二级标题多人会话上下文与就地章节回复）；根据评审链接解析、目标有效性及 UID/UTC 额度记录生成回复；任务三的 3-1 定期动态扫描（按条目聚合其全部差异、一次送检、结构化线索、本地 debugLog 与可选 check/checkuser 发布）与 3-2 模板请求式疑似 AI 分析（article1…article20 + diff1…diff20，按条目合并为「同一条目、不同 diff」后一次送检）。两条链路都送「差异 + 完整条目」，并在 24 小时内复用已送检的完整正文（`ai_edit_sends` 表），超出窗口或正文过长时降级为只送差异。代码已补充完备的详细业务与防误报/安全注释。真实编辑由显式 `writeEnabled: true` 控制，默认 dry-run；尚未在真实站点端到端验证。任务三默认关闭，需显式开启。所有输出只写机器人的讨论页或指定用户子页。评审文本截断、差异文本总量截断、非穷尽的近期变更筛选和过期 SSE checkpoint 缺乏 API 补洞仍是已知限制。不要描述为生产可用。
 
+2026-09-29 并发化改造（认领 / 执行分离）：旧实现把「归属判定」与「把这件事做完」耦合在同一条串行队列里，一笔耗时评审（含多次 LLM 往返）会把后续所有事件与定时任务挡在门外。现在认领阶段只做只读判定 + 一次认领落库并立刻返回，重活交给键控有界并发队列（同页面/同章节串行、异页面并行）。已知取舍：① 认领回收只在 `writeEnabled: true` 时启用，窗口 24 小时（dry-run 无持久副作用，不重放）；② 工作失败会把该修订标为 `failed`，重试依赖下一次事件重复投递或定时兜底扫描（聊天任务没有兜底扫描，失败即无回复）；③ 「缺少标准模板」的提示仍无 wikitext 级去重，崩溃重放可能重复提示一次（改造前同样存在该窗口）；④ 轮询 tick 仍按「跑完才 setTimeout」推进，认领阶段变快后漂移已大幅减小，但未做漂移补偿。
+
 ### 代码目录架构
 
-- `src/index.ts`：系统常驻守护进程入口，负责配置加载、数据库与维基客户端初始化、串行任务队列、统一变更事件监听调用与 cron 定时任务登记。事件监听不区分底层驱动，只调用一次 `startChangeFeed({ mode, cfg, db, bot, log, enqueue, onEvent })`。
-- `src/handle.ts`：变更事件主路由分发器，采用可插拔责任链流水线模式调度各任务 Handler（`[chatHandler, reviewHandler, aiEditHandler, afcHandler]`），支持按 `intercepted` 拦截与错误捕获。
+- `src/index.ts`：系统常驻守护进程入口，负责配置加载、数据库与维基客户端初始化、**两层队列**（串行认领队列 + 键控有界并发工作队列）、统一变更事件监听调用、cron 定时任务登记、运行状态统计日志与优雅停机（SIGTERM/SIGINT 后排空在途工作）。事件监听不区分底层驱动，只调用一次 `startChangeFeed({ mode, cfg, db, bot, log, enqueue, onEvent })`。
+- `src/handle.ts`：变更事件主路由分发器，采用可插拔责任链流水线模式调度各任务 Handler（`[chatHandler, reviewHandler, aiEditHandler, afcHandler]`），支持按 `intercepted` 拦截与错误捕获；并提供 `recoverUnfinishedEvents`（重启后回收上次已认领但未完成的事件）。
 - `src/config/`：配置契约与加载器（`src/config/index.ts`），基于 YAML + Zod 严格校验（含 cron 表达式校验）；Chat 和 Review 任务支持配置在独立的机器人讨论页中运行。
-- `src/utils/`：通用基础设施与工具模块（`db.ts` SQLite存储、`wiki.ts` MediaWiki客户端交互（页面读取、修订元数据与修订差异 `revisionDiff`）、`llm.ts` 大模型调用、`wikitext.ts` 维基文本与讨论页解析、`requestWorkflow.ts` 讨论页模板请求工作流（章节定位 / 请求模板提取 / 请求互斥锁 / 状态回报与回复 / 积压请求兜底扫描 / `createTemplateRequestHandler` 处理器工厂，供任务二、任务三 3-2、任务四共用）、`articleReview.ts` 条目审核流水线（固定版本快照校验、规则页拆分、两阶段审核引擎（全局检查 + 可选局部 Chunk 扫描 + 去重/语义合并）、结果页写入、请求拒绝回报，供任务二 / 任务四共用，任务三 3-2 复用其中的快照与回报能力）、`polling.ts` 近期变更轮询与轮询驱动、`eventstream.ts` EventStreams SSE 驱动、`changeFeed.ts` 两种驱动的统一入口、`schedule.ts` cron 定时调度）。
+- `src/utils/`：通用基础设施与工具模块（`db.ts` SQLite存储（含迁移、事件认领 `EVENT_CLAIM_SQL` 与未完成事件查询 `listUnfinishedEvents`）、`wiki.ts` MediaWiki客户端交互（页面读取、修订元数据与修订差异 `revisionDiff`）、`llm.ts` 大模型调用（多模型降级 + 全局并发闸门与单次超时）、`wikitext.ts` 维基文本与讨论页解析、`requestWorkflow.ts` 讨论页模板请求工作流（章节定位 / 请求模板提取 / 事件认领 / 工作阶段幂等复核 / 请求互斥锁 / 状态回报与回复 / 积压请求兜底扫描 / `createTemplateRequestHandler` 处理器工厂，供任务二、任务三 3-2、任务四共用）、`articleReview.ts` 条目审核流水线（固定版本快照校验、规则页拆分、两阶段审核引擎（全局检查 + 可选局部 Chunk 扫描 + 去重/语义合并）、结果页写入与结果页写入互斥、请求拒绝回报，供任务二 / 任务四共用，任务三 3-2 复用其中的快照与回报能力）、`workQueue.ts` 键控有界并发队列与键控互斥锁、`workDispatch.ts` 后台工作派发（认领后异步执行 / 未注入队列时同步内联）、`pageWriteLock.ts` 页面写入互斥、`polling.ts` 近期变更轮询与轮询驱动、`eventstream.ts` EventStreams SSE 驱动、`changeFeed.ts` 两种驱动的统一入口、`schedule.ts` cron 定时调度）。
 - `src/tasks/`：机器人任务模块，各独立一文件并暴露各自的 `TaskHandler`：
   - `src/tasks/chat.ts`：任务一（讨论页自由对话与章节多用户上下文应答，默认运行在 `User talk:Bot`）
   - `src/tasks/review.ts`：任务二（应请求条目/草稿校对评审，采用“全文全局检查 + 导言/二级/三级标题 Chunk 分块局部高覆盖率扫描 + 确定性/语义去重合并”流水线，与额度管控相配合，默认运行在 `User talk:Bot/review`；审核流水线与章节/模板/锁/回报等交互流程分别复用 `utils/articleReview` 与 `utils/requestWorkflow`）

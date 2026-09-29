@@ -205,8 +205,8 @@ toolforge jobs restart amanojakubot
 
 ```text
 src/
-├── index.ts                  # 守护进程入口：加载配置、打开 DB、登录维基、串行队列、注册 change feed 与 cron
-├── handle.ts                 # 变更事件主路由（责任链流水线，可拦截）
+├── index.ts                  # 守护进程入口：加载配置、打开 DB、登录维基、认领队列 + 工作队列、注册 change feed 与 cron
+├── handle.ts                 # 变更事件主路由（责任链流水线，可拦截）+ 重启后未完成事件回收
 ├── config/
 │   └── index.ts              # YAML + Zod 配置契约与加载器
 ├── tasks/                    # 各业务任务，一个任务一个文件，导出 TaskHandler
@@ -221,8 +221,11 @@ src/
     ├── wikitext.ts           # 维基文本与讨论页解析（签名/时间戳/缩进/章节/模板/回复插入）
     ├── llm.ts                # LLM 调用与多模型降级（executeWithFallback）、token 统计
     ├── llm-wiki-tools.ts     # 提供给模型的维基工具（供聊天任务使用）
-    ├── requestWorkflow.ts    # 模板请求工作流：章节定位、请求提取、互斥锁、状态回报、积压兜底扫描
-    ├── articleReview.ts      # 条目审核流水线：快照校验、规则页解析、两阶段审核引擎、结果页写入
+    ├── requestWorkflow.ts    # 模板请求工作流：章节定位、请求提取、事件认领、幂等复核、状态回报、积压兜底扫描
+    ├── articleReview.ts      # 条目审核流水线：快照校验、规则页解析、两阶段审核引擎、结果页写入（含结果页写入互斥）
+    ├── workQueue.ts          # 键控有界并发队列 + 页面级互斥锁（同键串行、异键并行、不丢任务）
+    ├── workDispatch.ts       # 后台工作派发（认领后异步执行；未注入队列时退化为同步内联）
+    ├── pageWriteLock.ts      # 维基页面写入互斥（同一页面的读-改-写串行，避免丢更新与编辑冲突）
     ├── changeFeed.ts         # 变更事件统一入口（按 mode 分发）
     ├── eventstream.ts        # EventStreams(SSE) 驱动（含 checkpoint、断线重连与补偿）
     ├── polling.ts            # RecentChanges 轮询驱动（窗口增量、分页、重叠去重）
@@ -231,7 +234,13 @@ src/
 
 **运行主链路**：`index.ts` 打开配置与数据库 → `startChangeFeed(...)` 按 `events.mode` 选择 SSE 或轮询 → 每个事件交给 `handle.ts` 的流水线 `[chatHandler, reviewHandler, aiEditHandler, afcHandler]` 依次处理。
 
-**并发模型**：所有事件消费与定时任务都排进同一条串行 `enqueue` 队列，避免 SQLite 写冲突与编辑冲突；单次任务失败只影响该次调用。
+**并发模型（认领 / 执行分离）**：事件驱动的消费路径分成两段，避免一笔耗时评审把后续所有事件与定时任务挡在门外。
+
+- **认领阶段**（驱动层 `enqueue`，极短串行链）：只做「归属判定 + 幂等校验 + 事件位点推进 + 认领落库（`events.state = claimed` + 原始事件载荷）」。该阶段只有同步 SQLite 写入与少量只读请求，毫秒~百毫秒级；位点推进保持严格有序。
+- **工作阶段**（`utils/workQueue` 键控有界并发队列）：LLM 调用与维基写入等重活。**同键（同一讨论页同一章节）严格串行**，保证同一页面的读-改-写不互相覆盖；**异键并行**（并发上限 `runtime.workConcurrency`），所以「讨论页 A 的评审」不再阻塞「讨论页 B 的请求」。
+- **不丢任务**：并发已满时任务排队等待，而不是像旧版请求锁那样「撞锁即跳过」；认领即落库，进程被重启后由 `handle.recoverUnfinishedEvents` 回收重派；单次任务失败只影响该次调用，并把该修订标记为 `failed` 交由定时兜底扫描重试。
+- **页面写入互斥**（`utils/pageWriteLock`）：同一维基页面的读-改-写（请求章节回报、结果页「读现有章节 → 生成唯一标题 → 全量写回」）串行化，避免丢更新与编辑冲突。
+- **限流与超时**：`runtime.llmMaxConcurrent` 限制同时进行的模型调用，`runtime.llmTimeoutSeconds` 为单次调用超时；队列深度与 LLM 闸门占用按 `runtime.statsIntervalSeconds` 输出到日志；收到 SIGTERM/SIGINT 后先排空在途工作再退出。
 
 ---
 

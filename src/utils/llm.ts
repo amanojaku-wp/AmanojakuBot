@@ -59,13 +59,77 @@ export type FallbackRunnerResult<T> =
   { result: T; usage?: PartialTokenUsage; model?: string } | T;
 
 /**
+ * LLM 运行时约束
+ *
+ * 工作队列允许异键任务并行后，同时到达的评审请求可能各自发起 LLM 调用。
+ * 这里在模型调用层再加一道全局闸门：
+ * 1. 并发上限：避免瞬时打爆 provider 的速率限制（429）进而触发整条模型链降级重试；
+ * 2. 单次超时：避免上游挂起时无限占用并发槽位与工作队列槽位。
+ */
+export type LlmRuntimeOptions = {
+  /** 同时进行的 LLM 调用上限 */
+  maxConcurrent: number;
+  /** 单次 LLM 调用超时（毫秒） */
+  timeoutMs: number;
+};
+
+let llmMaxConcurrent = 2;
+let llmTimeoutMs = 180_000;
+let llmActive = 0;
+const llmWaiters: (() => void)[] = [];
+
+/** 由进程入口依据配置注入 LLM 运行时约束（默认：并发 2、超时 3 分钟）。 */
+export function configureLlmRuntime(options: Partial<LlmRuntimeOptions>): void {
+  if (options.maxConcurrent && options.maxConcurrent > 0) {
+    llmMaxConcurrent = Math.max(1, Math.floor(options.maxConcurrent));
+  }
+  if (options.timeoutMs && options.timeoutMs > 0) {
+    llmTimeoutMs = Math.floor(options.timeoutMs);
+  }
+}
+
+/** LLM 闸门当前占用状况（日志与排查用）。 */
+export function llmRuntimeStats(): {
+  maxConcurrent: number;
+  active: number;
+  waiting: number;
+  timeoutMs: number;
+} {
+  return {
+    maxConcurrent: llmMaxConcurrent,
+    active: llmActive,
+    waiting: llmWaiters.length,
+    timeoutMs: llmTimeoutMs,
+  };
+}
+
+/** 获取一个 LLM 调用额度，返回释放函数（幂等，可重复调用）。 */
+async function acquireLlmSlot(): Promise<() => void> {
+  while (llmActive >= llmMaxConcurrent) {
+    await new Promise<void>((resolve) => llmWaiters.push(resolve));
+  }
+  llmActive++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    llmActive--;
+    llmWaiters.shift()?.();
+  };
+}
+
+/**
  * 带有 Fallback 降级重试与 Token 统计累加的 LLM 执行器
+ *
+ * runner 的第三个参数为本次调用的 AbortSignal（超时中断），调用方应透传给 generateText /
+ * generateObject 的 `abortSignal` 参数。
  */
 export async function executeWithFallback<T>(
   models: LlmModelSpec[],
   runner: (
     model: LanguageModel,
     spec: LlmModelSpec,
+    signal: AbortSignal,
   ) => Promise<FallbackRunnerResult<T>>,
   usageTracker?: TokenUsage,
 ): Promise<{
@@ -83,10 +147,12 @@ export async function executeWithFallback<T>(
   let lastError: unknown;
 
   for (const spec of models) {
+    const release = await acquireLlmSlot();
     try {
       const model = getLanguageModel(spec);
       const modelIdentifier = `${spec.provider}/${spec.model}`;
-      const output = await runner(model, spec);
+      const signal = AbortSignal.timeout(llmTimeoutMs);
+      const output = await runner(model, spec, signal);
       if (output !== null && typeof output === "object" && "result" in output) {
         const usage = (output as { usage?: PartialTokenUsage }).usage;
         addTokenUsage(callUsage, usage);
@@ -115,6 +181,8 @@ export async function executeWithFallback<T>(
       }
       lastError = err;
       // 继续尝试下一个模型
+    } finally {
+      release();
     }
   }
 

@@ -100,6 +100,35 @@ export const configSchema = z.object({
       responseTokenOnWiki: z.boolean().default(false),
     })
     .default({ level: "info", responseTokenOnWiki: false }),
+  /**
+   * 运行时并发与超时约束
+   *
+   * 「认领」与「执行」解耦后，事件消费不再被单笔耗时评审阻塞，代价是同时会有多笔工作
+   * 在跑。这里给出全局闸门，避免打爆 MediaWiki API / LLM 限流：
+   * - 工作队列并发上限（异键并行度）；
+   * - 单次 LLM 调用超时与 LLM 并发上限；
+   * - 队列排队时长告警阈值与运行状态统计间隔。
+   */
+  runtime: z
+    .object({
+      /** 后台工作队列的全局并发上限（建议 2~4） */
+      workConcurrency: z.number().int().min(1).max(16).default(3),
+      /** 任务排队等待超过该时长即输出 warn 日志（秒） */
+      slowWaitSeconds: z.number().int().min(1).default(30),
+      /** 运行状态（队列深度 / LLM 闸门）统计日志间隔（秒），0 表示关闭 */
+      statsIntervalSeconds: z.number().int().min(0).default(300),
+      /** 同时进行的 LLM 调用上限 */
+      llmMaxConcurrent: z.number().int().min(1).max(16).default(2),
+      /** 单次 LLM 调用超时（秒） */
+      llmTimeoutSeconds: z.number().int().min(10).default(180),
+    })
+    .default({
+      workConcurrency: 3,
+      slowWaitSeconds: 30,
+      statsIntervalSeconds: 300,
+      llmMaxConcurrent: 2,
+      llmTimeoutSeconds: 180,
+    }),
   llm: llmConfigSchema.optional(),
   tasks: z
     .object({

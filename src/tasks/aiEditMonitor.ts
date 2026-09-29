@@ -387,12 +387,13 @@ export async function analyzeWikitextClues(
 
   const { result: rawResult, usage } = await executeWithFallback(
     cfg.tasks.aiEdit.models,
-    async (modelInstance) => {
+    async (modelInstance, _spec, signal) => {
       const res = await generateObject({
         model: modelInstance,
         schema: aiClueResultSchema,
         system: AI_EDIT_SYSTEM_PROMPT,
         prompt: sections.join("\n\n"),
+        abortSignal: signal,
       });
       return { result: res.object, usage: res.usage };
     },

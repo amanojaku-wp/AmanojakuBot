@@ -20,6 +20,7 @@ import {
 import {
   fetchArticleSnapshot,
   rejectArticleRequest,
+  withResultPageLock,
 } from "../utils/articleReview.js";
 import {
   analyzeWikitextClues,
@@ -445,51 +446,57 @@ async function processAiCheckRequest(
   const now = new Date();
   const dateKey = now.toISOString().slice(0, 10).replace(/-/g, "");
   const resultPage = `${talkPage}/${dateKey}-${actor}`;
-  let existingContent = await pageText(bot, resultPage, {
-    redirects: false,
-  });
+  let sectionTitle = "";
 
-  if ((existingContent || "").trim() === "") {
-    existingContent = "{{Talkarchive}}";
-  }
+  // 「读取现有结果页 → 生成唯一章节标题 → 写回」整体串行化：
+  // 同一提交人的多笔请求汇总到同一结果页，并发写入会互相覆盖。
+  await withResultPageLock(ctx, resultPage, async () => {
+    let existingContent = await pageText(bot, resultPage, {
+      redirects: false,
+    });
 
-  const sectionTitle = generateUniqueSectionTitle(
-    parseSections(existingContent).map((s) => s.title),
-    formatUtcMinute(now),
-  );
-  const marker = `<!-- ai-request:${revid} -->`;
-  const sectionBody = renderAiCheckSection(
-    sectionTitle,
-    results,
-    unreadable,
-    marker,
-  );
+    if ((existingContent || "").trim() === "") {
+      existingContent = "{{Talkarchive}}";
+    }
 
-  if (!cfg.writeEnabled) {
-    log.info(
-      {
-        revid,
-        actor,
+    sectionTitle = generateUniqueSectionTitle(
+      parseSections(existingContent).map((s) => s.title),
+      formatUtcMinute(now),
+    );
+    const marker = `<!-- ai-request:${revid} -->`;
+    const sectionBody = renderAiCheckSection(
+      sectionTitle,
+      results,
+      unreadable,
+      marker,
+    );
+
+    if (!cfg.writeEnabled) {
+      log.info(
+        {
+          revid,
+          actor,
+          resultPage,
+          sectionTitle,
+          results,
+          usage,
+        },
+        "[dry-run] aiEdit 3-2 analysis completed",
+      );
+      return;
+    }
+
+    if (!existingContent.includes(marker)) {
+      const text = existingContent.trimEnd()
+        ? `${existingContent.trimEnd()}\n\n${sectionBody}\n`
+        : `${sectionBody}\n`;
+      await bot.save(
         resultPage,
-        sectionTitle,
-        results,
-        usage,
-      },
-      "[dry-run] aiEdit 3-2 analysis completed",
-    );
-    return;
-  }
-
-  if (!existingContent.includes(marker)) {
-    const text = existingContent.trimEnd()
-      ? `${existingContent.trimEnd()}\n\n${sectionBody}\n`
-      : `${sectionBody}\n`;
-    await bot.save(
-      resultPage,
-      text,
-      `疑似 AI 线索初步分析：${results.map((r) => r.title).join("、")}`,
-    );
-  }
+        text,
+        `疑似 AI 线索初步分析：${results.map((r) => r.title).join("、")}`,
+      );
+    }
+  });
 
   // 5. 更新请求模板并回复提交人。
   const reply = `\n:{{ping|${actor}}}疑似 AI 线索初步分析已完成，参见[[${resultPage}#${sectionTitle}|结果页]]。~~~~`;

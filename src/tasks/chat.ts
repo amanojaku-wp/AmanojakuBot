@@ -23,9 +23,13 @@ import {
 } from "../utils/llm.js";
 import {
   EVENT_SAVE_SQL,
-  EVENT_SEEN_SQL,
+  isEventDone,
+  readEventState,
   runInTransaction,
 } from "../utils/db.js";
+import { claimEvent } from "../utils/requestWorkflow.js";
+import { withWikiPageLock } from "../utils/pageWriteLock.js";
+import { runWork } from "../utils/workDispatch.js";
 import type {
   ChangeEvent,
   HandlerContext,
@@ -190,10 +194,9 @@ export const chatHandler: TaskHandler = async (
   }
 
   const revid = e.revision!.new!;
-  const seen = ctx.seenStatement ?? db.prepare(EVENT_SEEN_SQL);
   const save = ctx.saveStatement ?? db.prepare(EVENT_SAVE_SQL);
 
-  if ((seen.get(revid) as { state: string } | undefined)?.state === "done") {
+  if (isEventDone(readEventState(db, revid, ctx.seenStatement))) {
     return { intercepted: true };
   }
 
@@ -230,113 +233,130 @@ export const chatHandler: TaskHandler = async (
     return { intercepted: true };
   }
 
-  const {
-    reply: rawReply,
-    usage,
-    model,
-  } = await prepareChatReply(
-    db,
-    bot,
-    rev.actorId,
-    rev.actor,
-    message,
-    extraction,
-    {
-      personaPage: cfg.tasks.chat.personaPage,
-      models: cfg.tasks.chat.models,
-      timestampFormat: cfg.wiki.timestampFormat,
+  // 认领：重活（LLM 生成 + 写入维基）解耦到工作队列后，靠这次落库保证重启后仍能回收。
+  claimEvent(ctx, e, revid, rev.actorId);
+
+  // 工作阶段：以讨论页为键串行。同一页面的写入必须互斥（避免编辑冲突），
+  // 但不再阻塞其它页面的任务认领与执行。
+  await runWork(
+    ctx,
+    { key: `chat:${cfg.tasks.chat.talkPage}`, label: "chat reply", revid },
+    async () => {
+      const {
+        reply: rawReply,
+        usage,
+        model,
+      } = await prepareChatReply(
+        db,
+        bot,
+        rev.actorId,
+        rev.actor,
+        message,
+        extraction,
+        {
+          personaPage: cfg.tasks.chat.personaPage,
+          models: cfg.tasks.chat.models,
+          timestampFormat: cfg.wiki.timestampFormat,
+        },
+        log,
+        undefined,
+        rev.timestamp,
+        revid,
+      );
+
+      let reply = rawReply || "[系统异常] 机器人未能生成回复。";
+      if (reply.length > MAX_REPLY_CHARS) {
+        reply =
+          reply.slice(0, MAX_REPLY_CHARS) +
+          "\n\n[系统提示] 回复内容过长，已被截断。";
+      }
+
+      const tokenSuffix = cfg.log.responseTokenOnWiki
+        ? ` (${formatTokenUsage(usage)})`
+        : "";
+      const marker = `<!-- amanojaku-bot:source=${revid} -->`;
+      if (!cfg.writeEnabled) {
+        log.info(
+          { revid, actorId: rev.actorId, reply, usage, model },
+          "dry run (chat)",
+        );
+        return;
+      }
+
+      if (!(await canWrite())) return;
+
+      const currentTalk = await bot.read(cfg.tasks.chat.talkPage);
+      const currentTalkContent = currentTalk?.revisions?.[0]?.content ?? "";
+      if (marker && currentTalkContent.includes(marker)) {
+        save.run(
+          revid,
+          "done",
+          rev.actorId,
+          null,
+          usage.inputTokens,
+          usage.outputTokens,
+          model,
+        );
+        return;
+      }
+
+      save.run(
+        revid,
+        "pending",
+        rev.actorId,
+        null,
+        usage.inputTokens,
+        usage.outputTokens,
+        model,
+      );
+      const currentIndent = getCommentIndentLevel(extraction.comment);
+      const replyWikitext = formatDiscussionReply(
+        reply + tokenSuffix,
+        currentIndent,
+        marker,
+        cfg.wiki.username,
+      );
+      const result = await withWikiPageLock(
+        log,
+        cfg.tasks.chat.talkPage,
+        "chat reply",
+        () =>
+          bot.edit(cfg.tasks.chat.talkPage, ({ content }) => {
+            if (marker && content.includes(marker))
+              throw new Error("Reply marker already present");
+            return {
+              text: insertReplyIntoContent(
+                content,
+                replyWikitext,
+                extraction.sectionTitle,
+                extraction.comment,
+              ),
+              summary: `机器人：回复 ${rev.actor}`,
+              bot: true,
+            };
+          }),
+      );
+
+      runInTransaction(db, () => {
+        save.run(
+          revid,
+          "done",
+          rev.actorId,
+          result.newrevid ?? null,
+          usage.inputTokens,
+          usage.outputTokens,
+          model,
+        );
+        db.prepare(
+          "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'user',?,datetime('now'))",
+        ).run(rev.actorId, revid, message);
+        db.prepare(
+          "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'assistant',?,datetime('now'))",
+        ).run(rev.actorId, revid, reply);
+      });
+      log.info({ revid, usage, model }, "chat replied");
     },
-    log,
-    undefined,
-    rev.timestamp,
-    revid,
   );
-
-  let reply = rawReply || "[系统异常] 机器人未能生成回复。";
-  if (reply.length > MAX_REPLY_CHARS) {
-    reply =
-      reply.slice(0, MAX_REPLY_CHARS) +
-      "\n\n[系统提示] 回复内容过长，已被截断。";
-  }
-
-  const tokenSuffix = cfg.log.responseTokenOnWiki
-    ? ` (${formatTokenUsage(usage)})`
-    : "";
-  const marker = `<!-- amanojaku-bot:source=${revid} -->`;
-  if (!cfg.writeEnabled) {
-    log.info(
-      { revid, actorId: rev.actorId, reply, usage, model },
-      "dry run (chat)",
-    );
-    return { intercepted: true };
-  }
-
-  if (!(await canWrite())) return { intercepted: true };
-
-  const currentTalk = await bot.read(cfg.tasks.chat.talkPage);
-  const currentTalkContent = currentTalk?.revisions?.[0]?.content ?? "";
-  if (marker && currentTalkContent.includes(marker)) {
-    save.run(
-      revid,
-      "done",
-      rev.actorId,
-      null,
-      usage.inputTokens,
-      usage.outputTokens,
-      model,
-    );
-    return { intercepted: true };
-  }
-
-  save.run(
-    revid,
-    "pending",
-    rev.actorId,
-    null,
-    usage.inputTokens,
-    usage.outputTokens,
-    model,
-  );
-  const currentIndent = getCommentIndentLevel(extraction.comment);
-  const replyWikitext = formatDiscussionReply(
-    reply + tokenSuffix,
-    currentIndent,
-    marker,
-    cfg.wiki.username,
-  );
-  const result = await bot.edit(cfg.tasks.chat.talkPage, ({ content }) => {
-    if (marker && content.includes(marker))
-      throw new Error("Reply marker already present");
-    return {
-      text: insertReplyIntoContent(
-        content,
-        replyWikitext,
-        extraction.sectionTitle,
-        extraction.comment,
-      ),
-      summary: `机器人：回复 ${rev.actor}`,
-      bot: true,
-    };
-  });
-
-  runInTransaction(db, () => {
-    save.run(
-      revid,
-      "done",
-      rev.actorId,
-      result.newrevid ?? null,
-      usage.inputTokens,
-      usage.outputTokens,
-      model,
-    );
-    db.prepare(
-      "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'user',?,datetime('now'))",
-    ).run(rev.actorId, revid, message);
-    db.prepare(
-      "INSERT INTO messages(actor_id,source_revid,role,content,created_at) VALUES(?,?,'assistant',?,datetime('now'))",
-    ).run(rev.actorId, revid, reply);
-  });
-  log.info({ revid, usage, model }, "chat replied");
 
   return { intercepted: true };
 };
@@ -514,7 +534,7 @@ ${formattedCurrent}
 
   const { result, usage, model } = await executeWithFallback(
     models,
-    async (modelInstance, spec) => {
+    async (modelInstance, spec, signal) => {
       const startedAt = Date.now();
 
       const res = await generateText({
@@ -526,6 +546,8 @@ ${formattedCurrent}
         stopWhen: stepCountIs(6),
 
         maxOutputTokens: MAX_TOKENS,
+
+        abortSignal: signal,
 
         onStepFinish: (step) => {
           log?.debug(

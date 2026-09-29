@@ -20,6 +20,15 @@ log:
   level: info
   responseTokenOnWiki: false
 
+# 运行时并发与超时约束（均可省略，使用括号内默认值）
+# 「认领」与「执行」分离后，多笔工作会并行执行：同页面/同章节严格串行，异页面并行。
+runtime:
+  workConcurrency: 3 # 后台工作并发上限（默认 3）
+  slowWaitSeconds: 30 # 排队等待超过该时长输出 warn（默认 30）
+  statsIntervalSeconds: 300 # 运行状态统计日志间隔，秒；0 关闭（默认 300）
+  llmMaxConcurrent: 2 # 同时进行的 LLM 调用上限（默认 2）
+  llmTimeoutSeconds: 180 # 单次 LLM 调用超时，秒（默认 180）
+
 llm:
   provider: google
   model: gemini-3.7-flash

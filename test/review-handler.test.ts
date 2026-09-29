@@ -154,6 +154,13 @@ describe("Task 2 reviewHandler", () => {
         level: "info",
         responseTokenOnWiki: false,
       },
+      runtime: {
+        workConcurrency: 3,
+        slowWaitSeconds: 30,
+        statsIntervalSeconds: 300,
+        llmMaxConcurrent: 2,
+        llmTimeoutSeconds: 180,
+      },
       writeEnabled: true,
       tasks: {
         chat: {

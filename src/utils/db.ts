@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 /**
  * 数据库 Migration 接口定义
@@ -21,6 +21,7 @@ export type Migration = {
  * - 20260926000000: 新增 afc_requests 发布前评审请求表
  * - 20260928000000: 新增 ai_edit_reports 任务三按条目聚合的疑似 AI 线索表
  * - 20260929000000: 新增 ai_edit_sends 任务三「完整条目」送检记录表（24 小时内同一目只送差异）
+ * - 20260930000000: events 表新增 event_json 字段（认领期持久化原始变更事件，供重启后回收未完成工作）
  */
 export const MIGRATIONS: Migration[] = [
   {
@@ -258,6 +259,23 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    // 认领期持久化：事件被某个任务认领（intercepted）时，把原始变更事件一并写入 events 表，
+    // 状态置为 claimed。重活交给后台并发队列执行后，进程若在任务完成前退出，
+    // 重启时即可依据这些行重新派发，避免「位点已推进、工作却未完成」的静默丢失。
+    version: "20260930000000",
+    name: "add_event_json_to_events",
+    up: (db) => {
+      const tableInfo = db.prepare("PRAGMA table_info(events)").all() as {
+        name: string;
+      }[];
+      const columnNames = new Set(tableInfo.map((col) => col.name));
+
+      if (!columnNames.has("event_json")) {
+        db.exec("ALTER TABLE events ADD COLUMN event_json TEXT;");
+      }
+    },
+  },
 ];
 let savepointCounter = 0;
 
@@ -455,6 +473,86 @@ ON CONFLICT(revid) DO UPDATE SET
   input_tokens = COALESCE(excluded.input_tokens, events.input_tokens),
   output_tokens = COALESCE(excluded.output_tokens, events.output_tokens),
   model = COALESCE(excluded.model, events.model)`;
+
+/**
+ * 事件「认领」写入 SQL
+ *
+ * 事件被某个任务认领时立刻落库（state = claimed）并保存原始 ChangeEvent，
+ * 使「位点推进」与「工作完成」解耦后仍然可恢复。
+ * 注意 `state` 的 CASE：已完成（done）的行绝不回退为 claimed，
+ * 否则重复投递同一修订会让已完成的记录重新变成未完成。
+ */
+export const EVENT_CLAIM_SQL = `INSERT INTO events(revid, state, actor_id, reply_revid, updated_at, event_json)
+VALUES(?, 'claimed', ?, NULL, datetime('now'), ?)
+ON CONFLICT(revid) DO UPDATE SET
+  state = CASE WHEN events.state = 'done' THEN events.state ELSE 'claimed' END,
+  actor_id = COALESCE(excluded.actor_id, events.actor_id),
+  updated_at = excluded.updated_at,
+  event_json = COALESCE(excluded.event_json, events.event_json)`;
+
+/** 事件状态常量（events.state） */
+export const EVENT_STATE_DONE = "done";
+export const EVENT_STATE_CLAIMED = "claimed";
+export const EVENT_STATE_PENDING = "pending";
+export const EVENT_STATE_FAILED = "failed";
+
+/**
+ * 读取修订的处理状态。
+ */
+export function readEventState(
+  db: DatabaseSync,
+  revid: number,
+  seenStatement?: StatementSync,
+): string | undefined {
+  const statement = seenStatement ?? db.prepare(EVENT_SEEN_SQL);
+  return (statement.get(revid) as { state: string } | undefined)?.state;
+}
+
+/**
+ * 该修订是否已完成，无需重复处理。
+ *
+ * 刻意**不**把 claimed 视为终态：同一修订被重复投递（位点回放、多路补偿）时，
+ * 由键控队列保证同键串行 + 工作阶段重新读取当前页面复核，代价远低于误判丢失。
+ */
+export function isEventDone(state?: string): boolean {
+  return state === EVENT_STATE_DONE;
+}
+
+/**
+ * 列出上次运行期间已认领但未完成的事件（进程崩溃/重启后的回收来源）。
+ *
+ * 只返回最近 `withinHours` 小时内更新过、且保留了原始事件载荷的行。
+ */
+export function listUnfinishedEvents(
+  db: DatabaseSync,
+  withinHours = 24,
+  limit = 100,
+): { revid: number; state: string; event_json: string; updated_at: string }[] {
+  try {
+    return db
+      .prepare(
+        `SELECT revid, state, event_json, updated_at FROM events
+         WHERE state IN (?, ?) AND event_json IS NOT NULL
+           AND updated_at >= datetime('now', ?)
+         ORDER BY updated_at ASC
+         LIMIT ?`,
+      )
+      .all(
+        EVENT_STATE_CLAIMED,
+        EVENT_STATE_PENDING,
+        `-${Math.max(1, Math.floor(withinHours))} hours`,
+        limit,
+      ) as {
+      revid: number;
+      state: string;
+      event_json: string;
+      updated_at: string;
+    }[];
+  } catch (error) {
+    console.error("[DB] Failed to list unfinished events:", error);
+    return [];
+  }
+}
 
 /**
  * 任务二：条目校对请求记录结构
