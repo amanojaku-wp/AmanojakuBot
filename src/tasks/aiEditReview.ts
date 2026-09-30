@@ -45,16 +45,18 @@ import type { HandlerContext } from "../handle.js";
  * 以及 diff1、diff2……diff20 参数（修订版本号或 [[Special:Diff/…]] 差异链接），
  * 按任务（日期 + 提交人用户名）汇总到同一结果页。
  *
- * 送检规则（与 3-1 一致）：
+ * 送检规则：
  * - 先按「规范化条目名」把 article 与 diff 参数合并：同一条目只送检一次，其全部差异合并为同一次请求；
- * - **只送编辑差异，不送条目全文**（避免烧 token）；仅当本次没有任何差异可送时才附完整条目，
- *   否则请求没有可判断的内容；
+ * - **提供了 article（条目名）就送完整条目正文**，对该条目做全文检查；即便未提供 diff 也是正常请求，
+ *   同时提供了该条目的 diff 时正文与差异一并送检（正文超长时截断，不因此跳过）；
+ * - **只提供了 diff（未提供对应 article）时只送该差异**，不附条目其余部分，也不要求提交人补全文；
  * - 报告页用 {{La}} 整理条目相关链接（条目、编辑、讨论、历史等），并按送检差异逐条列出 Diff。
  *
  * 线索来源有两类（**URL 可达性检测不作为模型输入**）：
  * - 程序化确定性检查（runReferenceLinkCheck，不依赖 LLM）：提取参考文献 / 外部链接的 URL 探测可达性，
  *   但结果**只在模型已经分析出其它线索时**才作为单独一条补充线索附上（见 analyzeWithReferenceLinks）；
- * - 模型只看编辑差异输出文风 / 格式 / 内容层面的疑似线索；模型没发现线索时不附任何链接结果。
+ *   有 article 时检查整篇条目的链接，只给 diff 时只检查该差异新增的链接；
+ * - 模型输出文风 / 格式 / 内容层面的疑似线索；模型没发现线索时不附任何链接结果。
  *
  * 跳过规则（逐项跳过，不影响其它有效对象；只有全部无效时才回复 not done）：
  * - article / diff 参数无法识别，或对应页面不存在、不可读取、不在条目与 draftNamespace 命名空间内；
@@ -143,8 +145,9 @@ type AiCheckResultItem = {
 type AiCheckTarget = {
   title: string;
   canonical: string;
-  /** 完整条目正文是否来自 article 参数快照（否则取差异所属修订的正文） */
+  /** 是否由 article 参数送检（true 送完整正文；false 只送 diff，不附条目其余部分） */
   fromArticle: boolean;
+  /** 由 article 参数取到的完整条目正文（fromArticle 为 true 时有值） */
   content?: string;
   revid?: number;
   diffs: AiDiffInput[];
@@ -164,7 +167,7 @@ function renderAiCheckSection(
 ): string {
   const lines: string[] = [
     `== ${sectionTitle} ==`,
-    "'''注意：以下内容仅为疑似生成式 AI 辅助编辑线索的初步分析，不代表确认或否认该用户滥用 AI。'''",
+    "'''注意：以下内容仅为疑似生成式 AI 辅助编辑线索的初步分析，其结论仅供参考，可能存在漏判或误判，也不代表确认或否认该用户不当使用 AI。'''",
   ];
 
   for (const item of results) {
@@ -396,13 +399,11 @@ async function processAiCheckRequest(
       if (!target.diffs.some((d) => d.revid === diff.revid)) {
         target.diffs.push(toDiffInput(diff));
       }
-      // 未由 article 参数提供完整条目时，以差异所属修订的正文作为「完整条目」
+      // 只提供了 diff 的对象只送该差异，不附条目其余部分；修订号仅用于提示词与日志。
       if (
         !target.fromArticle &&
-        diff.content &&
         (!target.revid || diff.revid >= target.revid)
       ) {
-        target.content = diff.content;
         target.revid = diff.revid;
       }
       targets.set(key, target);
@@ -441,27 +442,20 @@ async function processAiCheckRequest(
   const results: AiCheckResultItem[] = [];
 
   for (const target of resolved) {
-    // 只送编辑差异（与 3-1 一致）：条目全文不送模型，避免烧 token。
-    // 唯一例外是本次没有任何差异可送（请求只给了 article 参数）——那时若不附正文，
-    // 整个请求就没有可判断的内容，只能如实回报「没有可分析的内容或差异」。
-    let content = target.diffs.length === 0 ? target.content : undefined;
+    // article 参数送检的条目：始终附完整正文（做全文检查），即便同时提供了该条目的差异；
+    // 只提供 diff 的对象：只送差异，不附条目其余部分。
+    let content = target.fromArticle ? target.content : undefined;
     const revidForRequest = target.revid;
     if (content && content.length > MAX_ARTICLE_CHARS) {
       log.info(
-        { title: target.title, length: content.length },
-        "aiEdit 3-2 oversized article, sending diff only",
+        {
+          title: target.title,
+          length: content.length,
+          cap: MAX_ARTICLE_CHARS,
+        },
+        "aiEdit 3-2 oversized article, truncating to cap",
       );
-      content = undefined;
-    }
-
-    // 既无完整条目也没有可送检差异时无法分析（如仅供条目名但正文过长），如实回报。
-    if (!content && target.diffs.length === 0) {
-      log.info(
-        { title: target.title },
-        "aiEdit 3-2 skip target without analyzable content or diff",
-      );
-      skipped.push(`${target.title}（没有可分析的内容或差异）`);
-      continue;
+      content = content.slice(0, MAX_ARTICLE_CHARS);
     }
 
     try {
@@ -470,7 +464,8 @@ async function processAiCheckRequest(
         title: target.title,
         revid: revidForRequest,
         content,
-        wikitext: target.content,
+        // 有 article 时对整篇条目做链接检查；只给 diff 时只用差异中的新增链接
+        wikitext: target.fromArticle ? target.content : undefined,
         diffs: target.diffs,
         ruleContent,
         usageTracker: usage,
