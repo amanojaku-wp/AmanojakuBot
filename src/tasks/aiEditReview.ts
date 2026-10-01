@@ -174,6 +174,7 @@ function renderAiCheckSection(
     lines.push(`=== ${safeTitle(item.title)} ===`);
     // {{La}} 负责整理条目相关链接（条目、编辑、讨论、历史等），此处只按送检差异列出具体 Diff
     lines.push(`* {{La|${safeWikitext(item.title)}}}`);
+    lines.push(`* '''状态'''：{{Tobedone}}--~~~~`);
     if (item.diffs.length > 0) {
       lines.push(`* Diff: ${renderDiffLinks(item.diffs)}`);
     }

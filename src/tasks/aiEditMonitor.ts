@@ -1720,6 +1720,7 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
     lines.push(`{{anchor|${sectionAnchor(row.scan_time, row.title)}}}`);
     // {{La}} 负责整理条目相关链接（条目、编辑、讨论、历史等），此处不再重复拼接
     lines.push(`* {{La|${safeTitle(row.title)}}}`);
+    lines.push(`* '''状态'''：{{Tobedone}}--~~~~`);
     lines.push("");
     if (diffs.length > 0) lines.push(`* Diff: ${renderDiffLinks(diffs)}`);
     lines.push(
