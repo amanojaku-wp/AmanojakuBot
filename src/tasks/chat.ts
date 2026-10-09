@@ -96,6 +96,11 @@ const WIKI_TOOL_POLICY = `
 - getUserContribs：查询用户编辑记录。支持传入 continueToken 进行接续翻页查询更早贡献。
 - getWikiRevision：读取指定 revision 的实际完整内容与元数据。
 - getWikiDiff：查询指定 revision 的修改差异（Diff），支持单版本与父版本对比，或任意两版本对比。
+- getUserLogs：查询某用户的维基操作日志（封禁 / 解封、用户权限变更、页面移动、保护、删除、上传、巡查、创建账户等）。type 只接受单个日志类型，省略则返回该用户全部类型。支持传入 continueToken 翻页。
+- getPageLogs：查询某页面的维基操作日志（移动、保护、删除 / 恢复、创建、导入等）。type 只接受单个日志类型，省略则返回该页面全部类型。支持传入 continueToken 翻页。
+- getUserRights：查询某用户当前的用户组、权限、编辑数、注册时间与封禁状态（含 blockinfo）。只反映当前状态，不返回历史。
+- getUserRightsLog：查询某用户的用户权限变更日志（rights 日志，含变更前后用户组 oldgroups / newgroups）。
+- fetchUrl：按任意 http/https 网址读取站外网页内容（仅 GET、自动跟随重定向，只返回静态文本，不执行页面中的 JavaScript / CSS）。
 
 讨论分析与事实归因特别规则：
 1. 解析讨论时必须基于 getWikiPage 返回的结构化 JSON 数据（kind: "discussion"）进行分析，严禁直接分析原始 Wikitext；结构化数据中已附带消息 id（格式形如 r-版本号-202601231123），以避免签名杂音和幻觉。
@@ -104,8 +109,27 @@ const WIKI_TOOL_POLICY = `
 特殊链接与指令识别规则：
 - 当用户输入或引用形如 [[Special:Diff/12345]]、[[Special:差异/12345]]、[[Special:差異/12345]]，或 [[Special:Diff/12345/67890]]、[[Special:差异/12345/67890]]、[[Special:差異/12345/67890]] 等差异链接时，必须理解为查询版本差异请求，使用 getWikiDiff 工具。
 - 当用户输入或引用形如 [[Special:Permalink/12345]]、[[Special:Perma/12345]]、[[Special:固定连接/12345]]、[[Special:固定連結/12345]] 或 oldid=12345 等固定链接时，必须理解为查看特定历史版本请求，提取出版本ID后使用 getWikiRevision 工具。
+- 链接中的「#锚点」（如 [[条目#某章节]]、[[Special:Diff/12345#某章节]]、[[Special:Permalink/12345#某章节]]）只是页面内的位置标记，不属于页面标题或版本号：解析标题/版本号时必须丢弃「#」及其后的全部内容。读取 [[条目#锚点]] 这类链接时，直接用页面标题「条目」调用 getWikiPage，不要把锚点带进标题。
 
-当答案依赖当前页面内容、编辑历史、具体版本、差异或用户贡献时，应使用工具核实，不得依靠模型记忆猜测。
+跨语言 / 跨维基链接：
+- 形如 [[en:Artificial intelligence]]、[[ja:…]]、[[c:File:Example.svg]]、[[d:Q42]]、[[m:…]]、[[wikt:…]] 等带语言/项目前缀的链接指向其他维基媒体站点。
+- getWikiPage、getPageHistory 可直接接收带前缀的完整目标（如 "en:Artificial intelligence"、"c:File:Example.svg"、"d:Q42"），工具会自动查询目标站点；getWikiRevision、getWikiDiff 可用 wiki 参数指定前缀（如 wiki: "d"）。
+- 跨维基链接中的固定链接（如 [[d:Special:Permalink/123#锚点]]）直接交给 getWikiPage 处理即可。
+- 本地命名空间前缀（Category、File、Template、User、Wikipedia、Talk 等）不是跨维基前缀，仍按普通页面标题处理。
+
+日志与权限查询规则：
+- 想确认某用户「当前」是否被封禁、拥有哪些权限，用 getUserRights；权限的授予 / 移除历史用 getUserRightsLog。不要用 getUserLogs 的 block 类型推断「该用户当前是否被封禁」。
+- 封禁日志（block）里「被处理的对象」记录在页面标题（User:XXX）上，执行封禁的管理员才是该日志的操作者；若要用日志确认某用户被封禁的历史，应使用 getPageLogs 查询「User:用户名」（可加 type: "block"）。
+- getUserLogs 的 move / protect / delete 类型记录的是「该用户执行过的」操作；若要查某页面被移动 / 保护 / 删除的历史，应使用 getPageLogs。
+- 日志查询的 type 参数只能填一个类型；需要多种类型时按类型分别调用，省略 type 则一次返回全部类型。
+
+外部网址（fetchUrl）：
+- 当用户给出站外链接（非维基页面）并要求了解其内容，或需要用站外资料核实信息时，使用 fetchUrl。
+- 该工具仅支持 GET、自动跟随重定向，只返回静态文本（不执行页面中的 JavaScript / CSS）。依赖 JS 动态渲染的页面可能拿不到完整内容，此时应如实说明，不得把不完整内容当成完整页面。
+- 出于安全考虑，禁止访问本机与内部网络地址（127.0.0.0/8、10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、169.254.0.0/16、*.local、localhost 及解析到这些地址的域名）与非 http/https 协议；此类请求会被拒绝，不要尝试绕过。
+- 维基媒体站点（维基百科及各姊妹项目）的页面应优先用 getWikiPage 等维基工具，而不是 fetchUrl。
+
+当答案依赖当前页面内容、编辑历史、具体版本、差异、用户贡献、日志或权限时，应使用工具核实，不得依靠模型记忆猜测。
 
 当用户提供页面标题、MediaWiki内链或明确指向维基百科某个页面，并且问题涉及该页面的实际内容时，应使用getWikiPage。
 
@@ -116,7 +140,7 @@ const WIKI_TOOL_POLICY = `
 需要确定某个具体revision实际包含什么时，可以先通过getPageHistory或getUserContribs定位revision，再使用getWikiRevision。
 
 接续查询与成本控制原则：
-- getPageHistory、getUserContribs、searchWiki 的接续查询（翻页）代价较高且消耗多次工具轮次。
+- getPageHistory、getUserContribs、getUserLogs、getPageLogs、getUserRightsLog、searchWiki 的接续查询（翻页）代价较高且消耗多次工具轮次。
 - 只有在首次查询未能找到所需关键信息，且用户明确要求进一步查询更早历史/贡献或必须查看下一页搜索结果等确有必要的情况下，才允许使用接续令牌（continueToken / offset）进行查询。
 - 严禁无目的或无限制地连续翻页。
 
@@ -173,13 +197,11 @@ const WIKITEXT_OUTPUT_POLICY = `
 - 工具调用获得的信息只提取回答当前问题所需的部分，不要复述完整工具结果。
 - 涉及代码、Wikitext、模板或其他结构化内容时，完整性优先于篇幅目标。不得为了缩短回复而在代码块、函数、模板、链接或句子中途截断。如果预计内容较长，应优先减少前言、解释、重复内容和总结，先保证用户实际需要的代码或结构化内容完整。
 
-如果回复明显较长，且直接展开会影响讨论页阅读，例如较长的程序代码或长篇分析，可以使用折叠模板：
+如果回复有长篇内容，例如较长的程序代码或长篇分析（超过10行），应当用下述方式进行折叠，以防止影响他人阅读：
 
 {{HideH|简短、具体的内容概述}}
 （实际内容）
 {{HideF}}
-
-不要为了使用折叠模板而增加回复长度；普通回复和中等长度回复无需折叠。
 `;
 
 const MAX_TOKENS = 3000;

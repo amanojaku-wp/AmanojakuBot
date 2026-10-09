@@ -1715,6 +1715,30 @@ export function extractSignatures(text: string): string[] {
 }
 
 /**
+ * 提取文本中最早出现的「带签名的留言作者」（最早签名者）。
+ *
+ * 与 extractSignatures（返回文本中出现的全部用户链接）不同，本函数只认行末的真正签名
+ * （`hasEndSignature`），因此章节标题、模板参数或正文里顺带提到的 `[[User:…]]` 不会被误判。
+ * 用于在请求章节中确定「发起请求的人」：章节可能被他人追加留言/签名，
+ * 机器人的回复与额度校验应归到最早签名者，而非最后签名者。
+ *
+ * 找不到可解析的签名时返回 undefined。
+ */
+export function extractEarliestSigner(text?: string): string | undefined {
+  if (!text) return undefined;
+
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!hasEndSignature(trimmed)) continue;
+
+    const { author } = parseStructuredComment(trimmed);
+    if (author && author !== "未知用户") return author;
+  }
+
+  return undefined;
+}
+
+/**
  * 校验签名用户列表中是否包含指定的修订作者
  */
 export function isSignatureMatchingActor(

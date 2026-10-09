@@ -12,6 +12,7 @@ import { withWikiPageLock } from "./pageWriteLock.js";
 import { runWork } from "./workDispatch.js";
 import {
   extractCommentDetails,
+  extractEarliestSigner,
   extractSignatures,
   findMatchingSection,
   isRelevant,
@@ -656,16 +657,44 @@ export async function resolveIncomingRequest(
 
   if (state.handled) return { kind: "ignored" };
 
-  // 请求者身份校验：触发修订的编辑者必须与签名一致
-  const signedUsers = extractSignatures(extraction.comment);
-  if (!isSignatureMatchingActor(signedUsers, rev.actor)) {
-    const sectionSignedUsers = extractSignatures(targetSection.content);
-    if (!isSignatureMatchingActor(sectionSignedUsers, rev.actor)) {
-      log.warn(
-        { revid, actor: rev.actor, signedUsers, sectionSignedUsers },
-        `${label}: requester signature does not match revision actor, skipping`,
+  // 请求者身份校验：触发修订的编辑者必须与签名一致（防伪造）
+  const commentSigners = extractSignatures(extraction.comment);
+  const sectionSigners = extractSignatures(targetSection.content);
+  if (
+    !isSignatureMatchingActor(commentSigners, rev.actor) &&
+    !isSignatureMatchingActor(sectionSigners, rev.actor)
+  ) {
+    log.warn(
+      { revid, actor: rev.actor, commentSigners, sectionSigners },
+      `${label}: requester signature does not match revision actor, skipping`,
+    );
+    return { kind: "ignored" };
+  }
+
+  // 请求者 = 章节中最早签名的人（发起请求的人），而非最后签名的人。
+  // 同一章节可能被他人追加留言/签名，机器人的回复（ping）与额度校验都应归到最早签名者。
+  // 触发本次修订的编辑者本人不是最早签名者时，按用户名补查其权威 user id；查不到则退回编辑者。
+  let requester = rev.actor;
+  let requesterId = rev.actorId;
+  const earliestSigner =
+    extractEarliestSigner(targetSection.content) ?? sectionSigners[0];
+  if (
+    earliestSigner &&
+    !isSignatureMatchingActor([earliestSigner], rev.actor)
+  ) {
+    const id = await lookupUserId(ctx, earliestSigner);
+    if (id) {
+      requester = earliestSigner;
+      requesterId = id;
+      log.info(
+        { revid, actor: rev.actor, requester, requesterId: id },
+        `${label}: attributing request to the earliest signer of the section`,
       );
-      return { kind: "ignored" };
+    } else {
+      log.warn(
+        { revid, actor: rev.actor, earliestSigner },
+        `${label}: could not resolve user id of the earliest signer, falling back to the revision actor`,
+      );
     }
   }
 
@@ -684,8 +713,8 @@ export async function resolveIncomingRequest(
     kind: "ready",
     request: {
       revid,
-      actor: rev.actor,
-      actorId: rev.actorId,
+      actor: requester,
+      actorId: requesterId,
       comment: extraction.comment,
       targetSection,
       reqTemplate: state.template!,
@@ -757,9 +786,41 @@ export async function recheckRequestStillPending(
 // ---------------------------------------------------------------------------
 
 /**
+ * 查询用户名对应的权威 user id（MediaWiki `list=users`）。
+ *
+ * 用于把请求归属到「章节中最早签名的人」：该请求者未必是触发本次修订的编辑者，
+ * 需要独立查询其 user id。查不到（用户不存在/已隐藏）时返回 undefined。
+ */
+async function lookupUserId(
+  ctx: HandlerContext,
+  username: string,
+): Promise<number | undefined> {
+  const { bot, log } = ctx;
+  const name = username.trim();
+  if (!name) return undefined;
+  try {
+    const data = await bot.request({
+      action: "query",
+      list: "users",
+      ususers: name,
+      formatversion: 2,
+    });
+    const user = data.query?.users?.[0] as { userid?: number } | undefined;
+    if (user && Number.isInteger(user.userid) && (user.userid as number) > 0) {
+      return user.userid;
+    }
+  } catch (err) {
+    log.warn({ err, username: name }, "failed to lookup user id");
+  }
+  return undefined;
+}
+
+/**
  * 从讨论页近期修订历史中回溯积压请求的提交者与触发修订号。
  *
- * 优先选择「章节标题出现在内容中且修订作者与签名一致」的修订；否则退回签名用户 + 用户 ID 查询。
+ * 请求者是「章节中最早签名的人」（发起请求者），而非最后签名/最后编辑的人；
+ * 在修订历史中选取该作者最早的、包含本章节标题的修订作为请求来源。
+ * 历史中取不到时退回签名用户 + 用户 ID 查询。
  */
 export async function resolveBacklogRequester(
   ctx: HandlerContext,
@@ -768,7 +829,10 @@ export async function resolveBacklogRequester(
   signedUsers: string[],
 ): Promise<{ actor: string; actorId: number; revid: number }> {
   const { bot, log } = ctx;
-  let actor = signedUsers[0] ?? "";
+  // 请求者 = 章节中最早签名的人（发起请求者），而非最后签名的人
+  const requester =
+    extractEarliestSigner(section.content) ?? signedUsers[0] ?? "";
+  let actor = requester;
   let actorId = 0;
   let revid = 0;
 
@@ -788,19 +852,18 @@ export async function resolveBacklogRequester(
     if (revs.length > 0) {
       revid = revs[0].revid; // 默认使用最新修订号
 
+      // 修订按时间倒序返回：不 break，持续覆盖，最终保留「最早」的、
+      // 作者与请求者一致且包含本章节标题的修订（即发起该请求的那次编辑），
+      // 而不是把最后一位签名者当作请求者。
       for (const r of revs) {
         const content = r.slots?.main?.content ?? r.content ?? "";
         if (!content.includes(section.title)) continue;
         if (!r.userid || r.userid <= 0 || !r.user) continue;
-        if (
-          signedUsers.length === 0 ||
-          isSignatureMatchingActor(signedUsers, r.user)
-        ) {
-          actor = r.user;
-          actorId = r.userid;
-          revid = r.revid;
-          break;
-        }
+        if (requester && !isSignatureMatchingActor([requester], r.user))
+          continue;
+        actor = r.user;
+        actorId = r.userid;
+        revid = r.revid;
       }
     }
   } catch (err) {
@@ -812,18 +875,7 @@ export async function resolveBacklogRequester(
 
   // 若历史中未能取得 actorId，但有签名用户，则通过 API 补查用户 ID
   if (actorId <= 0 && actor) {
-    try {
-      const userData = await bot.request({
-        action: "query",
-        list: "users",
-        ususers: actor,
-        formatversion: 2,
-      });
-      const u = userData.query?.users?.[0];
-      if (u && u.userid && u.userid > 0) actorId = u.userid;
-    } catch (err) {
-      log.warn({ err, actor }, "failed to fetch user info for backlog actor");
-    }
+    actorId = (await lookupUserId(ctx, actor)) ?? 0;
   }
 
   return { actor, actorId, revid };
