@@ -174,7 +174,7 @@ function renderAiCheckSection(
     lines.push(`=== ${safeTitle(item.title)} ===`);
     // {{La}} 负责整理条目相关链接（条目、编辑、讨论、历史等），此处只按送检差异列出具体 Diff
     lines.push(`* {{La|${safeWikitext(item.title)}}}`);
-    lines.push(`* '''状态'''：{{Tobedone}}--~~~~`);
+    lines.push(`* '''状态'''：待人工核实--~~~~`);
     if (item.diffs.length > 0) {
       lines.push(`* Diff: ${renderDiffLinks(item.diffs)}`);
     }
@@ -197,7 +197,7 @@ function renderAiCheckSection(
           ? `<small>（差异 [[Special:Diff/${issue.diff}|${issue.diff}]]）</small>`
           : "";
       lines.push(`; 线索强度：${issue.strength}${loc}${diffTag}`);
-      lines.push(`: {{tq|${safeReportText(issue.evidence)}}}`);
+      lines.push(`: {{tq|<nowiki>${safeReportText(issue.evidence)}</nowiki>}}`);
       lines.push(`: ${safeReportText(issue.analysis)}`);
       lines.push(
         `: '''其他可能解释：'''<i>${safeReportText(issue.alternative)}</i>`,
@@ -312,7 +312,7 @@ async function processAiCheckRequest(
       comment,
       replyText:
         "未指定待分析条目或差异。请使用 article1、article2……article20 提供条目名，或使用 diff1、diff2……diff20 提供修订版本号。~~~~",
-      summary: "疑似 AI 线索请求处理：未指定条目或差异",
+      summary: "机器人：疑似 AI 线索请求处理：未指定条目或差异",
     });
     return;
   }
@@ -430,7 +430,7 @@ async function processAiCheckRequest(
       targetSection,
       comment,
       replyText: `指定的条目或差异均无法分析，已全部跳过。${reasonText}请确认后重试。~~~~`,
-      summary: "疑似 AI 线索请求处理：条目或差异全部无效",
+      summary: "机器人：疑似 AI 线索请求处理：条目或差异全部无效",
     });
     return;
   }
@@ -493,7 +493,7 @@ async function processAiCheckRequest(
       targetSection,
       comment,
       replyText: "疑似 AI 线索分析失败，请稍后重试。~~~~",
-      summary: "疑似 AI 线索请求处理：分析失败",
+      summary: "机器人：疑似 AI 线索请求处理：分析失败",
     });
     return;
   }
@@ -569,7 +569,7 @@ async function processAiCheckRequest(
         section: sectionTitle,
       },
       reply,
-      summary: `疑似 AI 线索分析完成：${results.map((r) => r.title).join("、")}`,
+      summary: `机器人：疑似 AI 线索分析完成（[[${resultPage}#${sectionTitle}|结果页]]）：${results.map((r) => r.title).join("、")}`,
       event: {
         revid,
         actorId,
@@ -607,7 +607,7 @@ export const aiEditHandler = createTemplateRequestHandler({
   talkPage: (cfg) => cfg.tasks.aiEdit.talkPage,
   templateName: (cfg) => cfg.tasks.aiEdit.template,
   missingTemplateReply: "\n:请使用标准请求模板提交疑似 AI 线索分析请求。~~~~",
-  missingTemplateSummary: "回复疑似 AI 线索请求：请使用标准模板",
+  missingTemplateSummary: "机器人：回复疑似 AI 线索请求：请使用标准模板",
   lock: aiEditLocks,
   process: processAiCheckRequest,
 });

@@ -423,7 +423,7 @@ export async function analyzeWikitextClues(
     );
     return {
       confidence: 0,
-      summary: "未提供可用于分析的条目内容或编辑差异。",
+      summary: "机器人：未提供可用于分析的条目内容或编辑差异。",
       issues: [],
     };
   }
@@ -589,14 +589,14 @@ export function mergeCitationLinkClues(
   // 证据保持单行：报告页按 `: {{tq|…}}` 渲染，换行会打断列表缩进
   const listed = suspect
     .slice(0, 8)
-    .map((link) => `${link.url}（${describeLinkFailure(link)}）`)
+    .map((link) => `${link.url} （${describeLinkFailure(link)}）`)
     .join("；");
   const evidence = listed.length > 600 ? `${listed.slice(0, 597)}…` : listed;
 
   // 新增引用的失效情况与本次编辑直接相关，单独写进分析文本（旧链接失效可能与本次编辑无关）。
   const newRefNote =
     stats && stats.newReferences > 0
-      ? `本次编辑新增引用 ${stats.newReferences} 个，其中已检查 ${stats.checkedNewUrls} 个、无法访问 ${stats.deadNewUrls} 个（失效比例 ${stats.deadRate}）。`
+      ? `本次编辑新增 ${stats.newReferences} 个 URL，其中 ${stats.deadNewUrls} 个无法访问。`
       : "";
 
   // 因本机 DNS 异常未能检查的链接必须写明，否则读者会以为「列出的链接就是全部」；
@@ -611,11 +611,11 @@ export function mergeCitationLinkClues(
     title: `${CITATION_LINK_ISSUE_TITLE_PREFIX}（${suspect.length} 个）`,
     location: null,
     evidence,
-    analysis: `'''URL探测结果'''：条目参考文献 / 外部链接中的 ${suspect.length} 个 URL 在本次检查时无法正常访问（访问超时、拒绝连接、403、404 等）。${newRefNote}${unresolvedNote}引用来源不存在、已失效或被删除时会出现该现象，建议人工核实后再判断是否与疑似 AI 生成引用有关。`,
+    analysis: `'''URL探测结果'''：本次对条目参考文献/外部链接扫描，发现 ${suspect.length} 个 URL 无法正常访问（访问超时、拒绝连接、403、404 等）。${newRefNote}${unresolvedNote}，建议进一步核实。`,
     alternative:
-      "目标站点可能限制自动访问（如对数据中心 IP 返回 403）、临时故障或仅对特定网络 / 地区开放；URL 也可能存在抄录错误，或原文已被存档站收录。",
+      "引用来源可能已失效或被删除；目标站点可能限制程序自动访问、临时故障或仅对特定地区开放。",
     check:
-      "请在浏览器中逐一打开上述链接核实（报告页为避免触发滥用过滤器，已省略 http / https 协议头，打开时请自行补全）；若确已失效，可检查引用是否应改用存档（如 web.archive.org）或更正为可用来源。",
+      "请在浏览器中逐一打开上述链接核实；若确已失效，可检查引用是否应改用存档（如 web.archive.org）或更正为可用来源。",
     diff: null,
   };
 
@@ -1720,7 +1720,7 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
     lines.push(`{{anchor|${sectionAnchor(row.scan_time, row.title)}}}`);
     // {{La}} 负责整理条目相关链接（条目、编辑、讨论、历史等），此处不再重复拼接
     lines.push(`* {{La|${safeTitle(row.title)}}}`);
-    lines.push(`* '''状态'''：{{Tobedone}}--~~~~`);
+    lines.push(`* '''状态'''：待人工核实--~~~~`);
     lines.push("");
     if (diffs.length > 0) lines.push(`* Diff: ${renderDiffLinks(diffs)}`);
     lines.push(
@@ -1741,7 +1741,9 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
             ? `<small>（差异 [[Special:Diff/${issue.diff}|${issue.diff}]]）</small>`
             : "";
         lines.push(`; ${safeReportText(issue.title)}${loc}${diffTag}`);
-        lines.push(`: {{tq|${safeReportText(issue.evidence)}}}`);
+        lines.push(
+          `: {{tq|<nowiki>${safeReportText(issue.evidence)}</nowiki>}}`,
+        );
         lines.push(`: ${safeReportText(issue.analysis)}`);
         lines.push(
           `: '''其他可能解释：'''<i>${safeReportText(issue.alternative)}</i>`,
@@ -1752,6 +1754,24 @@ function renderCheckSection(scanTime: string, rows: AiReportRow[]): string {
     lines.push("");
   }
   return lines.join("\n").trimEnd();
+}
+
+/**
+ * 在页面「导言」之后插入新内容，使新内容排在所有既有章节之前。
+ *
+ * 导言 = 第一个二级标题（`== … ==`）之前的内容；新内容紧接导言之后插入，
+ * 因此不会跑到导言前面，同时保持「最新时间在最前」。
+ *
+ * 注意：正则必须写成 `^==[^=]`，否则会把三级标题 `=== … ===` 误判为二级标题；
+ * 页面没有二级标题时视为整页都是导言，直接在末尾追加。
+ */
+function insertAfterLead(content: string, addition: string): string {
+  const match = /^==[^=]/m.exec(content);
+  const leadEnd = match ? match.index : content.length;
+  const lead = content.slice(0, leadEnd).trim();
+  const rest = content.slice(leadEnd).trim();
+  const parts = [lead, addition.trim(), rest].filter((part) => part.length > 0);
+  return `${parts.join("\n\n")}\n`;
 }
 
 /**
@@ -1784,13 +1804,13 @@ async function publishSections(
   if (!(await canWrite())) return false;
 
   const current = await pageText(bot, page, { redirects: false });
-  const missing = sections.filter((s) => !current.includes(s.marker));
+  // 新的扫描片段插在导言之后、所有既有章节之前；同一批内按时间倒序，最新时间在最前。
+  const missing = sections
+    .filter((s) => !current.includes(s.marker))
+    .sort((a, b) => b.marker.localeCompare(a.marker));
   if (!missing.length) return true;
 
-  const text = `${current.trimEnd() ? `${current.trimEnd()}\n\n` : ""}${buildBody(
-    missing,
-  )}\n`;
-  await bot.save(page, text, summary);
+  await bot.save(page, insertAfterLead(current, buildBody(missing)), summary);
   return true;
 }
 
@@ -1808,8 +1828,8 @@ function upsertUserLine(
   const headerIndex = content.indexOf(header);
 
   if (headerIndex === -1) {
-    const addition = `${header}\n${prefix}${links.join("、")}\n`;
-    return content.trim() ? `${content.trimEnd()}\n\n${addition}` : addition;
+    // 新月份章节插在导言之后、所有既有月份之前（最新月份在最前）。
+    return insertAfterLead(content, `${header}\n${prefix}${links.join("、")}`);
   }
 
   const afterHeader = headerIndex + header.length;
@@ -1844,7 +1864,7 @@ function upsertUserLine(
 }
 
 /**
- * 更新 checkuser 页：统计已被公开记录的线索，某编者在 >= 3 个不同规范化条目
+ * 更新 checkuser 页：统计已被公开记录的线索，某编者在 >= 1 个不同规范化条目
  * （同名条目与草稿视为同一条目）中出现达到 minConfidence 的线索时，写入 / 合并其编者行。
  */
 async function updateCheckuserPage(
@@ -1887,7 +1907,7 @@ async function updateCheckuserPage(
 
   const updates: { month: string; username: string; links: string[] }[] = [];
   for (const [username, titles] of perUser) {
-    if (titles.size < 3) continue;
+    if (titles.size < 1) continue;
     const byMonth = new Map<string, string[]>();
     for (const ref of titles.values()) {
       const list = byMonth.get(ref.month) ?? [];
@@ -1898,6 +1918,9 @@ async function updateCheckuserPage(
       updates.push({ month, username, links });
   }
   if (!updates.length) return;
+
+  // 逐条插到导言之后：按月份升序应用，最后写入的最新月份落在最上方。
+  updates.sort((a, b) => a.month.localeCompare(b.month));
 
   if (!cfg.writeEnabled) {
     log.info({ updates }, "[dry-run] aiEdit checkuser page update");
@@ -1911,7 +1934,11 @@ async function updateCheckuserPage(
     text = upsertUserLine(text, update.month, update.username, update.links);
   if (text === current) return;
 
-  await bot.save(usersPage, `${text.trimEnd()}\n`, "更新疑似 AI 编辑用户汇总");
+  await bot.save(
+    usersPage,
+    `${text.trimEnd()}\n`,
+    "机器人：更新疑似 AI 编辑用户汇总",
+  );
 }
 
 /**
@@ -1977,7 +2004,7 @@ export async function publishAiReports(ctx: HandlerContext): Promise<void> {
       ctx,
       page,
       sections,
-      "更新疑似 AI 编辑人工复核线索",
+      "机器人：更新疑似 AI 编辑人工复核线索",
     );
     if (!published) continue;
 

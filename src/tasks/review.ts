@@ -460,7 +460,9 @@ function formatIssueSection(
       lines.push(title);
 
       if (issue.originalText?.trim()) {
-        lines.push(`: {{tq|${safeReportText(issue.originalText.trim())}}}`);
+        lines.push(
+          `: {{tq|<nowiki>${safeReportText(issue.originalText.trim())}</nowiki>}}`,
+        );
       }
 
       if (issue.description?.trim()) {
@@ -558,7 +560,7 @@ export async function processReviewRequest(
         {
           replyText:
             "今日次数已用完，将于明日重置。如需再次校对，请于重置后重新提交请求。~~~~",
-          summary: "校对请求处理：今日次数已用完",
+          summary: "机器人：校对请求处理：今日次数已用完",
           dryRunMessage: "[dry-run] review quota-exceeded reply",
         },
         (replyRevid) => {
@@ -589,7 +591,7 @@ export async function processReviewRequest(
       base,
       {
         replyText: "未指定待校对页面名称。~~~~",
-        summary: "校对请求处理：未指定页面",
+        summary: "机器人：校对请求处理：未指定页面",
       },
       () => {
         saveReviewRequest(db, {
@@ -765,7 +767,7 @@ export async function processReviewRequest(
       base,
       {
         replyText: `页面“${safeWikitext(fixedArticleTitle)}”内容明显非百科全书条目或草稿${reasonSuffix}，不予校对。~~~~`,
-        summary: `校对请求处理：非百科条目内容 (${fixedArticleTitle})`,
+        summary: `机器人：校对请求处理：非百科条目内容 (${fixedArticleTitle})`,
       },
       (replyRevid) => {
         saveReviewRequest(db, {
@@ -860,7 +862,7 @@ export async function processReviewRequest(
         sectionTitle: actualSectionTitle,
         fixedRevid,
         body: formattedIssuesWikitext,
-        summary: `条目校对报告：[[Special:Permalink/${fixedRevid}|${fixedArticleTitle}]] (${actualSectionTitle})`,
+        summary: `机器人：条目校对报告：[[Special:Permalink/${fixedRevid}#${actualSectionTitle}|${fixedArticleTitle}]] (${actualSectionTitle})`,
       });
       resultWritten = true;
       log.info(
@@ -894,7 +896,7 @@ export async function processReviewRequest(
   const tokenSuffix = cfg.log.responseTokenOnWiki
     ? ` (${formatTokenUsage(usageTracker)})`
     : "";
-  const replyWikitext = `\n:{{ping|${actor}}}校对已完成，参见[[Special:Permalink/${resultRevid}|结果页]]。${tokenSuffix}~~~~`;
+  const replyWikitext = `\n:{{ping|${actor}}}校对已完成，参见[[Special:Permalink/${resultRevid}#${actualSectionTitle}|结果页]]。${tokenSuffix}~~~~`;
 
   let replyRevid: number | null = null;
   try {
@@ -911,7 +913,7 @@ export async function processReviewRequest(
         resultpage: resultPageTitle,
       },
       reply: replyWikitext,
-      summary: `校对请求完成：[[${fixedArticleTitle}]] (r${fixedRevid})`,
+      summary: `机器人：校对请求完成：[[${fixedArticleTitle}]] ([[Special:Permalink/${fixedRevid}|r${fixedRevid}]]、[[Special:Permalink/${resultRevid}#${actualSectionTitle}|校对结果]])`,
     });
     replyRevid = reply?.newrevid ?? null;
   } catch (err) {
@@ -985,7 +987,7 @@ export const reviewHandler = createTemplateRequestHandler({
   talkPage: (cfg) => cfg.tasks.review.talkPage,
   templateName: (cfg) => cfg.tasks.review.template,
   missingTemplateReply: "\n:请点击上方按钮，使用标准请求模板进行申请。~~~~",
-  missingTemplateSummary: "回复校对请求：请使用标准模板",
+  missingTemplateSummary: "机器人：回复校对请求：请使用标准模板",
   lock: reviewLocks,
   note: (request) => request.reqTemplate.params.article,
   process: processReviewRequest,

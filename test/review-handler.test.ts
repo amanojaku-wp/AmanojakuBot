@@ -167,7 +167,7 @@ describe("Task 2 reviewHandler", () => {
           enabled: true,
           talkPage: "User talk:AmanojakuBot",
           personaPage: "User:AmanojakuBot/config/persona",
-          models: [{ provider: "openai", model: "gpt-5.6-luna" }],
+          models: [{ provider: "openai", model: "gpt-6-luna" }],
         },
         review: {
           enabled: true,
@@ -178,7 +178,7 @@ describe("Task 2 reviewHandler", () => {
           talkPage: "User talk:AmanojakuBot/review",
           rulePage: "User:AmanojakuBot/task/2/rule",
           template: "User:AmanojakuBot/template/ReviewRequest",
-          models: [{ provider: "openai", model: "gpt-5.6-luna" }],
+          models: [{ provider: "openai", model: "gpt-6-luna" }],
         },
         aiEdit: {
           enabled: false,
@@ -699,7 +699,7 @@ describe("Task 2 reviewHandler", () => {
     expect(resultPageText).toContain("=== 确认问题 ===");
     expect(resultPageText).toContain("<!-- 确认问题 -->");
     expect(resultPageText).toContain("; 1.<!-- 语言文字 -->发现一处错别字");
-    expect(resultPageText).toContain(": {{tq|测试错字}}");
+    expect(resultPageText).toContain(": {{tq|<nowiki>测试错字</nowiki>}}");
 
     // Check Talk page edit
     const now = new Date();

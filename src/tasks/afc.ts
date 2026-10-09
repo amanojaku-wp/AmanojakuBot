@@ -534,7 +534,9 @@ function formatIssueSection(
     lines.push(itemHeader);
 
     if (issue.originalText?.trim()) {
-      lines.push(`: {{tq|${safeReportText(issue.originalText.trim())}}}`);
+      lines.push(
+        `: {{tq|<nowiki>${safeReportText(issue.originalText.trim())}</nowiki>}}`,
+      );
     }
 
     if (issue.description?.trim()) {
@@ -681,7 +683,7 @@ export async function processAfcRequest(
         {
           replyText:
             "今日次数已用完，将于明日重置。如需再次提交发布前评审，请于重置后重新提交请求。~~~~",
-          summary: "发布前评审请求处理：今日次数已用完",
+          summary: "机器人：发布前评审请求处理：今日次数已用完",
           dryRunMessage: "[dry-run] afc quota-exceeded reply",
         },
         (replyRevid) => {
@@ -712,7 +714,7 @@ export async function processAfcRequest(
       base,
       {
         replyText: "未指定待评审页面名称。~~~~",
-        summary: "发布前评审请求处理：未指定页面",
+        summary: "机器人：发布前评审请求处理：未指定页面",
       },
       () => {
         saveAfcRequest(db, {
@@ -902,7 +904,7 @@ export async function processAfcRequest(
       base,
       {
         replyText: `页面“${safeWikitext(fixedArticleTitle)}”内容明显非百科全书条目或草稿${reasonSuffix}，不予评审。~~~~`,
-        summary: `发布前评审请求处理：非百科条目内容 (${fixedArticleTitle})`,
+        summary: `机器人：发布前评审请求处理：非百科条目内容 (${fixedArticleTitle})`,
       },
       (replyRevid) => {
         saveAfcRequest(db, {
@@ -999,7 +1001,7 @@ export async function processAfcRequest(
         sectionTitle: actualSectionTitle,
         fixedRevid,
         body: formattedIssuesWikitext,
-        summary: `条目发布前评审报告：[[Special:Permalink/${fixedRevid}|${fixedArticleTitle}]] (${actualSectionTitle})`,
+        summary: `机器人：条目发布前评审报告：[[Special:Permalink/${fixedRevid}#${actualSectionTitle}|${fixedArticleTitle}]] (${actualSectionTitle})`,
       });
       resultWritten = true;
 
@@ -1037,7 +1039,7 @@ export async function processAfcRequest(
     ? ` (${formatTokenUsage(usageTracker)})`
     : "";
 
-  const replyWikitext = `\n:{{ping|${actor}}}发布前评审已完成，参见[[Special:Permalink/${resultRevid}|结果页]]。${tokenSuffix}~~~~`;
+  const replyWikitext = `\n:{{ping|${actor}}}发布前评审已完成，参见[[Special:Permalink/${resultRevid}#${actualSectionTitle}|结果页]]。${tokenSuffix}~~~~`;
   let replyRevid: number | null = null;
 
   try {
@@ -1054,7 +1056,7 @@ export async function processAfcRequest(
         resultpage: resultPageTitle,
       },
       reply: replyWikitext,
-      summary: `发布前评审请求完成：[[${fixedArticleTitle}]] (r${fixedRevid})`,
+      summary: `机器人：发布前评审请求完成：[[${fixedArticleTitle}]] ([[Special:Permalink/${fixedRevid}|r${fixedRevid}]]、[[Special:Permalink/${resultRevid}#${actualSectionTitle}|评审结果]])`,
     });
 
     replyRevid = reply?.newrevid ?? null;
@@ -1131,7 +1133,7 @@ export const afcHandler = createTemplateRequestHandler({
   talkPage: (cfg) => cfg.tasks.afc.talkPage,
   templateName: (cfg) => cfg.tasks.afc.template,
   missingTemplateReply: "\n:请点击上方按钮，使用标准请求模板进行申请。~~~~",
-  missingTemplateSummary: "回复发布前评审请求：请使用标准模板",
+  missingTemplateSummary: "机器人：回复发布前评审请求：请使用标准模板",
   lock: afcLocks,
   note: (request) => request.reqTemplate.params.article,
   process: processAfcRequest,

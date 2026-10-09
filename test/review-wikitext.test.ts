@@ -180,7 +180,7 @@ describe("Review Wikitext utilities", () => {
     expect(formatted).toContain(
       "; 1.<!-- 语言文字 -->错字“建构”疑似应为“架构”<small>（导言区第二段）</small>",
     );
-    expect(formatted).toContain(": {{tq|该项目于2020年建立}}");
+    expect(formatted).toContain(": {{tq|<nowiki>该项目于2020年建立</nowiki>}}");
     expect(formatted).toContain(": <small>缺少句号</small>");
     expect(formatted).toContain(": ➡️ <u>在句末补全句号。</u>");
 

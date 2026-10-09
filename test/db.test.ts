@@ -95,7 +95,7 @@ describe("Events token and model tracking", () => {
     const seen = db.prepare(EVENT_SEEN_SQL);
 
     // Save pending event with token usage and model
-    save.run(1001, "pending", 42, null, 1500, 320, "openai/gpt-5.6-luna");
+    save.run(1001, "pending", 42, null, 1500, 320, "openai/gpt-6-luna");
 
     const row = db
       .prepare(
@@ -118,7 +118,7 @@ describe("Events token and model tracking", () => {
       reply_revid: null,
       input_tokens: 1500,
       output_tokens: 320,
-      model: "openai/gpt-5.6-luna",
+      model: "openai/gpt-6-luna",
     });
 
     expect(seen.get(1001)).toEqual({ state: "pending" });
@@ -139,7 +139,7 @@ describe("Events token and model tracking", () => {
       reply_revid: 2002,
       input_tokens: 1500,
       output_tokens: 320,
-      model: "openai/gpt-5.6-luna",
+      model: "openai/gpt-6-luna",
     });
   });
 });
