@@ -3,6 +3,7 @@ import type { Mwn } from "mwn";
 import { generateText, stepCountIs } from "ai";
 import { pageText, revision } from "../utils/wiki.js";
 import {
+  closeUnclosedCodeTags,
   extractCommentDetails,
   formatDiscussionReply,
   formatWikiTimestamp,
@@ -195,13 +196,6 @@ const WIKITEXT_OUTPUT_POLICY = `
 - 不要重复用户的问题，不要重复已经给出的结论，不要为了显得完整而添加总结、背景知识、延伸建议或无关说明。
 - 能直接回答时直接回答；不要固定使用“首先/其次/最后”、总结段或结尾客套话。
 - 工具调用获得的信息只提取回答当前问题所需的部分，不要复述完整工具结果。
-- 涉及代码、Wikitext、模板或其他结构化内容时，完整性优先于篇幅目标。不得为了缩短回复而在代码块、函数、模板、链接或句子中途截断。如果预计内容较长，应优先减少前言、解释、重复内容和总结，先保证用户实际需要的代码或结构化内容完整。
-
-如果回复有长篇内容，例如较长的程序代码或长篇分析（超过10行），应当用下述方式进行折叠，以防止影响他人阅读：
-
-{{HideH|简短、具体的内容概述}}
-（实际内容）
-{{HideF}}
 `;
 
 const MAX_TOKENS = 3000;
@@ -782,12 +776,15 @@ const isAlpha = (c: string) => /[A-Za-z]/.test(c);
  * 因此这里把「没有对应闭合符号」的开符号转义成 HTML entity，使其退化为可见的普通文字。
  *
  * 特殊规则：
- * 1. 已闭合的 HTML 注释（<!-- ... -->）整体跳过，不检查其内部；
- * 2. `<nowiki>`、`<source>`、`<syntaxhighlight>`、`<math>`、`<score>`、`<pre>` 的标签及其内部内容整体跳过；
- * 3. 已自闭合的标签（`<br/>`）与 HTML 空元素（`<br>`）不处理；
- * 4. 未闭合的标签与未闭合的 HTML 注释，把其符号转义为 `&lt;`／`&gt;`（维基代码开符转义为 `&#91;`／`&#123;`）。
+ * 1. 代码型标签（`<pre>` / `<syntaxhighlight>` / `<source>`）漏写闭合标签时**补上**闭合标签
+ *    （见 {@link closeUnclosedCodeTags}），避免签名与后续讨论被吞进代码块；
+ * 2. 已闭合的 HTML 注释（<!-- ... -->）整体跳过，不检查其内部；
+ * 3. `<nowiki>`、`<source>`、`<syntaxhighlight>`、`<math>`、`<score>`、`<pre>` 的标签及其内部内容整体跳过；
+ * 4. 已自闭合的标签（`<br/>`）与 HTML 空元素（`<br>`）不处理；
+ * 5. 其余未闭合的标签与未闭合的 HTML 注释，把其符号转义为 `&lt;`／`&gt;`（维基代码开符转义为 `&#91;`／`&#123;`）。
  */
-export function ensureClosedWikitext(input: string): string {
+export function ensureClosedWikitext(rawInput: string): string {
+  const input = closeUnclosedCodeTags(rawInput);
   const len = input.length;
   /** 原始下标 → 替换成的 HTML entity */
   const escapes = new Map<number, string>();

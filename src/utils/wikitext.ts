@@ -1209,20 +1209,162 @@ function getLineTagInfo(
 }
 
 /**
+ * 代码型内容标签：这些标签缺少闭合时会把其后整段页面（含机器人签名与后续讨论）
+ * 一起当成代码内容吞掉，因此需要在写入前由程序补齐，而不是转义成可见文字。
+ */
+const CODE_TAG_NAME_PATTERN = "(?:pre|syntaxhighlight|source)";
+const CODE_TAG_REGEX = new RegExp(
+  `<(/?)(${CODE_TAG_NAME_PATTERN})\\b([^>]*)>`,
+  "gi",
+);
+
+/**
+ * 补齐未闭合的代码标签（`<pre>` / `<syntaxhighlight>` / `<source>`）。
+ *
+ * 机器人经常会漏写 `</syntaxhighlight>` 或 `</pre>`，在讨论页里这会让
+ * 其后的全部内容（包括 `~~~~` 签名和后面别人的留言）都被渲染成代码块。
+ * 这里按开标签的嵌套顺序在回复末尾补上缺失的闭合标签：
+ * - 已闭合的标签原样保留；
+ * - 自闭合标签（`<pre />`）不处理；
+ * - 没有对应开标签的孤立闭标签也不处理。
+ */
+export function closeUnclosedCodeTags(input: string): string {
+  const stack: { name: string; at: number }[] = [];
+
+  CODE_TAG_REGEX.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CODE_TAG_REGEX.exec(input)) !== null) {
+    const isClosing = match[1] === "/";
+    const name = match[2].toLowerCase();
+    const attrs = match[3] ?? "";
+
+    if (isClosing) {
+      // 与 HTML 类似：外层闭合标签会连带结束其内部未闭合的同级标签
+      let index = -1;
+      for (let i = stack.length - 1; i >= 0; i -= 1) {
+        if (stack[i].name === name) {
+          index = i;
+          break;
+        }
+      }
+      if (index !== -1) stack.length = index;
+      continue;
+    }
+
+    if (/\/\s*$/.test(attrs)) continue; // 自闭合
+    stack.push({ name, at: match.index });
+  }
+
+  if (stack.length === 0) return input;
+
+  // 栈底是第一个未闭合的开标签，它之后的 {{HideF}} 才属于该代码块
+  const firstUnclosedAt = stack[0].at;
+  const closers = stack
+    .reverse()
+    .map(({ name }) => `</${name}>`)
+    .join("\n");
+  const head = input.replace(/\s+$/, "");
+  if (!head) return closers;
+
+  // 若模型自己写了 {{HideF}}，闭合标签要插在它前面：
+  // 否则 HideF 会被当成未闭合代码块的内容，折叠模板随之失效。
+  const hideFRegex = /(^|\n)[ \t]*(\{\{\s*hidef\b[^\n]*\}\})/gi;
+  let insertAt = head.length;
+  let hideF: RegExpExecArray | null;
+  while ((hideF = hideFRegex.exec(head)) !== null) {
+    const at = hideF.index + hideF[1].length;
+    if (at > firstUnclosedAt) insertAt = at;
+  }
+
+  if (insertAt >= head.length) return `${head}\n${closers}`;
+  // 只去掉待插入位置之前的换行，保留代码行末的空白（缩进型代码可能依赖它）
+  const before = head.slice(0, insertAt).replace(/\n+$/, "");
+  const after = head.slice(insertAt);
+  return `${before}\n${closers}\n${after}`;
+}
+
+/** 自动折叠的行数阈值：超过该行数的 `<syntaxhighlight>` 代码块套上 HideH / HideF */
+const CODE_BLOCK_HIDE_MIN_LINES = 10;
+
+const CODE_BLOCK_REGEX =
+  /(<syntaxhighlight\b[^>]*>)([\s\S]*?)(<\/syntaxhighlight\s*>)/gi;
+
+/** 顶格书写的折叠模板行（`{{HideH|...}}` / `{{HideF}}`），缩进步骤中需跳过 */
+export const HIDE_TEMPLATE_LINE_REGEX = /^\{\{\s*hide(?:h|f)?\b/i;
+
+function countCodeBlockLines(body: string): number {
+  // 忽略代码内容首尾的空行，中间的空行照常计数
+  const lines = body.split(/\r?\n/);
+  while (lines.length > 0 && lines[0].trim() === "") lines.shift();
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+  return lines.length;
+}
+
+/**
+ * 为超过 {@link CODE_BLOCK_HIDE_MIN_LINES} 行的 `<syntaxhighlight>` 代码块
+ * 套上 `{{HideH|代码}}` / `{{HideF}}` 折叠模板。
+ *
+ * - 代码块必须独占行首（允许前导空白），行内代码标签不处理；
+ * - 附近已有折叠模板（模型自己写了 `{{HideH}}` / `{{HideF}}`）时不重复包裹；
+ * - `{{HideH|代码}}` 与 `{{HideF}}` 各自独占一行，后续缩进步骤会让它们保持顶格。
+ */
+export function wrapLongCodeBlocks(text: string): string {
+  return text.replace(
+    CODE_BLOCK_REGEX,
+    (
+      match: string,
+      openTag: string,
+      body: string,
+      closeTag: string,
+      offset: number,
+      whole: string,
+    ) => {
+      // 仅处理独占行首的代码块，避免拆散行内内容
+      const lineStart = whole.lastIndexOf("\n", offset - 1) + 1;
+      if (whole.slice(lineStart, offset).trim() !== "") return match;
+
+      if (countCodeBlockLines(body) <= CODE_BLOCK_HIDE_MIN_LINES) return match;
+
+      // 已存在折叠模板（前后各看 3 行，只认行首的模板）则不再重复包裹
+      const hasHideTemplate = (lines: string[]) =>
+        lines.some((line) => /^\s*\{\{\s*hide/i.test(line));
+      const beforeLines = whole.slice(0, offset).split("\n").slice(-3);
+      const afterLines = whole
+        .slice(offset + match.length)
+        .split("\n")
+        .slice(0, 3);
+      if (hasHideTemplate(beforeLines) || hasHideTemplate(afterLines)) {
+        return match;
+      }
+
+      const after = whole.slice(offset + match.length);
+      const trailingBreak =
+        after.length > 0 && !/^\r?\n/.test(after) ? "\n" : "";
+
+      return `{{HideH|代码}}\n${openTag}${body}${closeTag}\n{{HideF}}${trailingBreak}`;
+    },
+  );
+}
+
+/**
  * 格式化机器人讨论页回复：
- * 1. 清理 AI 生成的签名（波浪线 ~~~/~~~~ 及前导破折号、冒号；若指定了 botUsername，则仅清理带有机器人自身用户名的显式签名，保留提及其他用户的链接）
- * 2. 清理 AI 自己生成的缩进（每行开头的冒号 `:`）
- * 3. 按照现有逻辑加缩进：上一条留言缩进等级 +1；若新等级超过 8，则使用 {{Outdent|8}} 将缩进重置为 0
- * 4. 对于 <math><pre><syntaxhighlight><source><score> 等多行内容标签，其内部各行开头不添加冒号
+ * 1. 补齐未闭合的代码标签（`<pre>` / `<syntaxhighlight>` / `<source>`），
+ *    保证后面追加的 `~~~~` 签名不会落进代码块内部
+ * 2. 清理 AI 生成的签名（波浪线 ~~~/~~~~ 及前导破折号、冒号；若指定了 botUsername，则仅清理带有机器人自身用户名的显式签名，保留提及其他用户的链接）
+ * 3. 清理 AI 自己生成的缩进（每行开头的冒号 `:`）
+ * 4. 超过 10 行的 <syntaxhighlight> 代码块自动套上 {{HideH|代码}} / {{HideF}} 折叠（已有折叠模板时不重复包裹）
+ * 5. 按照现有逻辑加缩进：上一条留言缩进等级 +1；若新等级超过 8，则使用 {{Outdent|8}} 将缩进重置为 0
+ * 6. 对于 <math><pre><syntaxhighlight><source><score> 等多行内容标签，其内部各行开头不添加冒号；
+ *    {{HideH|代码}} / {{HideF}} 必须顶格书写，不加任何冒号缩进（否则折叠模板失效）
  */
 export function formatDiscussionReply(
-  reply: string,
+  rawReply: string,
   currentIndentLevel: number,
   marker: string,
   botUsername?: string,
 ): string {
-  // 1. 清理 AI 生成的签名及残留破折号、波浪线、时间戳等
-  let cleanReply = reply
+  // 1. 先补齐代码标签，保证后加的 ~~~~ 签名不会落进未闭合的代码块内部
+  let cleanReply = closeUnclosedCodeTags(rawReply)
     // 移除 ~~~ 到 ~~~~~ 及其前面可能附带的破折号、冒号、空格
     .replace(/(?:[:\s\-—–]+)?~{3,5}/g, "");
 
@@ -1252,7 +1394,7 @@ export function formatDiscussionReply(
   // 移除末尾残留的冒号、破折号、连字符及空白
   cleanReply = cleanReply.replace(/[:\s\-—–]+$/, "").trim();
 
-  // 2. 清理 AI 自己生成的缩进（每行开头的 :），跳过多行内容标签内部代码
+  // 3. 清理 AI 自己生成的缩进（每行开头的 :），跳过多行内容标签内部代码
   const rawLines = cleanReply.split("\n");
   const cleanedLines: string[] = [];
   let currentTag: string | null = null;
@@ -1293,21 +1435,24 @@ export function formatDiscussionReply(
       .trimEnd();
   }
 
+  // 4. 长代码块自动折叠（在第 3 步清理完缩进之后、第 5 步加缩进之前处理）
+  const foldedLines = wrapLongCodeBlocks(cleanedLines.join("\n")).split("\n");
+
   const suffix = marker ? ` ~~~~ ${marker}` : " ~~~~";
   const nextLevel = currentIndentLevel + 1;
 
-  // 3. 缩进等级超过 8 则使用 Outdent 重置为 0
+  // 5. 缩进等级超过 8 则使用 Outdent 重置为 0
   if (nextLevel > 8) {
-    const body = cleanedLines.join("\n");
+    const body = foldedLines.join("\n");
     return `{{Outdent|${currentIndentLevel}}}\n${body}${suffix}`;
   }
 
-  // 3 & 4. 添加冒号缩进，多行内容标签内部各行保持原样不加冒号
+  // 5 & 6. 添加冒号缩进，多行内容标签内部各行保持原样不加冒号
   const indents = ":".repeat(nextLevel);
   const indentedLines: string[] = [];
   currentTag = null;
 
-  for (const line of cleanedLines) {
+  for (const line of foldedLines) {
     const { isInsideTagAtStart, openTagAtEnd } = getLineTagInfo(
       line,
       currentTag,
@@ -1316,6 +1461,9 @@ export function formatDiscussionReply(
 
     if (isInsideTagAtStart) {
       indentedLines.push(line);
+    } else if (HIDE_TEMPLATE_LINE_REGEX.test(line.trim())) {
+      // {{HideH|代码}} / {{HideF}} 前面不能有 ":::" 缩进，否则不会按折叠模板渲染
+      indentedLines.push(line.trim());
     } else {
       indentedLines.push(`${indents}${line}`);
     }
